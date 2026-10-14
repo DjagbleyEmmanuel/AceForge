@@ -706,6 +706,11 @@ pub fn fetch_result(port: u16, id: &str) -> Result<FetchedResult, String> {
 
 /// Decode standard base64. Written out rather than pulled from a crate: the
 /// app already vendors its dependencies and this is one call site.
+///
+/// Padding is part of the alphabet, not a stray character: the server pads the
+/// `X-LRC-Text` header to a multiple of four, and any LRC whose length is not a
+/// multiple of three ends in `=` or `==`. Treating `=` as invalid failed
+/// roughly two jobs in three.
 fn decode_base64(input: &str) -> Result<String, String> {
     fn value(c: u8) -> Option<u32> {
         match c {
@@ -714,25 +719,25 @@ fn decode_base64(input: &str) -> Result<String, String> {
             b'0'..=b'9' => Some((c - b'0') as u32 + 52),
             b'+' => Some(62),
             b'/' => Some(63),
+            b'=' => Some(0),
             _ => None,
         }
     }
     let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if bytes.len() % 4 == 1 {
+        return Err("truncated base64".to_string());
+    }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    let mut i = 0;
-    while i < bytes.len() {
-        let quad: Vec<u32> = bytes[i..(i + 4).min(bytes.len())]
-            .iter()
-            .map(|c| value(*c).ok_or_else(|| format!("bad base64 character {:?}", *c as char)))
-            .collect::<Result<Vec<u32>, String>>()?;
-        out.push(((quad[0] << 2) | (quad[1] >> 4)) as u8);
-        if quad.len() > 2 && bytes[i + 2] != b'=' {
-            out.push((((quad[1] & 0xF) << 4) | (quad[2] >> 2)) as u8);
+    for quad in bytes.chunks(4) {
+        let mut acc: u32 = 0;
+        for c in quad {
+            acc = (acc << 6) | value(*c).ok_or_else(|| format!("bad base64 character {:?}", *c as char))?;
         }
-        if quad.len() > 3 && bytes[i + 3] != b'=' {
-            out.push((((quad[2] & 0x3) << 6) | quad[3]) as u8);
-        }
-        i += 4;
+        let decoded = acc.to_be_bytes();
+        // `acc` holds at most 24 bits, so its three bytes are the last three of
+        // the big-endian form. A quad carries three bytes, minus one per pad.
+        let keep = 3usize.saturating_sub(quad.iter().filter(|c| **c == b'=').count());
+        out.extend_from_slice(&decoded[1..1 + keep]);
     }
     String::from_utf8(out).map_err(|e| format!("LRC was not valid UTF-8: {e}"))
 }
@@ -1148,6 +1153,52 @@ impl<R: std::io::Read + ?Sized> ReadToEnd for R {
 mod tests {
     use super::*;
 
+    /// Encodes the way `ace-server` does, so the round trip covers the padding
+    /// the server actually emits.
+    fn encode(input: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in input.chunks(3) {
+            let mut v = (chunk[0] as u32) << 16;
+            if chunk.len() > 1 {
+                v |= (chunk[1] as u32) << 8;
+            }
+            if chunk.len() > 2 {
+                v |= chunk[2] as u32;
+            }
+            out.push(T[(v >> 18) as usize & 63] as char);
+            out.push(T[(v >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 { T[(v >> 6) as usize & 63] as char } else { '=' });
+            out.push(if chunk.len() > 2 { T[v as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    /// `=` was rejected as a bad character, so any LRC whose length was not a
+    /// multiple of three failed to decode and took the whole render down with
+    /// it. Every length modulo three must survive.
+    #[test]
+    fn decodes_padded_base64() {
+        for len in 0..64usize {
+            let raw: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+            let encoded = encode(&raw);
+            assert!(encoded.contains('=') || raw.is_empty() || len % 3 == 0);
+            assert_eq!(decode_base64(&encoded).unwrap(), String::from_utf8(raw).unwrap());
+        }
+    }
+
+    #[test]
+    fn decodes_real_lrc_shape() {
+        let lrc = "[00:07.84]Yeah mon... bless up... one love inna di place\n[00:11.85]Mi wake up early\n";
+        assert_eq!(decode_base64(&encode(lrc.as_bytes())).unwrap(), lrc);
+    }
+
+    #[test]
+    fn rejects_bad_characters() {
+        assert!(decode_base64("not base64!!").is_err());
+        assert!(decode_base64("AAAAA").is_err(), "a length of 5 cannot be valid");
+    }
+
     /// The Sampling panel showed steps, guidance, shift and seed, but
     /// `to_lm_json` never sent them. The backend silently used the turbo
     /// defaults, so the controls did nothing. `/lm` echoes each field back on
@@ -1535,3 +1586,4 @@ mod lrc_sanitise_tests {
         assert_eq!(sanitise_lrc(""), "");
     }
 }
+
