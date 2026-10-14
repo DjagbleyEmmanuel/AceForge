@@ -4,7 +4,6 @@ import {
   LOUDNESS_TARGETS,
   annotations,
   library,
-  coverUrl,
   lyricSync,
   mastering,
   type Track,
@@ -12,6 +11,7 @@ import {
 import { formatBytes, type LoudnessTarget, type NormaliseReport } from "../lib/types";
 import { TrackPlayer } from "./TrackPlayer";
 import { Select } from "./Select";
+import { CoverArt } from "./CoverArt";
 import { CropDialog } from "./CropDialog";
 import { LyricSyncPanel } from "./LyricSyncPanel";
 
@@ -198,29 +198,33 @@ export function LibraryPanel({ tracks, onChanged, running = false }: Props) {
           aria-label="Search songs"
           className="field min-w-40 flex-1 py-1 text-xs"
         />
-        <select
-          value={filter}
-          onChange={(e) => setFilter(e.target.value as Filter)}
-          aria-label="Filter songs"
-          className="field w-36 py-1 text-[11px]"
-        >
-          <option value="all">all songs</option>
-          <option value="synced">lyrics synced</option>
-          <option value="unsynced">lyrics not synced</option>
-          <option value="instrumental">instrumental</option>
-          <option value="wav">wav only</option>
-        </select>
-        <select
-          value={sort}
-          onChange={(e) => setSort(e.target.value as Sort)}
-          aria-label="Sort songs"
-          className="field w-32 py-1 text-[11px]"
-        >
-          <option value="newest">newest first</option>
-          <option value="oldest">oldest first</option>
-          <option value="longest">longest first</option>
-          <option value="name">by name</option>
-        </select>
+        <div className="w-40">
+          <Select
+            size="sm"
+            value={filter}
+            options={[
+              { value: "all", label: "all songs" },
+              { value: "synced", label: "lyrics synced" },
+              { value: "unsynced", label: "lyrics not synced" },
+              { value: "instrumental", label: "instrumental" },
+              { value: "wav", label: "wav only" },
+            ]}
+            onChange={(v) => setFilter(v as Filter)}
+          />
+        </div>
+        <div className="w-36">
+          <Select
+            size="sm"
+            value={sort}
+            options={[
+              { value: "newest", label: "newest first" },
+              { value: "oldest", label: "oldest first" },
+              { value: "longest", label: "longest first" },
+              { value: "name", label: "by name" },
+            ]}
+            onChange={(v) => setSort(v as Sort)}
+          />
+        </div>
         <span className="text-[11px] text-ink-500">
           {items.length} of {tracks.length}
         </span>
@@ -259,18 +263,10 @@ export function LibraryPanel({ tracks, onChanged, running = false }: Props) {
       )}
 
       {items.map((track) => {
-        const cover = coverUrl(track.cover);
         return (
         <div key={track.path} className="panel p-4">
           <div className="flex gap-3">
-            {cover && (
-              <img
-                src={cover}
-                alt=""
-                className="size-20 shrink-0 rounded-lg object-cover ring-1 ring-ink-800"
-                loading="lazy"
-              />
-            )}
+            <CoverArt path={track.cover} />
             <div className="min-w-0 flex-1">
               <TrackPlayer track={track} />
             </div>

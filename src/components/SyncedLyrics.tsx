@@ -17,6 +17,14 @@ export function lyricLines(raw: string): string[] {
     .filter((l) => l.length > 0 && l.toLowerCase() !== "[instrumental]");
 }
 
+/**
+ * How long a manual scroll keeps following suspended.
+ *
+ * Long enough to read ahead or check the last line, short enough that the
+ * lyrics resume on their own once the reader stops.
+ */
+const FOLLOW_RESUME_MS = 6000;
+
 /** Index of the line that should be lit at `time`, or -1 before the first. */
 export function activeLineIndex(lines: LyricLine[], time: number): number {
   let found = -1;
@@ -46,7 +54,11 @@ export function SyncedLyrics({
   const [tapping, setTapping] = useState(false);
   const [draft, setDraft] = useState<{ at: number; text: string }[]>([]);
   const listRef = useRef<HTMLOListElement>(null);
-  const activeRef = useRef<HTMLLIElement>(null);
+  /** True while the reader has scrolled away and playback should not fight. */
+  const [following, setFollowing] = useState(true);
+  /** Set briefly after a manual scroll, so our own smooth scroll is ignored. */
+  const followLock = useRef(false);
+  const [hidden, setHidden] = useState(false);
 
   const plain = useMemo(() => lyricLines(lyrics), [lyrics]);
 
@@ -120,11 +132,60 @@ export function SyncedLyrics({
     return () => document.removeEventListener("keydown", onKey);
   }, [tapping, currentTime]);
 
-  // Keep the current line visible without yanking the page: scroll only the
-  // list's own container.
+  /**
+   * Follow along, but only when the reader has not taken over.
+   *
+   * Scrolling the active line into view unconditionally is hostile: the moment
+   * you scroll down to read ahead, the next line yanks the view back, and there
+   * is no way to reach the bottom of the lyrics at all. So following suspends
+   * while the user is scrolled away from the current line, and for a few
+   * seconds after they scroll -- long enough to read ahead, short enough that
+   * playback resumes on its own.
+   */
   useEffect(() => {
-    activeRef.current?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [timings, currentTime]);
+    const list = listRef.current;
+    if (!list || !timings) return;
+
+    const activeIndex = activeLineIndex(timings.lines, currentTime);
+    if (activeIndex < 0) return;
+
+    const lineEl = list.querySelector<HTMLElement>(`[data-line="${activeIndex}"]`);
+    if (!lineEl) return;
+
+    const listBox = list.getBoundingClientRect();
+    const lineBox = lineEl.getBoundingClientRect();
+    // Within a line's height of the active one means the reader is parked at
+    // the playhead and wants to be dragged along.
+    const nearActive =
+      lineBox.top < listBox.bottom + lineBox.height &&
+      lineBox.bottom > listBox.top - lineBox.height;
+    if (!nearActive) {
+      setFollowing(false);
+      return;
+    }
+
+    if (!following || followLock.current) return;
+    lineEl.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [timings, currentTime, following]);
+
+  // Any manual scroll takes over for a few seconds.
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list || !timings) return;
+    let timer = 0;
+    const onScroll = () => {
+      followLock.current = true;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        followLock.current = false;
+      }, FOLLOW_RESUME_MS);
+    };
+    list.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      list.removeEventListener("scroll", onScroll);
+      window.clearTimeout(timer);
+    };
+  }, [timings]);
 
   if (plain.length === 0) return null;
 
@@ -170,6 +231,17 @@ export function SyncedLyrics({
     );
   }
 
+  if (hidden) {
+    return (
+      <button
+        onClick={() => setHidden(false)}
+        className="self-start text-[11px] text-ink-500 underline-offset-2 hover:text-ink-300 hover:underline"
+      >
+        show lyrics
+      </button>
+    );
+  }
+
   if (!timings) {
     return (
       <details className="group">
@@ -193,14 +265,34 @@ export function SyncedLyrics({
 
   return (
     <div className="space-y-1.5">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <span className="text-[11px] text-ink-400">Lyrics</span>
-        <button
-          onClick={startTapping}
-          className="text-[10px] text-ink-500 underline-offset-2 hover:text-ink-300 hover:underline"
-        >
-          re-time
-        </button>
+        <span className="flex items-center gap-2">
+          {!following && (
+            <button
+              onClick={() => {
+                setFollowing(true);
+                followLock.current = false;
+              }}
+              className="text-[10px] text-glow-300 underline-offset-2 hover:underline"
+              title="Scroll back to the line being sung"
+            >
+              follow
+            </button>
+          )}
+          <button
+            onClick={startTapping}
+            className="text-[10px] text-ink-500 underline-offset-2 hover:text-ink-300 hover:underline"
+          >
+            re-time
+          </button>
+          <button
+            onClick={() => setHidden(true)}
+            className="text-[10px] text-ink-500 underline-offset-2 hover:text-ink-300 hover:underline"
+          >
+            hide
+          </button>
+        </span>
       </div>
       <ol
         ref={listRef}
@@ -212,7 +304,7 @@ export function SyncedLyrics({
           return (
             <li
               key={`${line.atSecs}-${i}`}
-              ref={isActive ? activeRef : undefined}
+              data-line={i}
               className={`rounded px-1.5 py-0.5 text-xs transition ${
                 isActive
                   ? "bg-glow-500/20 font-medium text-glow-200"

@@ -347,6 +347,50 @@ fn submit(port: u16, path: &str, body: serde_json::Value) -> Result<String, Stri
     job_id_from(response.into_json().map_err(|e| format!("bad submit response: {e}"))?, path)
 }
 
+/// Force LRC timestamps strictly increasing.
+///
+/// The aligner works at token granularity and can place several lines on the
+/// same frame, which produces two rows with an identical timestamp. A karaoke
+/// display cannot show that: whichever line is checked last wins and the other
+/// flashes. A small floor keeps every line reachable in order.
+fn sanitise_lrc(lrc: &str) -> String {
+    /// Shortest gap between two lines, in seconds. Below this the display
+    /// cannot usefully show one line before the next.
+    const MIN_GAP: f32 = 0.25;
+
+    let mut out = String::with_capacity(lrc.len());
+    let mut previous: Option<f32> = None;
+
+    for line in lrc.lines() {
+        let Some((stamp, rest)) = line.split_once(']') else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let Some((mins, secs)) = stamp.trim_start_matches('[').split_once(':') else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let (Ok(mins), Ok(secs)) = (mins.parse::<f32>(), secs.parse::<f32>()) else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+
+        let mut at = mins * 60.0 + secs;
+        if let Some(prev) = previous {
+            at = at.max(prev + MIN_GAP);
+        }
+        previous = Some(at);
+
+        let m = at.floor() as u32;
+        let s = at - m as f32;
+        out.push_str(&format!("[{m:02}:{s:05.2}]{rest}\n"));
+    }
+    out
+}
+
 /// True when the render is instrumental, so lyric alignment is pointless.
 fn is_instrumental(params: &GenerateParams) -> bool {
     let lyrics = params.lyrics.trim();
@@ -943,12 +987,21 @@ pub fn generate(
         // Write the LRC beside the audio so the library can pick it up. A
         // failure here must not lose the render -- the song is already on disk
         // and the lyrics are still in the request.
-        if let Some(lrc) = fetched.lrc.as_deref() {
-            let lrc_path = path.with_extension("lrc");
-            if let Err(e) = std::fs::write(&lrc_path, lrc) {
-                eprintln!("[lrc] cannot write {}: {e}", lrc_path.display());
-            } else {
-                eprintln!("[lrc] wrote {} ({} bytes)", lrc_path.display(), lrc.len());
+        //
+        // Only the take it was measured against. The engine aligns lyric tokens
+        // to the audio produced in that pass, and with `synth_batch_size` each
+        // take is a different performance, so handing the same LRC to all of
+        // them times take 2's singing against take 1's audio. Every take but
+        // the first still gets lyrics -- they simply do not follow along until
+        // they are re-timed.
+        if index == 0 {
+            if let Some(lrc) = fetched.lrc.as_deref().map(|text| sanitise_lrc(text)) {
+                let lrc_path = path.with_extension("lrc");
+                if let Err(e) = std::fs::write(&lrc_path, &lrc) {
+                    eprintln!("[lrc] cannot write {}: {e}", lrc_path.display());
+                } else {
+                    eprintln!("[lrc] wrote {} ({} bytes)", lrc_path.display(), lrc.len());
+                }
             }
         }
 
@@ -1442,3 +1495,43 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod lrc_sanitise_tests {
+    use super::sanitise_lrc;
+
+    #[test]
+    fn duplicated_timestamps_are_pushed_apart() {
+        // Two rows landing on the same frame is what makes a karaoke display
+        // flicker: both are "current" at once and neither is ever readable.
+        let out = sanitise_lrc("[00:04.00]first\n[00:04.00]second\n[00:09.00]third\n");
+        let ts: Vec<f32> = out
+            .lines()
+            .map(|l| {
+                let (m, s) = l[1..l.find(']').unwrap()].split_once(':').unwrap();
+                m.parse::<f32>().unwrap() * 60.0 + s.parse::<f32>().unwrap()
+            })
+            .collect();
+        assert!(ts.windows(2).all(|w| w[1] > w[0]), "not strictly increasing: {ts:?}");
+    }
+
+    #[test]
+    fn ordering_and_text_are_preserved() {
+        let out = sanitise_lrc("[00:01.00]hello there\n[00:05.00]second line\n");
+        assert!(out.contains("]hello there"), "text lost: {out}");
+        assert!(out.contains("]second line"), "text lost: {out}");
+        assert!(out.find("hello") < out.find("second"), "order changed: {out}");
+    }
+
+    #[test]
+    fn lines_without_a_timestamp_pass_through() {
+        let out = sanitise_lrc("no stamp here\n[00:02.00]real\n");
+        assert!(out.contains("no stamp here"));
+        assert!(out.contains("]real"));
+    }
+
+    #[test]
+    fn an_empty_input_stays_empty() {
+        assert_eq!(sanitise_lrc(""), "");
+    }
+}

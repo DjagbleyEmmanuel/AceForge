@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { coverUrl, covers, settings, type CoverEntry, type SettingsView } from "../lib/api";
+import { covers, settings, type CoverEntry, type SettingsView } from "../lib/api";
+import { CoverArt } from "./CoverArt";
 
 interface Props {
   view: SettingsView;
@@ -306,17 +307,11 @@ export function SettingsPanel({
         {coverList.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {coverList.slice(0, 24).map((c) => {
-              const url = coverUrl(c.path);
               return (
-                <img
+                <CoverArt
                   key={c.path}
-                  src={url ?? undefined}
+                  path={c.path}
                   alt={c.name}
-                  title={
-                    c.fromUserDir
-                      ? `${c.name}\nfrom your cover folder`
-                      : `${c.name}\nbundled`
-                  }
                   className="size-11 rounded-md object-cover ring-1 ring-ink-800"
                 />
               );

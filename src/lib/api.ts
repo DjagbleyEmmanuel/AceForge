@@ -463,12 +463,6 @@ export function audioUrl(track: Pick<Track, "path">): string {
   return `asset://localhost${encodeURI(track.path)}`;
 }
 
-/** Cover art goes through the same asset protocol as audio. */
-export function coverUrl(cover: string | null | undefined): string | null {
-  if (!cover) return null;
-  return `asset://localhost${encodeURI(cover)}`;
-}
-
 /** Live job id for the run in flight, so Cancel has something to cancel. */
 export function onJob(handler: (jobId: string) => void): Promise<() => void> {
   return listen<string>("gen://job", (event) => handler(event.payload));
