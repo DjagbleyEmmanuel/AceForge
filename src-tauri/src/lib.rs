@@ -76,6 +76,22 @@ fn get_settings() -> SettingsView {
     }
 }
 
+/// Grant the webview read access to a cover folder.
+///
+/// Split out because three places need it -- startup for the bundled art and
+/// for a folder chosen in an earlier session, and the setter when the user
+/// changes it -- and missing one of them means covers silently stop working
+/// after a restart.
+fn grant_covers(app: &tauri::AppHandle, dir: &std::path::Path) {
+    use tauri::Manager;
+    if !dir.is_dir() {
+        return;
+    }
+    if let Err(e) = app.asset_protocol_scope().allow_directory(dir, true) {
+        eprintln!("[covers] asset scope for {} failed: {e}", dir.display());
+    }
+}
+
 /// Point the app at a different weights directory.
 ///
 /// Passing an empty string clears the override and restores the default, which
@@ -1272,10 +1288,19 @@ pub fn run() {
             // restart never silently re-runs work.
             set_app_handle(app.handle().clone());
             queue::spawn_runner();
-            // Bundled cover art lives beside the other packaged resources,
-            // which is not the executable's directory in a deb install.
-            if let Ok(dir) = app.path().resource_dir() {
-                covers::set_resource_dir(dir);
+            // Cover art is served through the same asset protocol as audio, so
+            // its folders need granting too. Without this the bundled art is
+            // refused by the webview and every track shows a broken image, which
+            // is what a missing file looks like and is easy to misread.
+            if let Ok(resource) = app.path().resource_dir() {
+                covers::set_resource_dir(resource.clone());
+                grant_covers(app.handle(), &resource.join("covers"));
+            }
+            // A custom cover folder set in an earlier session needs the same
+            // grant, or it stops rendering after a restart.
+            let configured = settings::load().covers_dir.trim().to_string();
+            if !configured.is_empty() {
+                grant_covers(app.handle(), std::path::Path::new(&configured));
             }
             Ok(())
         })

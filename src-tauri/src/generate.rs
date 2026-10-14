@@ -1034,6 +1034,13 @@ fn track_from_path(path: &Path) -> Track {
             // Trust the filesystem for size; the sidecar may be stale.
             stored.bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(stored.bytes);
             stored.path = path.display().to_string();
+            // Cover art is not stored in the sidecar. It used to be assigned
+            // only on the fallback below, which every track with metadata skips
+            // by returning here -- so 40 of 41 songs had none and the library
+            // showed a broken image for them.
+            if stored.cover.is_none() {
+                stored.cover = crate::covers::cover_for(&path.display().to_string());
+            }
             return stored;
         }
     }
@@ -1434,3 +1441,4 @@ mod tests {
         assert!(out.ends_with("..."), "got: {out}");
     }
 }
+
