@@ -1,8 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { ServerStatus, StoreSnapshot, WeightFile } from "./types";
+import type {
+  Layer,
+  LayerStack,
+  LoudnessTarget,
+  NormaliseReport,
+  QueuedJob,
+  SavedSeed,
+  Section,
+  SongProject,
+  ServerStatus,
+  StoreSnapshot,
+  TrackNotes,
+  WeightFile,
+} from "./types";
 
-export type { WeightFile };
+export type { WeightFile, SavedSeed, Layer, LayerStack, Section, SongProject };
 
 export const store = {
   snapshot: () => invoke<StoreSnapshot>("store_snapshot"),
@@ -85,6 +98,7 @@ export interface SettingsView {
   env_override: string | null;
   library_dir: string;
   resolved_library_dir: string;
+  covers_dir: string;
 }
 
 /** Field names are camelCase because Rust serialises `GenerateParams` with
@@ -157,6 +171,8 @@ export interface Track {
   vocalLanguage: string;
   durationSecs: number;
   createdAt: number;
+  /** Absolute path to the assigned cover image, when one exists. */
+  cover: string | null;
 }
 
 export interface GenerateOutcome {
@@ -164,12 +180,17 @@ export interface GenerateOutcome {
   cancelled: boolean;
 }
 
+/** Wire shape of `Preset`. The struct is `rename_all = "camelCase"` in Rust,
+ *  so these are camelCase too -- `params` is a `GenerateParams` and camelCase
+ *  for the same reason. */
 export interface GenerationPreset {
   id: string;
   label: string;
   description: string;
   intent: string;
-  approx_seconds: string;
+  approxSeconds: string;
+  /** Whether this preset is allowed to replace the lyrics field. */
+  setsLyrics: boolean;
   params: GenerateParams;
 }
 
@@ -260,6 +281,176 @@ export const generate = {
     invoke<null>("cancel_track", { port, jobId }),
 };
 
+/** Durable generation queue. `add` returns as soon as the job is on disk; the
+ *  backend runner decides when it starts. */
+export const queue = {
+  list: () => invoke<QueuedJob[]>("queue_list"),
+  add: (params: GenerateParams) => invoke<QueuedJob>("queue_add", { params }),
+  cancel: (jobId: string) => invoke<null>("queue_cancel", { jobId }),
+  retry: (jobId: string) => invoke<QueuedJob>("queue_retry", { jobId }),
+  discard: (jobId: string) => invoke<null>("queue_discard", { jobId }),
+  clearDone: () => invoke<null>("queue_clear_done"),
+  reset: () => invoke<null>("queue_reset"),
+  onChanged: (handler: () => void) =>
+    listen("queue://changed", () => handler()),
+  onStage: (
+    handler: (jobId: string, stage: string, detail: string) => void,
+  ) =>
+    listen<[string, string, string]>("queue://stage", (event) =>
+      handler(event.payload[0], event.payload[1], event.payload[2]),
+    ),
+};
+
+/** Audio seconds per second of generation. 3.0 means a minute of music took
+ *  twenty seconds. Only meaningful once a job finished with both clocks set. */
+export function renderRatio(job: QueuedJob): number | null {
+  if (job.state !== "done" || job.audio_secs <= 0.1 || job.elapsed_secs <= 0.1) {
+    return null;
+  }
+  return job.audio_secs / job.elapsed_secs;
+}
+
+/** Wildcard preview. Runs the same Rust expander the engine-facing path uses. */
+export const wildcards = {
+  preview: (text: string, seed: number) =>
+    invoke<string>("expand_wildcards", { text, seed }),
+  /** Cheap check for the hint: does this text contain a `{a|b}` group at all? */
+  hasWildcards: (text: string) => /\{[^{}]*\|/.test(text),
+};
+
+/** Per-track annotations: section markers and the pinned A/B pair. */
+export const annotations = {
+  notes: (trackId: string) => invoke<TrackNotes>("track_notes", { trackId }),
+  addMarker: (trackId: string, atSecs: number, label: string) =>
+    invoke<TrackNotes>("add_marker", { trackId, atSecs, label }),
+  removeMarker: (trackId: string, index: number) =>
+    invoke<TrackNotes>("remove_marker", { trackId, index }),
+  songs: () => invoke<SongProject[]>("songs"),
+  saveSong: (song: SongProject) => invoke<SongProject[]>("save_song", { song }),
+  deleteSong: (id: string) => invoke<SongProject[]>("delete_song", { id }),
+  layerStacks: () => invoke<LayerStack[]>("layer_stacks"),
+  saveLayerStack: (stack: LayerStack) =>
+    invoke<LayerStack[]>("save_layer_stack", { stack }),
+  deleteLayerStack: (id: string) =>
+    invoke<LayerStack[]>("delete_layer_stack", { id }),
+  seeds: () => invoke<SavedSeed[]>("saved_seeds"),
+  saveSeed: (seed: number, caption: string) =>
+    invoke<SavedSeed[]>("save_seed", { seed, caption }),
+  toggleStar: (seed: number) => invoke<SavedSeed[]>("toggle_star_seed", { seed }),
+  removeSeed: (seed: number) => invoke<SavedSeed[]>("remove_seed", { seed }),
+  abSlots: () => invoke<[string, string] | null>("ab_slots"),
+  setAbSlot: (index: number, trackId: string) =>
+    invoke<[string, string]>("set_ab_slot", { index, trackId }),
+};
+
+export interface CoverEntry {
+  path: string;
+  name: string;
+  fromUserDir: boolean;
+}
+
+/** Cover art: the user's directory first, then the bundled set. */
+export const covers = {
+  list: () => invoke<CoverEntry[]>("list_covers"),
+  setDir: (path: string) => invoke<SettingsView>("set_covers_dir", { path }),
+};
+
+/** Crop a track to a time range. Writes a new file; the original is kept. */
+export type TimingSource = "manual" | "sidecar";
+
+export interface LyricLine {
+  atSecs: number;
+  text: string;
+}
+
+export interface LyricTimings {
+  lines: LyricLine[];
+  source: TimingSource;
+}
+
+/** Lyric timings: a sidecar `.lrc` if present, else what the user tapped in.
+ *
+ *  The engine produces none of its own, so without one of these there is
+ *  nothing to follow and the UI shows plain lyrics instead of pretending.
+ */
+export const lyricsApi = {
+  timings: (trackPath: string) =>
+    invoke<LyricTimings | null>("lyric_timings", { trackPath }),
+  save: (trackPath: string, lines: LyricLine[]) =>
+    invoke<null>("save_lyric_timings", { trackPath, lines }),
+};
+
+export interface SyncReport {
+  path: string;
+  lines: number;
+  tookSecs: number;
+  error: string | null;
+}
+
+export interface SyncProgress {
+  running: boolean;
+  done: number;
+  total: number;
+  current: string;
+  error: string | null;
+}
+
+/** Backfill lyric timings for songs rendered before the engine could emit them.
+ *  Runs one at a time in the background; the audio is discarded each pass. */
+export const lyricSync = {
+  pending: () => invoke<Track[]>("lyric_sync_pending"),
+  start: (paths: string[]) => invoke<SyncProgress>("lyric_sync_start", { paths }),
+  progress: () => invoke<SyncProgress>("lyric_sync_progress"),
+  cancel: () => invoke<null>("lyric_sync_cancel"),
+  onProgress: (handler: (p: SyncProgress) => void) =>
+    listen<SyncProgress>("lyricsync://progress", (e) => handler(e.payload)),
+};
+
+export interface CropResult {
+  seconds: number;
+  replaced: boolean;
+}
+
+export const trimming = {
+  trim: (path: string, fromSecs: number, toSecs: number) =>
+    invoke<number>("trim_track", { path, fromSecs, toSecs }),
+  /** `keep: "only"` keeps the highlighted range, `"except"` cuts it out.
+   *  `replace` overwrites the file; the UI confirms that separately. */
+  crop: (
+    path: string,
+    fromSecs: number,
+    toSecs: number,
+    replace: boolean,
+    keep: "only" | "except",
+  ) => invoke<CropResult>("crop_track", { path, fromSecs, toSecs, replace, keep }),
+};
+
+/** Loudness normalisation. Writes a new file; the original is left alone. */
+export const mastering = {
+  normalise: (
+    path: string,
+    target: LoudnessTarget,
+    referencePath?: string,
+  ) =>
+    invoke<NormaliseReport>("normalise_track", {
+      path,
+      target,
+      referencePath: referencePath ?? null,
+    }),
+};
+
+/** Display names and descriptions for the targets, in the order shown. */
+export const LOUDNESS_TARGETS: {
+  id: LoudnessTarget;
+  label: string;
+  note: string;
+}[] = [
+  { id: "streaming14", label: "-14", note: "streaming default" },
+  { id: "club9", label: "-9", note: "dense club master" },
+  { id: "broadcast24", label: "-24", note: "broadcast / R128" },
+  { id: "loud6", label: "-6", note: "loud, limited hard" },
+];
+
 export const library = {
   list: () => invoke<Track[]>("library"),
   remove: (path: string) => invoke<null>("delete_track", { path }),
@@ -270,6 +461,12 @@ export const library = {
  *  rather than a filesystem path. */
 export function audioUrl(track: Pick<Track, "path">): string {
   return `asset://localhost${encodeURI(track.path)}`;
+}
+
+/** Cover art goes through the same asset protocol as audio. */
+export function coverUrl(cover: string | null | undefined): string | null {
+  if (!cover) return null;
+  return `asset://localhost${encodeURI(cover)}`;
 }
 
 /** Live job id for the run in flight, so Cancel has something to cancel. */

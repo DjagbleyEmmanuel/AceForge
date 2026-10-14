@@ -41,6 +41,17 @@ pub struct Preset {
     pub intent: Intent,
     /// Rough wall-clock estimate on a GTX 1050, measured not guessed.
     pub approx_seconds: String,
+    /// Whether this preset is allowed to write the lyrics field.
+    ///
+    /// Almost none of them should. A preset is a set of *rendering* knobs --
+    /// steps, guidance, length -- and applying one silently replaced whatever
+    /// lyrics the user had pasted in, which is the single most expensive thing
+    /// a preset can clobber. So the field is opt-in and only the preset whose
+    /// entire point is the vocal mode claims it.
+    ///
+    /// "My lyrics" in particular must never set it: its purpose is the text
+    /// already on screen.
+    pub sets_lyrics: bool,
     pub params: GenerateParams,
 }
 
@@ -61,6 +72,7 @@ pub fn all() -> Vec<Preset> {
                           prompt is worth pursuing.".into(),
             intent: Intent::Sketch,
             approx_seconds: "~25s".into(),
+            sets_lyrics: false,
             params: GenerateParams {
                 caption: String::new(),
                 lyrics: "[Instrumental]".into(),
@@ -78,6 +90,7 @@ pub fn all() -> Vec<Preset> {
                           the exact token the DiT was trained on for no-vocal.".into(),
             intent: Intent::Instrumental,
             approx_seconds: "~60s".into(),
+            sets_lyrics: true,
             params: GenerateParams {
                 caption: String::new(),
                 lyrics: "[Instrumental]".into(),
@@ -93,6 +106,7 @@ pub fn all() -> Vec<Preset> {
             description: "Three minutes with planner-written lyrics and metadata.                           This is the closest to what the model was demoed with.".into(),
             intent: Intent::Song,
             approx_seconds: "~3min".into(),
+            sets_lyrics: false,
             params: GenerateParams {
                 caption: String::new(),
                 lyrics: String::new(),
@@ -110,6 +124,7 @@ pub fn all() -> Vec<Preset> {
                           than a full song.".into(),
             intent: Intent::CustomLyrics,
             approx_seconds: "~1min".into(),
+            sets_lyrics: false,
             params: GenerateParams {
                 caption: String::new(),
                 lyrics: String::new(),
@@ -129,6 +144,7 @@ pub fn all() -> Vec<Preset> {
                           step count stays cheap.".into(),
             intent: Intent::Quality,
             approx_seconds: "~6min".into(),
+            sets_lyrics: false,
             params: GenerateParams {
                 caption: String::new(),
                 lyrics: String::new(),
@@ -150,6 +166,7 @@ pub fn all() -> Vec<Preset> {
                           close to its limit.".into(),
             intent: Intent::Ambient,
             approx_seconds: "~7min".into(),
+            sets_lyrics: false,
             params: GenerateParams {
                 caption: String::new(),
                 lyrics: "[Instrumental]".into(),
@@ -169,6 +186,7 @@ pub fn all() -> Vec<Preset> {
                           here, so the variety comes from the renderer.".into(),
             intent: Intent::Explore,
             approx_seconds: "~2min".into(),
+            sets_lyrics: false,
             params: GenerateParams {
                 caption: String::new(),
                 lyrics: String::new(),
@@ -180,3 +198,62 @@ pub fn all() -> Vec<Preset> {
         },
     ]
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Applying a preset must not destroy lyrics the user pasted in.
+    ///
+    /// This is the regression that prompted the `sets_lyrics` flag: every
+    /// preset carried a `lyrics` value, and the UI applied it wholesale, so
+    /// selecting any preset replaced the text in the lyrics box -- either with
+    /// `[Instrumental]` or with an empty string.
+    #[test]
+    fn only_the_instrumental_preset_writes_the_lyrics_field() {
+        let all_presets = all();
+        let owners: Vec<&str> = all_presets
+            .iter()
+            .filter(|p| p.sets_lyrics)
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            owners,
+            vec!["instrumental"],
+            "a preset other than the instrumental one now overwrites pasted lyrics"
+        );
+    }
+
+    /// The preset whose whole purpose is the user's own text must never claim
+    /// the field, however convenient it would be.
+    #[test]
+    fn the_custom_lyrics_preset_does_not_own_lyrics() {
+        let p = all().into_iter().find(|p| p.id == "custom-lyrics").expect("preset exists");
+        assert!(
+            !p.sets_lyrics,
+            "a preset for the user's own lyrics must leave them alone"
+        );
+    }
+
+    /// Presets that do own the field must actually put something in it,
+    /// otherwise the flag is silently a no-op and selecting one leaves a
+    /// vocal track with no indication that instrumental was asked for.
+    #[test]
+    fn a_preset_that_owns_lyrics_supplies_some() {
+        for p in all().into_iter().filter(|p| p.sets_lyrics) {
+            assert!(
+                !p.params.lyrics.trim().is_empty(),
+                "{} claims the lyrics field but supplies nothing",
+                p.id
+            );
+        }
+    }
+
+    /// The flag has to reach the frontend, or the UI cannot honour it.
+    #[test]
+    fn sets_lyrics_is_serialised_for_the_frontend() {
+        let json = serde_json::to_string(&all()).unwrap();
+        assert!(json.contains("\"setsLyrics\":true"), "got {}", &json[..200]);
+        assert!(json.contains("\"setsLyrics\":false"), "got {}", &json[..200]);
+    }
+}
+

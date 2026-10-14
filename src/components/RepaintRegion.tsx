@@ -76,6 +76,19 @@ export function RepaintRegion({
     }
   }, [srcUrl]);
 
+  // Keep an audition inside the region. Playing the whole track to judge ten
+  // seconds of it is the reason the region-scoped button exists.
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a || !srcUrl) return;
+    const onTime = () => {
+      const limit = end ?? duration;
+      if (limit > 0 && a.currentTime >= limit) a.pause();
+    };
+    a.addEventListener("timeupdate", onTime);
+    return () => a.removeEventListener("timeupdate", onTime);
+  }, [srcUrl, end, duration]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !peaks) return;
@@ -155,7 +168,9 @@ export function RepaintRegion({
     if (a.paused) {
       // Always audition from the start of the region, not wherever the last
       // preview left off.
-      if (Math.abs(a.currentTime - start) > 0.5) a.currentTime = start;
+      if (a.currentTime < start || a.currentTime >= (end ?? duration)) {
+        a.currentTime = start;
+      }
       void a.play().catch(() => undefined);
     } else {
       a.pause();
@@ -168,7 +183,7 @@ export function RepaintRegion({
 
   return (
     <div className="space-y-2">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-[11px] text-ink-300">
           Repaint{" "}
           <span className="font-mono text-ink-100">
@@ -180,8 +195,9 @@ export function RepaintRegion({
             onClick={preview}
             disabled={!srcUrl}
             className="btn btn-ghost px-2 py-1 text-[10px] disabled:opacity-40"
+            title="Audition just the selected region"
           >
-            preview
+            preview region
           </button>
           <button
             onClick={() => onChange(0, null)}
@@ -193,6 +209,50 @@ export function RepaintRegion({
         </div>
       </div>
 
+      {/* Exact times. Dragging is imprecise by nature, and a region that is a
+          tenth of a second out wastes a render that takes minutes. */}
+      <div className="flex items-center gap-2 text-[11px]">
+        <label className="flex items-center gap-1 text-ink-500">
+          from
+          <input
+            type="number"
+            min={0}
+            step={0.1}
+            value={Number(start.toFixed(1))}
+            disabled={disabled}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              if (!Number.isFinite(v)) return;
+              onChange(Math.max(0, Math.min(v, endAt - 0.2)), end);
+            }}
+            className="field w-20 px-1.5 py-0.5 font-mono text-[11px]"
+          />
+        </label>
+        <label className="flex items-center gap-1 text-ink-500">
+          to
+          <input
+            type="number"
+            min={0}
+            step={0.1}
+            value={end === null ? "" : Number(end.toFixed(1))}
+            placeholder={duration > 0 ? duration.toFixed(1) : "end"}
+            disabled={disabled}
+            onChange={(e) => {
+              const raw = e.target.value;
+              if (raw.trim() === "") {
+                onChange(start, null);
+                return;
+              }
+              const v = Number(raw);
+              if (!Number.isFinite(v)) return;
+              onChange(start, v <= start + 0.2 ? start + 0.2 : v);
+            }}
+            className="field w-20 px-1.5 py-0.5 font-mono text-[11px]"
+          />
+        </label>
+        <span className="text-ink-600">seconds; empty "to" means the end</span>
+      </div>
+
       <div className="relative">
         <canvas
           ref={canvasRef}
@@ -202,10 +262,25 @@ export function RepaintRegion({
           className={`h-20 w-full rounded-lg ${disabled ? "opacity-40" : "cursor-crosshair"}`}
         />
         {peaks && (
-          <div
-            className="pointer-events-none absolute inset-y-0 rounded-full bg-emerald-400/25 ring-1 ring-emerald-400/60"
-            style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
-          />
+          <>
+            <div
+              className="pointer-events-none absolute inset-y-0 rounded-full bg-emerald-400/25 ring-1 ring-emerald-400/60"
+              style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
+            />
+            {/* Visible grab handles. The region overlay alone does not say
+                where its edges are, and the pointer already snaps to the
+                nearer one -- this makes that affordance visible. */}
+            {([
+              [leftPct, "start"],
+              [leftPct + widthPct, "end"],
+            ] as const).map(([pct, which]) => (
+              <span
+                key={which}
+                className="pointer-events-none absolute inset-y-0 w-1 -translate-x-1/2 rounded-full bg-emerald-300/80"
+                style={{ left: `${pct}%` }}
+              />
+            ))}
+          </>
         )}
       </div>
 

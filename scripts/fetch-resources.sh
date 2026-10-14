@@ -11,6 +11,19 @@
 
 set -euo pipefail
 
+# The ACE-Step engine is copied from a local build tree, so a clone gets whatever
+# that tree was built from. Synced lyrics need the LRC alignment pass, which is
+# not in upstream acestep.cpp -- it was ported in as a patch. Apply it before
+# building, or the engine will accept get_lrc and quietly return no timings.
+if [ -d "$acestep_src" ] && [ -d "$acestep_src/.git" ]; then
+  if git -C "$acestep_src" log --oneline -1 | grep -q . ; then
+    if ! grep -rq "get_lrc" "$acestep_src/src/request.h" 2>/dev/null; then
+      echo "note: the ACE-Step source has no LRC support; synced lyrics will not work."
+      echo "      apply with: git -C \"$acestep_src\" am $here/scripts/acestep-lrc-alignment.patch"
+    fi
+  fi
+fi
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 resources="$here/src-tauri/resources"
 

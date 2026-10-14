@@ -1,14 +1,23 @@
 import { useEffect, useRef, useState } from "react";
-import { library, type Track } from "../lib/api";
+import { annotations, library, trimming, type Track } from "../lib/api";
 import { loadTrackSource } from "../lib/audio";
 import { claimPlayback, releasePlayback } from "../lib/playerRegistry";
+import { isLooping, toggleLooping } from "../lib/loop";
 import {
   computePeaks,
   drawWaveform,
   seekFromEvent,
   type Peaks,
 } from "../lib/waveform";
-import { formatBytes } from "../lib/types";
+import { formatBytes, type Marker } from "../lib/types";
+import { SyncedLyrics } from "./SyncedLyrics";
+import {
+  nativeOutputRate,
+  rebindOutputRate,
+  releaseOutputRate,
+  type OutputRate,
+  type RateBinding,
+} from "../lib/outputRate";
 
 interface Props {
   track: Track;
@@ -36,6 +45,20 @@ export function TrackPlayer({ track, compact = false }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [peaks, setPeaks] = useState<Peaks | null>(null);
   const [rainbow, setRainbow] = useState(true);
+  // Preview controls. Rate and pitch lock are per-player on purpose: auditioning
+  // a take at half speed while the others stay normal is the point.
+  const [rate, setRate] = useState(1);
+  const [pitchLock, setPitchLock] = useState(true);
+  const [outRate, setOutRate] = useState<OutputRate>(() => nativeOutputRate());
+  const [looping, setLoopingHere] = useState(() => isLooping(track.path));
+  const [rateUnavailable, setRateUnavailable] = useState(false);
+  const bindingRef = useRef<RateBinding | null>(null);
+  const [markers, setMarkers] = useState<Marker[]>([]);
+  const [trimFrom, setTrimFrom] = useState("");
+  const [trimTo, setTrimTo] = useState("");
+  const [trimMsg, setTrimMsg] = useState<string | null>(null);
+  const [marking, setMarking] = useState(false);
+  const [markerLabel, setMarkerLabel] = useState("");
 
   // Blob URLs are replaced per track and must be revoked, or a long session
   // leaks every track it has ever played.
@@ -59,6 +82,51 @@ export function TrackPlayer({ track, compact = false }: Props) {
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
+
+  // Markers are keyed by track id, so they reload on their own and not as part
+  // of the audio load: a failed decode must not hide them.
+  useEffect(() => {
+    let alive = true;
+    void annotations
+      .notes(track.id)
+      .then((n) => {
+        if (alive) setMarkers(n.markers);
+      })
+      .catch(() => {
+        if (alive) setMarkers([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [track.id]);
+
+  // An AudioContext outlives the component unless it is closed, and a closed
+  // context leaves the element silent. Every card that ever bound one must
+  // release it on unmount.
+  useEffect(
+    () => () => {
+      releaseOutputRate(bindingRef.current);
+      bindingRef.current = null;
+    },
+    [],
+  );
+
+  // Rate and pitch lock are DOM properties rather than attributes, so they are
+  // applied imperatively. `preservesPitch` is vendor-prefixed in WebKitGTK,
+  // which is the webview this app ships in.
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    el.playbackRate = rate;
+    const withPitch = el as HTMLAudioElement & {
+      preservesPitch?: boolean;
+      mozPreservesPitch?: boolean;
+      webkitPreservesPitch?: boolean;
+    };
+    withPitch.preservesPitch = pitchLock;
+    withPitch.mozPreservesPitch = pitchLock;
+    withPitch.webkitPreservesPitch = pitchLock;
+  }, [rate, pitchLock, visible]);
 
   useEffect(() => {
     if (!visible) return;
@@ -198,8 +266,18 @@ export function TrackPlayer({ track, compact = false }: Props) {
           releasePlayback(track.path);
         }}
         onEnded={() => {
-          setPlaying(false);
           releasePlayback(track.path);
+          // Restarting in place keeps the playback claim, so the card does not
+          // flicker back to paused between repeats.
+          if (looping) {
+            const a = audioRef.current;
+            if (a) {
+              a.currentTime = 0;
+              void a.play().catch(() => undefined);
+            }
+            return;
+          }
+          setPlaying(false);
         }}
         onError={() =>
           setFailed(
@@ -267,6 +345,122 @@ export function TrackPlayer({ track, compact = false }: Props) {
           />
         </button>
 
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            onClick={() => setRate((r) => Math.max(0.5, Math.round((r - 0.05) * 100) / 100))}
+            disabled={rate <= 0.5}
+            aria-label="Slower"
+            title="Slow playback by 0.05x"
+            className="rounded px-1.5 py-0.5 font-mono text-xs text-ink-400 transition hover:bg-ink-750 hover:text-ink-200 disabled:opacity-30"
+          >
+            −
+          </button>
+          <button
+            onClick={() => setRate(1)}
+            title="Back to 1x"
+            className={`min-w-[2.75rem] rounded px-1 py-0.5 font-mono text-xs transition ${
+              rate === 1
+                ? "text-ink-500"
+                : "bg-glow-500/20 text-glow-300 ring-1 ring-glow-500/40"
+            }`}
+          >
+            {rate.toFixed(2)}x
+          </button>
+          <button
+            onClick={() => setRate((r) => Math.min(2, Math.round((r + 0.05) * 100) / 100))}
+            disabled={rate >= 2}
+            aria-label="Faster"
+            title="Speed up by 0.05x"
+            className="rounded px-1.5 py-0.5 font-mono text-xs text-ink-400 transition hover:bg-ink-750 hover:text-ink-200 disabled:opacity-30"
+          >
+            +
+          </button>
+          <button
+            onClick={() => setPitchLock((v) => !v)}
+            aria-pressed={!pitchLock}
+            title={
+              pitchLock
+                ? "Pitch is locked: speed changes tempo only. Click to let pitch shift too."
+                : "Pitch shifts with speed, like turning a jog wheel. Click to lock pitch."
+            }
+            className={`ml-1 rounded px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide transition ${
+              pitchLock
+                ? "bg-ink-800 text-ink-500"
+                : "bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40"
+            }`}
+          >
+            {pitchLock ? "lock" : "dj"}
+          </button>
+          <button
+            onClick={() => setLoopingHere(toggleLooping(track.path))}
+            aria-pressed={looping}
+            aria-label="Loop this track"
+            title={
+              looping
+                ? "Looping this track — click to stop repeating"
+                : "Loop this track"
+            }
+            className={`ml-1 flex h-[18px] items-center gap-0.5 rounded px-1 transition ${
+              looping
+                ? "bg-glow-500/20 text-glow-300 ring-1 ring-glow-500/40"
+                : "text-ink-600 hover:text-ink-400"
+            }`}
+          >
+            <svg
+              width="11"
+              height="11"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.7"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M2.5 6.5A3.5 3.5 0 0 1 6 3h6" />
+              <path d="M10 1l2 2-2 2" />
+              <path d="M13.5 9.5A3.5 3.5 0 0 1 10 13H4" />
+              <path d="M6 15l-2-2 2-2" />
+            </svg>
+            <span className="text-[9px] font-bold leading-none">1</span>
+          </button>
+          <button
+            onClick={() => {
+              const next = outRate === 48000 ? 44100 : 48000;
+              const el = audioRef.current;
+              if (!el || !source) return;
+              try {
+                bindingRef.current = rebindOutputRate(
+                  el,
+                  bindingRef.current,
+                  next,
+                );
+                setOutRate(next);
+                setRateUnavailable(false);
+              } catch {
+                // A refused AudioContext must not break playback. The toggle
+                // stays visible but inert so it is clear why nothing happened.
+                setRateUnavailable(true);
+                bindingRef.current = null;
+              }
+            }}
+            disabled={rateUnavailable || !source}
+            title={
+              rateUnavailable
+                ? "this webview would not create an AudioContext, so the output rate cannot be changed"
+                : outRate === 48000
+                  ? "Play through a 44.1 kHz graph, as streaming services deliver"
+                  : "Play through a 48 kHz graph, matching the render rate"
+            }
+            className={`ml-1 rounded px-1.5 py-0.5 font-mono text-[10px] transition disabled:opacity-40 ${
+              outRate === 44100
+                ? "bg-glow-500/20 text-glow-300 ring-1 ring-glow-500/40"
+                : "bg-ink-800 text-ink-500"
+            }`}
+          >
+            {outRate === 44100 ? "44.1k" : "48k"}
+          </button>
+        </div>
+
         <span className="shrink-0 font-mono text-xs text-ink-400">
           {formatTime(current)} / {total > 0 ? formatTime(total) : "--:--"}
         </span>
@@ -292,12 +486,162 @@ export function TrackPlayer({ track, compact = false }: Props) {
             if (e.key === "ArrowLeft") onScrub(Math.max(0, current - 5));
           }}
         />
+        {markers.map((m, i) => {
+          const dur = total || peaks?.duration || 0;
+          if (dur <= 0) return null;
+          return (
+            <button
+              key={`${m.atSecs}-${i}`}
+              onClick={() => onScrub(m.atSecs)}
+              title={`${m.label} — ${formatTime(m.atSecs)}`}
+              className="absolute bottom-0 top-0 w-px -translate-x-1/2"
+              style={{ left: `${(m.atSecs / dur) * 100}%` }}
+            >
+              <span className="absolute -top-0.5 left-0 block size-1.5 -translate-x-1/2 rounded-full bg-amber-400" />
+            </button>
+          );
+        })}
         {!peaks && (
           <span className="pointer-events-none absolute inset-x-0 bottom-1 text-center text-[10px] text-ink-600">
             decoding waveform…
           </span>
         )}
       </div>
+
+      {/* Crop. Writes a new file rather than editing in place: trimming is a
+          judgement call, and the untrimmed render has to survive a bad one. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[10px] text-ink-600">crop</span>
+        <input
+          type="number"
+          min={0}
+          step={0.1}
+          value={trimFrom}
+          onChange={(e) => setTrimFrom(e.target.value)}
+          placeholder="0.0"
+          className="field w-20 px-1.5 py-0.5 font-mono text-[11px]"
+        />
+        <span className="text-ink-600">→</span>
+        <input
+          type="number"
+          min={0}
+          step={0.1}
+          value={trimTo}
+          onChange={(e) => setTrimTo(e.target.value)}
+          placeholder={total > 0 ? total.toFixed(1) : "end"}
+          className="field w-20 px-1.5 py-0.5 font-mono text-[11px]"
+        />
+        <button
+          onClick={() => setTrimFrom(current.toFixed(1))}
+          title="Use the playhead as the start"
+          className="chip px-1.5 py-0.5 text-[10px]"
+        >
+          in
+        </button>
+        <button
+          onClick={() => setTrimTo(current.toFixed(1))}
+          title="Use the playhead as the end"
+          className="chip px-1.5 py-0.5 text-[10px]"
+        >
+          out
+        </button>
+        <button
+          onClick={async () => {
+            const from = Number(trimFrom);
+            const to = trimTo.trim() === "" ? total : Number(trimTo);
+            if (!Number.isFinite(from) || !Number.isFinite(to)) return;
+            setTrimMsg(null);
+            try {
+              const secs = await trimming.trim(track.path, from, to);
+              setTrimMsg(`cropped copy: ${secs.toFixed(1)}s`);
+              setTrimFrom("");
+              setTrimTo("");
+            } catch (e) {
+              setTrimMsg(String(e));
+            }
+          }}
+          disabled={!source || total <= 0}
+          className="chip px-2 py-1 text-[11px] disabled:opacity-40"
+          title="Save a cropped copy to the library"
+        >
+          save crop
+        </button>
+        {trimMsg && <span className="text-[10px] text-ink-400">{trimMsg}</span>}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={() => setMarking((v) => !v)}
+          aria-pressed={marking}
+          title="Drop a named section marker at the playhead"
+          className={`chip px-2 py-1 text-[11px] ${
+            marking ? "bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40" : ""
+          }`}
+        >
+          + section
+        </button>
+        {marking && (
+          <>
+            <input
+              value={markerLabel}
+              onChange={(e) => setMarkerLabel(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter" || !markerLabel.trim()) return;
+                void annotations
+                  .addMarker(track.id, current, markerLabel.trim())
+                  .then((n) => {
+                    setMarkers(n.markers);
+                    setMarkerLabel("");
+                    setMarking(false);
+                  });
+              }}
+              placeholder="chorus"
+              className="field min-w-0 flex-1 py-1 text-xs"
+              autoFocus
+            />
+            <button
+              onClick={() => {
+                if (!markerLabel.trim()) return;
+                void annotations
+                  .addMarker(track.id, current, markerLabel.trim())
+                  .then((n) => {
+                    setMarkers(n.markers);
+                    setMarkerLabel("");
+                    setMarking(false);
+                  });
+              }}
+              className="chip px-2 py-1 text-[11px]"
+            >
+              save
+            </button>
+          </>
+        )}
+        {markers.map((m, i) => (
+          <span
+            key={`${m.atSecs}-tag-${i}`}
+            className="chip gap-1 px-1.5 py-1 text-[11px] text-amber-300"
+          >
+            <button onClick={() => onScrub(m.atSecs)} title={`jump to ${formatTime(m.atSecs)}`}>
+              {m.label}
+            </button>
+            <button
+              onClick={() =>
+                void annotations.removeMarker(track.id, i).then((n) => setMarkers(n.markers))
+              }
+              title="remove"
+              className="text-ink-500 hover:text-rose-300"
+            >
+              ×
+            </button>
+          </span>
+        ))}
+      </div>
+
+      <SyncedLyrics
+        trackPath={track.path}
+        lyrics={track.lyrics}
+        currentTime={current}
+      />
 
       {failed && (
         <div className="rounded-lg bg-rose-500/10 px-3 py-2 ring-1 ring-rose-500/25">

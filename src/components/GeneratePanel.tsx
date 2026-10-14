@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  generate,
+  queue,
+  wildcards as wildcardsApi,
   music,
-  onJob,
   presets as presetApi,
   userPresets,
   type GenerateParams,
@@ -16,14 +16,26 @@ import {
 } from "../lib/api";
 import { EditableSlider } from "./EditableSlider";
 import { RepaintRegion } from "./RepaintRegion";
+import { SeedManager } from "./SeedManager";
+import { Select } from "./Select";
+import { StemBuilder } from "./StemBuilder";
+import { SongBuilder } from "./SongBuilder";
 import { SourcePicker } from "./SourcePicker";
 import { SamplingGuide, presetTitle, samplingSummary } from "./SamplingGuide";
 import { formatBytes } from "../lib/types";
 
 interface Props {
   port: number | null;
+  /** Applies a stem layer request from StemBuilder to the form. */
+  onStemLayer?: (stem: string, sourcePath: string) => void;
+  /** Queues the repaints SongBuilder needs for one section. */
+  onBuildSection?: (opts: {
+    sourcePath: string;
+    startSecs: number;
+    lengthSecs: number;
+    seed: number;
+  }) => void;
   running: boolean;
-  onGenerated: (tracks: Track[]) => void;
   catalog: WeightFile[];
   onBrowseModels: () => void;
   params: GenerateParams;
@@ -91,14 +103,16 @@ const STEM_NAMES = [
 export function GeneratePanel({
   port,
   running,
-  onGenerated,
   catalog,
   onBrowseModels,
   params,
   setParams,
   tracks,
+  onStemLayer,
+  onBuildSection,
 }: Props) {
-  const [stage, setStage] = useState<{ stage: string; detail: string } | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [presets, setPresets] = useState<GenerationPreset[]>([]);
@@ -106,7 +120,6 @@ export function GeneratePanel({
   const [reference, setReference] = useState<MusicReference | null>(null);
   const [activeSampling, setActiveSampling] = useState<string | null>(null);
   const [showGuide, setShowGuide] = useState(false);
-  const [jobId, setJobId] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -116,15 +129,11 @@ export function GeneratePanel({
     void music.reference().then((ref) => {
       if (alive) setReference(ref);
     });
-    void onJob((id) => {
-      if (alive) setJobId(id);
-    });
     return () => {
       alive = false;
     };
   }, []);
 
-  const busy = stage !== null && stage.stage !== "done" && stage.stage !== "error";
   const instrumental = params.lyrics.trim() === "[Instrumental]";
 
   // The DiT and the sampling preset are halves of one decision. Turbo is a
@@ -142,6 +151,17 @@ export function GeneratePanel({
 
   function set<K extends keyof GenerateParams>(key: K, value: GenerateParams[K]) {
     setParams((p) => ({ ...p, [key]: value }));
+  }
+
+  /** Load a saved set of settings without touching the text the user wrote.
+   *
+   *  Both the caption and the lyrics stored with a preset are what someone was
+   *  thinking about when they hit save, not part of the configuration. Applying
+   *  them was wiping work in progress: the caption was already spared, and
+   *  lyrics were not, so picking a preset mid-write destroyed the pasted text.
+   */
+  function restore(saved: GenerateParams) {
+    setParams((cur) => ({ ...saved, caption: cur.caption, lyrics: cur.lyrics }));
   }
 
   // Cover, repaint and lego are all "render this source audio" tasks. Sending
@@ -163,96 +183,105 @@ export function GeneratePanel({
           ? "This task needs a source track"
           : undefined;
 
+  // Submission is now a queue hand-off rather than an awaited render. The
+  // button returns immediately, the job row in QueuePanel owns progress and
+  // failure, and the engine renders in submission order on its own thread.
   async function submit() {
     if (port === null) return;
     setError(null);
-    setJobId(null);
-    setStage({ stage: "lm", detail: "submitting" });
-
     try {
-      const outcome = await generate.run(port, params);
-      if (outcome.cancelled) {
-        setStage(null);
-        return;
-      }
-      setStage({ stage: "done", detail: "complete" });
-      setJobId(null);
-      onGenerated(outcome.tracks);
-      setTimeout(() => setStage(null), 1600);
+      await queue.add(params);
+      setNotice("Added to the queue — progress is in the queue below.");
+      setTimeout(() => setNotice(null), 2600);
     } catch (e) {
       setError(String(e));
-      setStage(null);
-      setJobId(null);
+      setNotice(null);
     }
   }
 
   return (
     <div className="space-y-5">
       <section className="panel p-5 space-y-4">
-        <div>
-          <span className="label">Presets</span>
-          <div className="mt-2 flex flex-wrap gap-2">
-            {presets.map((preset) => {
-              const active = activePreset === preset.id;
-              return (
-                <button
-                  key={preset.id}
-                  title={`${preset.description}\n\nAbout ${preset.approx_seconds} on this machine`}
-                  onClick={() => {
-                    // Keep the caption the user already typed; a preset sets
-                    // the knobs around it, not the prompt itself.
-                    setParams((p) => ({ ...preset.params, caption: p.caption }));
-                    setActivePreset(preset.id);
-                  }}
-                  className={`chip px-2.5 py-1.5 text-[11px] transition ${
-                    active
-                      ? "bg-glow-500/20 text-glow-300 ring-1 ring-glow-500/45"
-                      : "bg-ink-800 text-ink-300 ring-1 ring-ink-700 hover:bg-ink-750"
-                  }`}
-                >
-                  {preset.label}
-                  <span className="text-ink-500">{preset.approx_seconds}</span>
-                </button>
-              );
-            })}
+        {/* Presets and sampling presets sit side by side and stay narrow. Both
+            were full-panel-width boxes for a one-word choice, which read as an
+            empty field and pushed everything below them down the page. */}
+        <div className="flex flex-wrap items-end gap-3">
+          <Select
+            label="Preset"
+            width="md"
+            placeholder="choose a preset…"
+            value={activePreset ?? ""}
+            options={[
+              { value: "", label: "none" },
+              ...presets.map((preset) => ({
+                value: preset.id,
+                label: preset.label,
+                note: preset.description,
+                meta: preset.approxSeconds,
+              })),
+            ]}
+            onChange={(id) => {
+              const preset = presets.find((p) => p.id === id);
+              if (!preset) {
+                setActivePreset(null);
+                return;
+              }
+              // A preset is a set of rendering knobs. It must not silently
+              // replace the caption the user typed or the lyrics they pasted --
+              // only a preset that explicitly owns the vocal mode may set the
+              // lyrics field. Restoring `caption` alone used to leave lyrics
+              // being wiped, which is what lost pasted text.
+              setParams((p) => ({
+                ...preset.params,
+                caption: p.caption,
+                lyrics: preset.setsLyrics ? preset.params.lyrics : p.lyrics,
+              }));
+              setActivePreset(preset.id);
+            }}
+          />
+
+          <div className="min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <span className="label mb-1.5 block">Sampling</span>
+              <button
+                onClick={() => setShowGuide((v) => !v)}
+                title="What each sampling preset does"
+                className="text-[10px] text-glow-300 underline-offset-2 hover:underline"
+              >
+                {showGuide ? "hide" : "?"}
+              </button>
+            </div>
+            <Select
+              size="sm"
+              width="md"
+              placeholder="no preset"
+              value={activeSampling ?? ""}
+              options={[
+                { value: "", label: "none" },
+                ...(reference?.samplingPresets ?? []).map(
+                  (preset: SamplingPreset) => ({
+                    value: preset.id,
+                    label: preset.label,
+                    note: presetTitle(preset),
+                  }),
+                ),
+              ]}
+              onChange={async (id) => {
+                if (!id) {
+                  setActiveSampling(null);
+                  return;
+                }
+                // Rust owns the merge so a sampling preset can never clobber
+                // the caption or lyrics.
+                const merged = await music.applySampling(id, params);
+                setParams(merged);
+                setActiveSampling(id);
+              }}
+            />
           </div>
         </div>
 
         <div>
-          <div className="flex items-center justify-between gap-2">
-            <span className="label">Sampling</span>
-            <button
-              onClick={() => setShowGuide((v) => !v)}
-              className="text-[11px] text-glow-300 underline-offset-2 hover:underline"
-            >
-              {showGuide ? "hide guide" : "what do these do?"}
-            </button>
-          </div>
-          <div className="mt-2 flex flex-wrap gap-2">
-            {reference?.samplingPresets.map((preset: SamplingPreset) => {
-              const active = activeSampling === preset.id;
-              return (
-                <button
-                  key={preset.id}
-                  title={presetTitle(preset)}
-                  onClick={async () => {
-                    // Rust owns the merge so a sampling preset can never
-                    // clobber the caption or lyrics.
-                    const merged = await music.applySampling(preset.id, params);
-                    setParams(merged);
-                    setActiveSampling(preset.id);
-                  }}
-                  className={`chip px-2.5 py-1.5 text-[11px] transition ${
-                    active
-                      ? "bg-mint-400/15 text-mint-400 ring-1 ring-mint-400/40"
-                      : "bg-ink-800 text-ink-300 ring-1 ring-ink-700 hover:bg-ink-750"
-                  }`}
-                >
-                  {preset.label}
-                </button>
-              );
-            })}
-          </div>
           <p className="mt-2 text-[10px] text-ink-500">
             {samplingSummary(params, activeSampling ?? undefined)}
           </p>
@@ -298,6 +327,38 @@ export function GeneratePanel({
             placeholder="Moody lo-fi hip hop, dusty rhodes, vinyl crackle, slow and warm"
             className="field mt-1.5 resize-y leading-relaxed"
           />
+          {(wildcardsApi.hasWildcards(params.caption) ||
+            wildcardsApi.hasWildcards(params.lyrics)) && (
+            <div className="mt-2">
+              <button
+                onClick={async () => {
+                  // Preview both fields against one seed, exactly as the engine
+                  // path does, so what is shown is what will be rendered.
+                  const seed = params.seed;
+                  const cap = await wildcardsApi.preview(params.caption, seed);
+                  const lyr = params.lyrics
+                    ? await wildcardsApi.preview(params.lyrics, seed)
+                    : "";
+                  setPreview(
+                    lyr ? `caption: ${cap}\nlyrics: ${lyr}` : `caption: ${cap}`,
+                  );
+                }}
+                className="chip px-2 py-1 text-[11px]"
+                title="Show one expansion of the wildcards for the current seed"
+              >
+                preview wildcards
+              </button>
+              {preview && (
+                <pre className="mt-2 whitespace-pre-wrap break-words rounded bg-ink-900 p-2.5 text-[11px] leading-relaxed text-ink-300">
+                  {preview}
+                </pre>
+              )}
+              <p className="mt-1.5 text-[11px] text-ink-500">
+                {`{a|b|c}`} picks one option from the seed. Leave a seed in place
+                and Retry reuses it, so the same prompt gives the same song.
+              </p>
+            </div>
+          )}
         </div>
 
         <TaskSection
@@ -350,7 +411,7 @@ export function GeneratePanel({
 
         <LmSamplingPanel params={params} setParams={setParams} />
 
-        <UserPresetBar params={params} setParams={setParams} />
+        <UserPresetBar params={params} restore={restore} />
 
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <div>
@@ -438,67 +499,19 @@ export function GeneratePanel({
             {showAdvanced ? "hide" : "show"} advanced
           </button>
 
-          {busy ? (
-            <button
-              disabled={!jobId}
-              title={jobId ? undefined : "waiting for the job to be submitted"}
-              onClick={async () => {
-                if (port === null || !jobId) return;
-                setError(null);
-                try {
-                  await generate.cancel(port, jobId);
-                  setJobId(null);
-                  setStage(null);
-                } catch (e) {
-                  setError(String(e));
-                }
-              }}
-              className="btn btn-ghost min-w-36"
-            >
-              cancel
-            </button>
-          ) : (
-            <button
-              onClick={submit}
-              disabled={blockedReason !== undefined}
-              title={blockedReason}
-              className="btn btn-primary min-w-36"
-            >
-              {running ? "Generate" : "server offline"}
-            </button>
-          )}
+          <button
+            onClick={submit}
+            disabled={blockedReason !== undefined}
+            title={blockedReason}
+            className="btn btn-primary min-w-36"
+          >
+            {running ? "Generate" : "server offline"}
+          </button>
         </div>
       </section>
 
-      {busy && (
-        <section className="panel relative overflow-hidden p-4">
-          <div className="sheen pointer-events-none absolute inset-0" />
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-3">
-              <span className="size-2 rounded-full bg-glow-400 pulsing" />
-              <div>
-                <p className="text-sm capitalize">
-                  {stage?.stage === "lm" ? "planner" : "synthesising"}
-                </p>
-                <p className="text-xs text-ink-400">{stage?.detail}</p>
-              </div>
-            </div>
-            <div className="flex gap-1.5">
-              {["lm", "synth"].map((s) => (
-                <span
-                  key={s}
-                  className={`chip ${
-                    stage?.stage === s
-                      ? "bg-glow-500/20 text-glow-300 ring-1 ring-glow-500/40"
-                      : "bg-ink-800 text-ink-500"
-                  }`}
-                >
-                  {s}
-                </span>
-              ))}
-            </div>
-          </div>
-        </section>
+      {notice && (
+        <p className="text-xs text-glow-400">{notice}</p>
       )}
 
       {error && (
@@ -558,20 +571,17 @@ export function GeneratePanel({
               display={(v) => (v === -1 ? "-1 · random" : String(v))}
             />
             <div>
-              <label className="label" htmlFor="format">
-                Format
-              </label>
-              <select
-                id="format"
+              <Select
+                label="Format"
                 value={params.outputFormat}
-                onChange={(e) => set("outputFormat", e.target.value)}
-                className="field mt-1.5"
-              >
-                <option value="mp3">mp3</option>
-                <option value="wav16">wav 16-bit</option>
-                <option value="wav24">wav 24-bit</option>
-                <option value="wav32">wav 32-bit</option>
-              </select>
+                options={[
+                  { value: "mp3", label: "mp3" },
+                  { value: "wav16", label: "wav 16-bit" },
+                  { value: "wav24", label: "wav 24-bit" },
+                  { value: "wav32", label: "wav 32-bit" },
+                ]}
+                onChange={(v) => set("outputFormat", v)}
+              />
             </div>
           </div>
           <p className="text-[11px] leading-relaxed text-ink-500">
@@ -581,6 +591,31 @@ export function GeneratePanel({
           </p>
         </section>
       )}
+
+      {/* Studio panels sit below the form rather than inside it. These are
+          whole tools, not fields; interleaving them pushed the advanced
+          sampling controls a screen away from everything else. */}
+      {onBuildSection && (
+        <SongBuilder
+          tracks={tracks}
+          running={!running}
+          onBuildSection={onBuildSection}
+        />
+      )}
+
+      {onStemLayer && (
+        <StemBuilder
+          tracks={tracks}
+          running={!running}
+          onRenderStem={onStemLayer}
+        />
+      )}
+
+      <SeedManager
+        currentSeed={params.seed}
+        onLoad={(seed) => set("seed", seed)}
+      />
+
     </div>
   );
 }
@@ -648,22 +683,18 @@ function LanguageField({
       <label className="label" htmlFor="vocalLanguage">
         Vocal language
       </label>
-      <select
-        id="vocalLanguage"
+      <Select
+        label="Vocal language"
         value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="field mt-1.5"
-      >
-        <option value="en">English</option>
-        <option value="">auto — let the planner guess</option>
-        {languages
-          .filter((l) => l.code !== "en")
-          .map((l) => (
-            <option key={l.code} value={l.code}>
-              {l.label}
-            </option>
-          ))}
-      </select>
+        options={[
+          { value: "en", label: "English" },
+          { value: "", label: "auto — let the planner guess" },
+          ...languages
+            .filter((l) => l.code !== "en")
+            .map((l) => ({ value: l.code, label: l.label })),
+        ]}
+        onChange={onChange}
+      />
       <p className="mt-1 text-[10px] text-ink-500">
         {auto
           ? "the planner guesses from the caption, and guesses badly"
@@ -722,22 +753,22 @@ function ModelPicker({
         </span>
       </div>
 
-      <select
-        id={id}
+      {/* Empty means "whatever is resident, else the first registry entry",
+          which is not necessarily the one you want, so it is an explicit
+          option rather than a blank row. */}
+      <Select
+        label={label}
         value={selectedMissing ? "" : value}
-        onChange={(e) => onChange(e.target.value)}
         disabled={none}
-        className="field mt-1.5 disabled:cursor-not-allowed disabled:opacity-50"
-      >
-        {/* Empty means "whatever is resident, else the first registry entry",
-            which is not necessarily the one you want. */}
-        <option value="">auto (backend default)</option>
-        {sorted.map((file) => (
-          <option key={file.filename} value={file.filename}>
-            {file.variant} · {file.quant}
-          </option>
-        ))}
-      </select>
+        options={[
+          { value: "", label: "auto (backend default)" },
+          ...sorted.map((file) => ({
+            value: file.filename,
+            label: `${file.variant} · ${file.quant}`,
+          })),
+        ]}
+        onChange={onChange}
+      />
 
       {selectedMissing ? (
         <p className="mt-1 text-[10px] text-amber-400">
@@ -832,6 +863,10 @@ function TaskSection({
   // A source that is no longer in the library (deleted in another view) must
   // not linger as a path the backend would reject.
   const source = tracks.find((t) => t.path === params.sourceAudio) ?? null;
+  // On by default: a repaint almost always wants the source's own style, and a
+  // caption left over from the previous render is the wrong one far more often
+  // than not.
+  const [reuseSourceStyle, setReuseSourceStyle] = useState(true);
   useEffect(() => {
     if (params.sourceAudio && !source) set("sourceAudio", "");
   }, [params.sourceAudio, source, set]);
@@ -842,21 +877,13 @@ function TaskSection({
   return (
     <div className="space-y-3 rounded-xl bg-ink-900/40 p-3 ring-1 ring-ink-800">
       <div>
-        <label className="label" htmlFor="task-type">
-          Task
-        </label>
-        <select
-          id="task-type"
+        <Select
+          label="Task"
+          width="md"
           value={params.taskType}
-          onChange={(e) => set("taskType", e.target.value)}
-          className="field mt-1.5"
-        >
-          {TASK_TYPES.map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.label}
-            </option>
-          ))}
-        </select>
+          options={TASK_TYPES.map((t) => ({ value: t.id, label: t.label }))}
+          onChange={(v) => set("taskType", v)}
+        />
       </div>
 
       {turboBlocked && (
@@ -897,19 +924,18 @@ function TaskSection({
               <label className="label" htmlFor="stem-name">
                 Stem
               </label>
-              <select
-                id="stem-name"
+              <Select
+                label="Stem"
                 value={params.track}
-                onChange={(e) => set("track", e.target.value)}
-                className="field mt-1.5"
-              >
-                <option value="">Unnamed stem</option>
-                {STEM_NAMES.map((n) => (
-                  <option key={n} value={n}>
-                    {n.replace("_", " ")}
-                  </option>
-                ))}
-              </select>
+                options={[
+                  { value: "", label: "Unnamed stem" },
+                  ...STEM_NAMES.map((n) => ({
+                    value: n as string,
+                    label: n.replace("_", " "),
+                  })),
+                ]}
+                onChange={(v) => set("track", v)}
+              />
               <p className="mt-1 text-[10px] leading-relaxed text-ink-500">
                 Becomes the instruction the model is given:{" "}
                 <span className="font-mono text-ink-400">
@@ -969,6 +995,44 @@ function TaskSection({
                   }));
                 }}
               />
+
+              {/* Style reuse. A repaint usually wants the source's own style,
+                  not a retyped version of it, and leaving this on retypes
+                  whatever the caption box happened to hold from the previous
+                  render -- which is worse than either extreme. */}
+              <div className="flex items-center justify-between gap-2 rounded-lg bg-ink-900 px-3 py-2">
+                <label className="flex items-center gap-2 text-[11px] text-ink-300">
+                  <input
+                    type="checkbox"
+                    checked={reuseSourceStyle}
+                    onChange={(e) => setReuseSourceStyle(e.target.checked)}
+                    className="accent-glow-500"
+                  />
+                  reuse the source&apos;s style
+                </label>
+                {reuseSourceStyle && (
+                  <button
+                    onClick={() =>
+                      setParams((p) => ({ ...p, caption: source.caption }))
+                    }
+                    className="chip px-2 py-1 text-[10px]"
+                    title={
+                      source.caption
+                        ? `Fill the caption with "${source.caption.slice(0, 60)}"`
+                        : "This track has no stored caption"
+                    }
+                    disabled={!source.caption}
+                  >
+                    {params.caption === source.caption ? "filled" : "fill caption"}
+                  </button>
+                )}
+              </div>
+              {reuseSourceStyle && params.caption !== source.caption && (
+                <p className="text-[10px] text-amber-400/80">
+                  The caption still differs from the source&apos;s, so the
+                  repaint will use yours rather than its style.
+                </p>
+              )}
               <div>
                 <label className="label" htmlFor="cover-strength">
                   Keep source
@@ -1006,10 +1070,10 @@ function TaskSection({
  */
 function UserPresetBar({
   params,
-  setParams,
+  restore,
 }: {
   params: GenerateParams;
-  setParams: React.Dispatch<React.SetStateAction<GenerateParams>>;
+  restore: (saved: GenerateParams) => void;
 }) {
   const [saved, setSaved] = useState<UserPreset[]>([]);
   const [label, setLabel] = useState("");
@@ -1078,19 +1142,33 @@ function UserPresetBar({
         </button>
       </div>
 
+      {/* Saved settings load from a dropdown rather than as chips, matching the
+          built-in presets. The stored caption is deliberately not restored: it
+          is what the user was thinking about when saving, not a setting. */}
+      <Select
+        label="Load a saved preset"
+        placeholder="none saved yet"
+        value=""
+        disabled={busy}
+        options={[
+          { value: "", label: "none saved yet" },
+          ...saved.map((p) => ({ value: p.id, label: p.label })),
+        ]}
+        onChange={(id) => {
+          const preset = saved.find((p) => p.id === id);
+          if (preset) restore(preset.params);
+        }}
+      />
+
       {saved.length > 0 && (
-        <div className="flex flex-wrap gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
           {saved.map((p) => (
             <span
               key={p.id}
               className="inline-flex items-center gap-1 rounded-full bg-ink-800 ring-1 ring-ink-700"
             >
               <button
-                onClick={() =>
-                  // The stored caption is not restored: it is what the user
-                  // was thinking about when saving, not a setting.
-                  setParams((cur) => ({ ...p.params, caption: cur.caption }))
-                }
+                onClick={() => restore(p.params)}
                 disabled={busy}
                 className="px-2.5 py-1 text-[11px] text-ink-200 hover:text-ink-100 disabled:opacity-40"
               >
@@ -1271,20 +1349,15 @@ function AdapterSection({
       </summary>
 
       <div className="space-y-2 pt-1">
-        <select
+        <Select
+          label="Adapter"
           value={params.adapter}
-          onChange={(e) =>
-            setParams((p) => ({ ...p, adapter: e.target.value }))
-          }
-          className="field"
-        >
-          <option value="">No adapter</option>
-          {available.map((a) => (
-            <option key={a} value={a}>
-              {a}
-            </option>
-          ))}
-        </select>
+          options={[
+            { value: "", label: "No adapter" },
+            ...available.map((a) => ({ value: a, label: a })),
+          ]}
+          onChange={(v) => setParams((p) => ({ ...p, adapter: v }))}
+        />
 
         {available.length === 0 && (
           <p className="text-[10px] leading-relaxed text-ink-500">

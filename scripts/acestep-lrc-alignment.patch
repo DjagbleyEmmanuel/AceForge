@@ -1,0 +1,1530 @@
+From 85427c76108a1edc13a4ccdd578b51245d56efcf Mon Sep 17 00:00:00 2001
+From: DjagbleyEmmanuel <djagbleyemmanuel@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 12:49:54 +0000
+Subject: [PATCH] feat(lrc): port native synchronized lyric alignment
+
+Ports the get_lrc pipeline from the HOT-Step fork of acestep.cpp: an
+extra DiT pass for cross-attention alignment, DTW lyric-audio
+alignment with bidirectional consensus, and LRC formatting.
+
+Upstream lacks the LoRA/section parameters the fork's graph helpers
+carry, so the alignment graph's self-attention call takes the upstream
+argument list -- it passed nullptr for the LoRA parameter anyway.
+
+The fork's X-LRC-Text header is emitted from ace-server rather than
+hot-step-server; base64 is implemented locally for the one call site.
+---
+ src/alignment-config.h     | 172 +++++++++++++
+ src/dit-alignment-graph.h  | 367 ++++++++++++++++++++++++++
+ src/lrc-alignment.h        | 516 +++++++++++++++++++++++++++++++++++++
+ src/pipeline-synth-impl.h  |   8 +
+ src/pipeline-synth-ops.cpp |  71 +++++
+ src/pipeline-synth.cpp     | 122 +++++++++
+ src/pipeline-synth.h       |  12 +
+ src/request.cpp            |  12 +
+ src/request.h              |   5 +
+ tools/ace-server.cpp       |  36 ++-
+ tools/synth-batch-runner.h |  13 +-
+ 11 files changed, 1332 insertions(+), 2 deletions(-)
+ create mode 100644 src/alignment-config.h
+ create mode 100644 src/dit-alignment-graph.h
+ create mode 100644 src/lrc-alignment.h
+
+diff --git a/src/alignment-config.h b/src/alignment-config.h
+new file mode 100644
+index 0000000..00be44c
+--- /dev/null
++++ b/src/alignment-config.h
+@@ -0,0 +1,172 @@
++#pragma once
++// alignment-config.h: cross-attention layer/head configuration for LRC alignment
++//
++// Specifies which DiT cross-attention heads produce useful lyric-to-audio
++// alignment. The default config targets the 2B model (24 layers, 16 heads).
++// XL models (32 layers, 32 heads) must provide their config via GGUF metadata.
++
++#include <cstdio>
++#include <string>
++#include <vector>
++
++struct AlignLayerHeads {
++    int              layer;
++    std::vector<int> heads;
++};
++
++struct AlignmentConfig {
++    std::vector<AlignLayerHeads> targets;
++    int  max_layer;    // max(layer indices) — early exit boundary
++    int  total_heads;  // sum of all head counts
++    bool valid;        // false if config is unavailable/unsupported
++};
++
++// Default config for the 2B DiT model (24 layers, 16 heads per layer).
++// Python reference: {2: [6], 3: [10, 11], 4: [3], 5: [8, 9], 6: [8]}
++static AlignmentConfig alignment_config_default_2b() {
++    AlignmentConfig cfg;
++    cfg.targets = {
++        {2, {6}},
++        {3, {10, 11}},
++        {4, {3}},
++        {5, {8, 9}},
++        {6, {8}},
++    };
++    cfg.max_layer   = 6;
++    cfg.total_heads = 7;
++    cfg.valid       = true;
++    return cfg;
++}
++
++// Parse alignment config from a JSON string (from GGUF metadata).
++// Format: {"2": [6], "3": [10, 11], "4": [3], ...}
++// Returns invalid config on parse failure.
++static AlignmentConfig alignment_config_parse_json(const std::string & json) {
++    AlignmentConfig cfg;
++    cfg.max_layer   = -1;
++    cfg.total_heads = 0;
++    cfg.valid       = false;
++
++    if (json.empty()) {
++        return cfg;
++    }
++
++    // Minimal JSON object parser: { "key": [int, ...], ... }
++    // Good enough for the simple nested structure, no external deps.
++    size_t pos = json.find('{');
++    if (pos == std::string::npos) {
++        return cfg;
++    }
++    pos++;
++
++    while (pos < json.size()) {
++        // skip whitespace/commas
++        while (pos < json.size() && (json[pos] == ' ' || json[pos] == ',' || json[pos] == '\n' || json[pos] == '\r' || json[pos] == '\t')) {
++            pos++;
++        }
++        if (pos >= json.size() || json[pos] == '}') {
++            break;
++        }
++
++        // parse key (quoted string or bare number)
++        if (json[pos] != '"') {
++            break;  // unexpected
++        }
++        pos++;
++        size_t key_end = json.find('"', pos);
++        if (key_end == std::string::npos) {
++            break;
++        }
++        int layer = std::atoi(json.substr(pos, key_end - pos).c_str());
++        pos       = key_end + 1;
++
++        // skip to ':'
++        while (pos < json.size() && json[pos] != ':') {
++            pos++;
++        }
++        if (pos >= json.size()) {
++            break;
++        }
++        pos++;
++
++        // skip to '['
++        while (pos < json.size() && json[pos] != '[') {
++            pos++;
++        }
++        if (pos >= json.size()) {
++            break;
++        }
++        pos++;
++
++        // parse head indices
++        AlignLayerHeads lh;
++        lh.layer = layer;
++        while (pos < json.size() && json[pos] != ']') {
++            while (pos < json.size() && (json[pos] == ' ' || json[pos] == ',')) {
++                pos++;
++            }
++            if (pos >= json.size() || json[pos] == ']') {
++                break;
++            }
++            int  head = 0;
++            bool neg  = false;
++            if (json[pos] == '-') {
++                neg = true;
++                pos++;
++            }
++            while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
++                head = head * 10 + (json[pos] - '0');
++                pos++;
++            }
++            if (neg) {
++                head = -head;
++            }
++            lh.heads.push_back(head);
++        }
++        if (pos < json.size()) {
++            pos++;  // skip ']'
++        }
++
++        if (!lh.heads.empty()) {
++            cfg.targets.push_back(lh);
++            cfg.total_heads += (int) lh.heads.size();
++            if (layer > cfg.max_layer) {
++                cfg.max_layer = layer;
++            }
++        }
++    }
++
++    cfg.valid = !cfg.targets.empty();
++    if (cfg.valid) {
++        fprintf(stderr, "[AlignConfig] Parsed: %d layer groups, %d total heads, max_layer=%d\n",
++                (int) cfg.targets.size(), cfg.total_heads, cfg.max_layer);
++    }
++    return cfg;
++}
++
++// Resolve alignment config: use GGUF config if available, else fall back
++// to 2B default (only safe for 24-layer models).
++static AlignmentConfig alignment_config_resolve(const std::string & gguf_json, int n_layers) {
++    // Try GGUF config first
++    if (!gguf_json.empty()) {
++        AlignmentConfig cfg = alignment_config_parse_json(gguf_json);
++        if (cfg.valid) {
++            return cfg;
++        }
++        fprintf(stderr, "[AlignConfig] WARNING: failed to parse GGUF alignment config, trying default\n");
++    }
++
++    // Fall back to 2B default only for 24-layer models
++    if (n_layers == 24) {
++        fprintf(stderr, "[AlignConfig] Using default 2B config (24 layers)\n");
++        return alignment_config_default_2b();
++    }
++
++    // Unknown model — can't guess
++    fprintf(stderr, "[AlignConfig] WARNING: no alignment config for %d-layer model\n", n_layers);
++    AlignmentConfig invalid;
++    invalid.max_layer   = -1;
++    invalid.total_heads = 0;
++    invalid.valid       = false;
++    return invalid;
++}
+diff --git a/src/dit-alignment-graph.h b/src/dit-alignment-graph.h
+new file mode 100644
+index 0000000..341266c
+--- /dev/null
++++ b/src/dit-alignment-graph.h
+@@ -0,0 +1,367 @@
++#pragma once
++// dit-alignment-graph.h: Modified DiT forward for cross-attention score extraction
++//
++// Builds a partial DiT graph (layers 0..max_layer) with manual cross-attention
++// on target layers to materialize attention weights. Used by LRC Phase 3.
++
++#include "alignment-config.h"
++#include "dit-graph.h"
++#include "dit.h"
++#include "philox.h"
++
++#include <cstring>
++#include <string>
++#include <vector>
++
++// Build cross-attention with explicit score output for a target layer.
++// Same as dit_ggml_build_cross_attn but splits the attention into
++// Q*K^T -> softmax (tagged output) -> V multiply.
++// Returns: {attn_output [H,S,N], scores_per_head vector}
++struct CrossAttnWithScores {
++    struct ggml_tensor *              attn_output;
++    std::vector<struct ggml_tensor *> head_scores;  // [enc_S, S, 1, N] per target head
++};
++
++static CrossAttnWithScores dit_build_cross_attn_scored(
++    struct ggml_context * ctx,
++    DiTGGML *             m,
++    DiTGGMLLayer *        ly,
++    struct ggml_tensor *  norm_ca,
++    struct ggml_tensor *  enc,
++    struct ggml_tensor *  ca_mask,
++    int                   S,
++    int                   enc_S,
++    int                   N,
++    int                   layer_idx,
++    const std::vector<int> & target_heads) {
++
++    CrossAttnWithScores result;
++    DiTGGMLConfig & c   = m->cfg;
++    int             D   = c.head_dim;
++    int             Nh  = c.n_heads;
++    int             Nkv = c.n_kv_heads;
++
++    // QKV projections (same logic as dit_ggml_build_cross_attn)
++    int                 q_dim  = Nh * D;
++    int                 kv_dim = Nkv * D;
++    struct ggml_tensor *q, *k, *v;
++    if (ly->ca_qkv) {
++        struct ggml_tensor * w_q  = ggml_view_2d(ctx, ly->ca_qkv, ly->ca_qkv->ne[0], q_dim, ly->ca_qkv->nb[1], 0);
++        struct ggml_tensor * w_kv = ggml_view_2d(ctx, ly->ca_qkv, ly->ca_qkv->ne[0], 2 * kv_dim, ly->ca_qkv->nb[1],
++                                                 (size_t) q_dim * ly->ca_qkv->nb[1]);
++        q                         = ggml_mul_mat(ctx, w_q, norm_ca);
++        struct ggml_tensor * kv   = ggml_mul_mat(ctx, w_kv, enc);
++        k = ggml_cont(ctx, ggml_view_3d(ctx, kv, kv_dim, enc_S, N, kv->nb[1], kv->nb[2], 0));
++        v = ggml_cont(ctx, ggml_view_3d(ctx, kv, kv_dim, enc_S, N, kv->nb[1], kv->nb[2], (size_t) kv_dim * kv->nb[0]));
++    } else if (ly->ca_kv) {
++        q                       = dit_ggml_linear(ctx, ly->ca_q_proj, norm_ca);
++        struct ggml_tensor * kv = ggml_mul_mat(ctx, ly->ca_kv, enc);
++        k = ggml_cont(ctx, ggml_view_3d(ctx, kv, kv_dim, enc_S, N, kv->nb[1], kv->nb[2], 0));
++        v = ggml_cont(ctx, ggml_view_3d(ctx, kv, kv_dim, enc_S, N, kv->nb[1], kv->nb[2], (size_t) kv_dim * kv->nb[0]));
++    } else {
++        q = dit_ggml_linear(ctx, ly->ca_q_proj, norm_ca);
++        k = dit_ggml_linear(ctx, ly->ca_k_proj, enc);
++        v = dit_ggml_linear(ctx, ly->ca_v_proj, enc);
++    }
++
++    // Reshape + permute to [D, seq, heads, N]
++    q = ggml_permute(ctx, ggml_reshape_4d(ctx, q, D, Nh, S, N), 0, 2, 1, 3);
++    k = ggml_permute(ctx, ggml_reshape_4d(ctx, k, D, Nkv, enc_S, N), 0, 2, 1, 3);
++    v = ggml_permute(ctx, ggml_reshape_4d(ctx, v, D, Nkv, enc_S, N), 0, 2, 1, 3);
++
++    // QK-norm
++    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, c.rms_norm_eps), dit_ggml_f32(ctx, ly->ca_q_norm));
++    k = ggml_mul(ctx, ggml_rms_norm(ctx, k, c.rms_norm_eps), dit_ggml_f32(ctx, ly->ca_k_norm));
++
++    float scale = 1.0f / sqrtf((float) D);
++
++    // Manual attention: compute full scores, tag target heads as outputs
++    // Q: [D, S, Nh, N], K: [D, enc_S, Nkv, N]
++    // scores = Q^T * K: [enc_S, S, Nh, N] (ggml mul_mat: [D,enc_S,Nkv,N]^T * [D,S,Nh,N])
++    struct ggml_tensor * scores = ggml_mul_mat(ctx, k, q);  // [enc_S, S, Nh, N]
++    scores = ggml_soft_max_ext(ctx, scores, ca_mask, scale, 0.0f);
++
++    // Tag target heads as named outputs
++    for (int head_idx : target_heads) {
++        if (head_idx >= Nh) continue;
++        // Extract single head: view [enc_S, S, 1, N] at offset head_idx
++        size_t head_offset = (size_t) head_idx * scores->nb[2];
++        struct ggml_tensor * head_scores = ggml_view_4d(ctx, scores,
++            enc_S, S, 1, N,
++            scores->nb[1], scores->nb[2], scores->nb[3],
++            head_offset);
++        head_scores = ggml_cont(ctx, head_scores);
++
++        char name[64];
++        snprintf(name, sizeof(name), "ca_L%d_H%d", layer_idx, head_idx);
++        ggml_set_name(head_scores, name);
++        ggml_set_output(head_scores);
++        result.head_scores.push_back(head_scores);
++    }
++
++    // V multiply: attn_out = scores * V^T
++    struct ggml_tensor * vt   = ggml_cont(ctx, ggml_transpose(ctx, v));
++    struct ggml_tensor * attn = ggml_mul_mat(ctx, vt, scores);
++    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
++    attn = ggml_reshape_3d(ctx, attn, Nh * D, S, N);
++
++    result.attn_output = dit_ggml_linear(ctx, ly->ca_o_proj, attn);
++    return result;
++}
++
++// Build a partial alignment layer: same as dit_ggml_build_layer but uses
++// dit_build_cross_attn_scored for target layers.
++static struct ggml_tensor * dit_build_alignment_layer(
++    struct ggml_context *       ctx,
++    DiTGGML *                   m,
++    int                         layer_idx,
++    struct ggml_tensor *        hidden,
++    struct ggml_tensor *        tproj,
++    struct ggml_tensor *        enc,
++    struct ggml_tensor *        positions,
++    struct ggml_tensor *        sa_mask,
++    struct ggml_tensor *        ca_mask,
++    int S, int enc_S, int N,
++    const std::vector<int> *    target_heads,  // NULL = not a target layer
++    std::vector<struct ggml_tensor *> & score_outputs) {
++
++    DiTGGMLConfig & c  = m->cfg;
++    DiTGGMLLayer *  ly = &m->layers[layer_idx];
++    int             H  = c.hidden_size;
++
++    // AdaLN
++    struct ggml_tensor * ss = ly->scale_shift_table;
++    if (ss->type != GGML_TYPE_F32) ss = ggml_cast(ctx, ss, GGML_TYPE_F32);
++    struct ggml_tensor * ss_flat = ggml_reshape_1d(ctx, ss, 6 * H);
++    struct ggml_tensor * adaln   = ggml_add(ctx, ss_flat, tproj);
++
++    size_t Hb = H * sizeof(float);
++    struct ggml_tensor * shift_sa  = ggml_view_1d(ctx, adaln, H, 0 * Hb);
++    struct ggml_tensor * scale_sa  = ggml_view_1d(ctx, adaln, H, 1 * Hb);
++    struct ggml_tensor * gate_sa   = ggml_view_1d(ctx, adaln, H, 2 * Hb);
++    struct ggml_tensor * shift_ffn = ggml_view_1d(ctx, adaln, H, 3 * Hb);
++    struct ggml_tensor * scale_ffn = ggml_view_1d(ctx, adaln, H, 4 * Hb);
++    struct ggml_tensor * gate_ffn  = ggml_view_1d(ctx, adaln, H, 5 * Hb);
++
++    // Self-attention
++    struct ggml_tensor * residual = hidden;
++    struct ggml_tensor * norm_sa  = dit_ggml_rms_norm_weighted(ctx, hidden, ly->self_attn_norm, c.rms_norm_eps);
++    norm_sa = dit_ggml_adaln(ctx, norm_sa, scale_sa, shift_sa, m->scalar_one);
++    struct ggml_tensor * sa_out = dit_ggml_build_self_attn(ctx, m, ly, norm_sa, positions, sa_mask, S, N, -1);
++    hidden = dit_ggml_gated_add(ctx, residual, sa_out, gate_sa);
++
++    // Cross-attention
++    if (enc) {
++        struct ggml_tensor * norm_ca = dit_ggml_rms_norm_weighted(ctx, hidden, ly->cross_attn_norm, c.rms_norm_eps);
++
++        if (target_heads && !target_heads->empty()) {
++            // Scored cross-attention: extracts attention weights for target heads
++            auto ca_result = dit_build_cross_attn_scored(ctx, m, ly, norm_ca, enc, ca_mask,
++                                                          S, enc_S, N, layer_idx, *target_heads);
++            hidden = ggml_add(ctx, hidden, ca_result.attn_output);
++            for (auto * s : ca_result.head_scores) {
++                score_outputs.push_back(s);
++            }
++        } else {
++            // Normal cross-attention (non-target layers)
++            struct ggml_tensor * ca_out = dit_ggml_build_cross_attn(ctx, m, ly, norm_ca, enc, positions, ca_mask, S, enc_S, N);
++            hidden = ggml_add(ctx, hidden, ca_out);
++        }
++    }
++
++    // FFN
++    residual = hidden;
++    struct ggml_tensor * norm_ffn = dit_ggml_rms_norm_weighted(ctx, hidden, ly->mlp_norm, c.rms_norm_eps);
++    norm_ffn = dit_ggml_adaln(ctx, norm_ffn, scale_ffn, shift_ffn, m->scalar_one);
++    struct ggml_tensor * ffn_out = dit_ggml_build_mlp(ctx, m, ly, norm_ffn, S);
++    hidden = dit_ggml_gated_add(ctx, residual, ffn_out, gate_ffn);
++
++    return hidden;
++}
++
++// Extract cross-attention alignment scores from the DiT.
++// Builds a partial graph (layers 0..max_layer), runs one forward pass at t_last,
++// reads attention scores for configured layer/head pairs.
++//
++// out_scores: [total_heads, enc_S, S] f32, caller-allocated.
++// Returns 0 on success, -1 on error.
++static int dit_alignment_extract(
++    DiTGGML *              dit,
++    const AlignmentConfig & cfg,
++    const float * output,      // [T * Oc] DiT output (pred_latent), batch 0 only
++    const float * context,     // [T * ctx_ch] context latents, batch 0 only
++    const float * enc_hidden,  // [enc_S * H_cond] encoder hidden states, batch 0 only
++    int T, int S, int enc_S,
++    int num_steps,
++    float * out_scores) {
++
++    if (!cfg.valid || cfg.total_heads <= 0) {
++        fprintf(stderr, "[Align-Extract] ERROR: invalid alignment config\n");
++        return -1;
++    }
++
++    DiTGGMLConfig & c = dit->cfg;
++    int P   = c.patch_size;
++    int N   = 1;  // alignment always batch=1
++    int Oc  = c.out_channels;
++    int Ic  = c.in_channels;
++
++    // Compute t_last and xt
++    float t_last = 1.0f / (float) num_steps;
++
++    // Generate alignment noise (seed 42, matching Python)
++    std::vector<float> align_noise(Oc * T);
++    philox_randn(42, align_noise.data(), Oc * T, true);
++
++    // xt = t_last * noise + (1 - t_last) * output
++    std::vector<float> xt(Oc * T);
++    for (int i = 0; i < Oc * T; i++) {
++        xt[i] = t_last * align_noise[i] + (1.0f - t_last) * output[i];
++    }
++
++    // Build input_latents: [in_channels, T, 1] = concat(context, xt)
++    int ctx_ch = Ic - Oc;  // 64 typically
++    std::vector<float> input_latents(Ic * T);
++    for (int t = 0; t < T; t++) {
++        // context channels first, then xt channels
++        memcpy(input_latents.data() + t * Ic, context + t * ctx_ch, ctx_ch * sizeof(float));
++        memcpy(input_latents.data() + t * Ic + ctx_ch, xt.data() + t * Oc, Oc * sizeof(float));
++    }
++
++    // Build alignment graph
++    size_t ctx_size = ggml_tensor_overhead() * 4096 + 256 * 1024 * 1024;
++    struct ggml_init_params gp = { ctx_size, NULL, true };
++    struct ggml_context * ctx = ggml_init(gp);
++    if (!ctx) {
++        fprintf(stderr, "[Align-Extract] ERROR: ggml_init failed\n");
++        return -1;
++    }
++
++    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
++
++    // Input tensors
++    struct ggml_tensor * t_input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Ic, T, N);
++    ggml_set_name(t_input, "input_latents"); ggml_set_input(t_input);
++
++    int H_enc = (int) dit->cond_emb_w->ne[0];
++    struct ggml_tensor * t_enc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H_enc, enc_S, N);
++    ggml_set_name(t_enc, "enc_hidden"); ggml_set_input(t_enc);
++
++    struct ggml_tensor * t_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
++    ggml_set_name(t_t, "t"); ggml_set_input(t_t);
++
++    struct ggml_tensor * t_tr = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
++    ggml_set_name(t_tr, "t_r"); ggml_set_input(t_tr);
++
++    struct ggml_tensor * t_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S * N);
++    ggml_set_name(t_pos, "positions"); ggml_set_input(t_pos);
++
++    struct ggml_tensor * sa_mask_sw = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, S, S, 1, N);
++    ggml_set_name(sa_mask_sw, "sa_mask_sw"); ggml_set_input(sa_mask_sw);
++
++    struct ggml_tensor * sa_mask_pad = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, S, S, 1, N);
++    ggml_set_name(sa_mask_pad, "sa_mask_pad"); ggml_set_input(sa_mask_pad);
++
++    struct ggml_tensor * ca_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, enc_S, S, 1, N);
++    ggml_set_name(ca_mask, "ca_mask"); ggml_set_input(ca_mask);
++
++    // Timestep embeddings
++    struct ggml_tensor * tproj, * temb;
++    {
++        struct ggml_tensor * tproj_t;
++        struct ggml_tensor * temb_t = dit_ggml_build_temb(ctx, &dit->time_embed, t_t, &tproj_t, "_t");
++        struct ggml_tensor * t_diff = ggml_sub(ctx, t_t, t_tr);
++        struct ggml_tensor * tproj_r;
++        struct ggml_tensor * temb_r = dit_ggml_build_temb(ctx, &dit->time_embed_r, t_diff, &tproj_r, "_r");
++        temb  = ggml_add(ctx, temb_t, temb_r);
++        tproj = ggml_add(ctx, tproj_t, tproj_r);
++    }
++
++    // proj_in
++    struct ggml_tensor * patched = ggml_reshape_3d(ctx, t_input, Ic * P, S, N);
++    struct ggml_tensor * hidden  = dit_ggml_linear_bias(ctx, dit->proj_in_w, dit->proj_in_b, patched);
++
++    // Condition embedder
++    struct ggml_tensor * enc = dit_ggml_linear_bias(ctx, dit->cond_emb_w, dit->cond_emb_b, t_enc);
++
++    // Build target layer lookup
++    std::vector<std::vector<int>> layer_heads(cfg.max_layer + 1);
++    for (const auto & lh : cfg.targets) {
++        if (lh.layer <= cfg.max_layer) {
++            layer_heads[lh.layer] = lh.heads;
++        }
++    }
++
++    // Layers 0..max_layer (early exit)
++    std::vector<struct ggml_tensor *> score_outputs;
++    for (int i = 0; i <= cfg.max_layer && i < c.n_layers; i++) {
++        struct ggml_tensor * sa_mask = (dit->layers[i].layer_type == 0) ? sa_mask_sw : sa_mask_pad;
++        const std::vector<int> * heads = (i < (int) layer_heads.size() && !layer_heads[i].empty())
++                                         ? &layer_heads[i] : nullptr;
++        hidden = dit_build_alignment_layer(ctx, dit, i, hidden, tproj, enc, t_pos,
++                                           sa_mask, ca_mask, S, enc_S, N,
++                                           heads, score_outputs);
++    }
++
++    // Build the graph from all score outputs
++    for (auto * s : score_outputs) {
++        ggml_build_forward_expand(gf, s);
++    }
++    // Also need hidden to be computed (drives dependencies)
++    ggml_build_forward_expand(gf, hidden);
++
++    // Allocate and compute
++    ggml_backend_sched_reset(dit->sched);
++    if (!ggml_backend_sched_alloc_graph(dit->sched, gf)) {
++        fprintf(stderr, "[Align-Extract] ERROR: graph alloc failed\n");
++        ggml_free(ctx);
++        return -1;
++    }
++
++    // Set input data
++    ggml_backend_tensor_set(t_input, input_latents.data(), 0, Ic * T * sizeof(float));
++    ggml_backend_tensor_set(t_enc, enc_hidden, 0, H_enc * enc_S * sizeof(float));
++    ggml_backend_tensor_set(t_t, &t_last, 0, sizeof(float));
++    ggml_backend_tensor_set(t_tr, &t_last, 0, sizeof(float));  // t_r = t for alignment
++
++    // Positions: 0..S-1
++    std::vector<int> pos_data(S);
++    for (int i = 0; i < S; i++) pos_data[i] = i;
++    ggml_backend_tensor_set(t_pos, pos_data.data(), 0, S * sizeof(int));
++
++    // Masks: all zeros (no padding for single sample)
++    std::vector<uint16_t> zero_sa(S * S, 0);
++    ggml_backend_tensor_set(sa_mask_sw, zero_sa.data(), 0, S * S * sizeof(uint16_t));
++    ggml_backend_tensor_set(sa_mask_pad, zero_sa.data(), 0, S * S * sizeof(uint16_t));
++    std::vector<uint16_t> zero_ca(enc_S * S, 0);
++    ggml_backend_tensor_set(ca_mask, zero_ca.data(), 0, enc_S * S * sizeof(uint16_t));
++
++    // Compute
++    Timer timer;
++    ggml_backend_sched_graph_compute(dit->sched, gf);
++    fprintf(stderr, "[Align-Extract] Graph compute: %.1f ms (%d layers)\n", timer.ms(), cfg.max_layer + 1);
++
++    // Read back scores
++    int score_idx = 0;
++    for (const auto & lh : cfg.targets) {
++        for (int head : lh.heads) {
++            char name[64];
++            snprintf(name, sizeof(name), "ca_L%d_H%d", lh.layer, head);
++            struct ggml_tensor * t = ggml_graph_get_tensor(gf, name);
++            if (!t) {
++                fprintf(stderr, "[Align-Extract] WARNING: tensor '%s' not found\n", name);
++                memset(out_scores + score_idx * enc_S * S, 0, enc_S * S * sizeof(float));
++            } else {
++                // Tensor is [enc_S, S, 1, N] — read as [enc_S * S] floats
++                // We need [S, enc_S] (transposed: frames × tokens) but Python transposes
++                // at a later stage. Store as [enc_S, S] here.
++                ggml_backend_tensor_get(t, out_scores + score_idx * enc_S * S, 0, enc_S * S * sizeof(float));
++            }
++            score_idx++;
++        }
++    }
++
++    ggml_free(ctx);
++    fprintf(stderr, "[Align-Extract] Extracted %d/%d head scores\n", score_idx, cfg.total_heads);
++    return 0;
++}
+diff --git a/src/lrc-alignment.h b/src/lrc-alignment.h
+new file mode 100644
+index 0000000..99aa1dc
+--- /dev/null
++++ b/src/lrc-alignment.h
+@@ -0,0 +1,516 @@
++#pragma once
++// lrc-alignment.h: LRC lyric timestamp alignment (pure C++, no GGML)
++//
++// Port of Python MusicStampsAligner + _dtw.py:
++//   - Dynamic Time Warping (DTW)
++//   - Bidirectional consensus denoising
++//   - Median filter
++//   - Token→sentence grouping
++//   - LRC formatting
++//
++// All operations run on CPU after attention scores are read back from GPU.
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <numeric>
++#include <string>
++#include <vector>
++
++// ====================== DTW ======================
++
++// Dynamic Time Warping on a cost matrix [N, M].
++// Returns aligned (text_indices, time_indices) arrays.
++// Port of _dtw.py::dtw_cpu + _backtrace.
++static void dtw_cpu(const double * cost_matrix, int N, int M,
++                    std::vector<int> & text_indices,
++                    std::vector<int> & time_indices) {
++    // Allocate cost and trace matrices (1-indexed, so +1)
++    std::vector<float> cost((N + 1) * (M + 1), std::numeric_limits<float>::infinity());
++    std::vector<int>   trace((N + 1) * (M + 1), -1);
++
++    auto idx = [&](int i, int j) { return i * (M + 1) + j; };
++
++    cost[idx(0, 0)] = 0.0f;
++
++    for (int j = 1; j <= M; j++) {
++        for (int i = 1; i <= N; i++) {
++            float c0 = cost[idx(i - 1, j - 1)];
++            float c1 = cost[idx(i - 1, j)];
++            float c2 = cost[idx(i, j - 1)];
++
++            float c;
++            int   t;
++            if (c0 < c1 && c0 < c2) {
++                c = c0; t = 0;
++            } else if (c1 < c0 && c1 < c2) {
++                c = c1; t = 1;
++            } else {
++                c = c2; t = 2;
++            }
++
++            cost[idx(i, j)]  = (float) cost_matrix[(i - 1) * M + (j - 1)] + c;
++            trace[idx(i, j)] = t;
++        }
++    }
++
++    // Backtrace
++    // Set boundary conditions
++    for (int j = 0; j <= M; j++) {
++        trace[idx(0, j)] = 2;
++    }
++    for (int i = 0; i <= N; i++) {
++        trace[idx(i, 0)] = 1;
++    }
++
++    int max_path = N + M;
++    std::vector<int> path_text(max_path);
++    std::vector<int> path_time(max_path);
++
++    int i = N, j = M;
++    int path_idx = max_path - 1;
++
++    while (i > 0 || j > 0) {
++        path_text[path_idx] = i - 1;
++        path_time[path_idx] = j - 1;
++        path_idx--;
++
++        int t = trace[idx(i, j)];
++        if (t == 0) {
++            i--; j--;
++        } else if (t == 1) {
++            i--;
++        } else if (t == 2) {
++            j--;
++        } else {
++            break;
++        }
++    }
++
++    int start = path_idx + 1;
++    int len   = max_path - start;
++    text_indices.assign(path_text.begin() + start, path_text.begin() + start + len);
++    time_indices.assign(path_time.begin() + start, path_time.begin() + start + len);
++}
++
++// ====================== SOFTMAX ======================
++
++// Row-wise softmax: out[i][j] = exp(x[i][j]) / sum_j(exp(x[i][j]))
++static void softmax_rows(const float * x, float * out, int rows, int cols) {
++    for (int i = 0; i < rows; i++) {
++        const float * row = x + i * cols;
++        float *       dst = out + i * cols;
++
++        float mx = row[0];
++        for (int j = 1; j < cols; j++) {
++            if (row[j] > mx) mx = row[j];
++        }
++
++        float sum = 0.0f;
++        for (int j = 0; j < cols; j++) {
++            dst[j] = expf(row[j] - mx);
++            sum += dst[j];
++        }
++        float inv = 1.0f / (sum + 1e-9f);
++        for (int j = 0; j < cols; j++) {
++            dst[j] *= inv;
++        }
++    }
++}
++
++// Column-wise softmax: out[i][j] = exp(x[i][j]) / sum_i(exp(x[i][j]))
++static void softmax_cols(const float * x, float * out, int rows, int cols) {
++    for (int j = 0; j < cols; j++) {
++        float mx = x[0 * cols + j];
++        for (int i = 1; i < rows; i++) {
++            if (x[i * cols + j] > mx) mx = x[i * cols + j];
++        }
++
++        float sum = 0.0f;
++        for (int i = 0; i < rows; i++) {
++            float v = expf(x[i * cols + j] - mx);
++            out[i * cols + j] = v;
++            sum += v;
++        }
++        float inv = 1.0f / (sum + 1e-9f);
++        for (int i = 0; i < rows; i++) {
++            out[i * cols + j] *= inv;
++        }
++    }
++}
++
++// ====================== MEDIAN ======================
++
++// Median of a small array (selection, not full sort for small n)
++static float median_small(std::vector<float> & buf) {
++    int n = (int) buf.size();
++    if (n == 0) return 0.0f;
++    std::nth_element(buf.begin(), buf.begin() + n / 2, buf.end());
++    return buf[n / 2];
++}
++
++// Row-wise median: compute median of each row
++static void row_medians(const float * x, float * out, int rows, int cols) {
++    std::vector<float> buf(cols);
++    for (int i = 0; i < rows; i++) {
++        buf.assign(x + i * cols, x + (i + 1) * cols);
++        out[i] = median_small(buf);
++    }
++}
++
++// Column-wise median: compute median of each column
++static void col_medians(const float * x, float * out, int rows, int cols) {
++    std::vector<float> buf(rows);
++    for (int j = 0; j < cols; j++) {
++        for (int i = 0; i < rows; i++) {
++            buf[i] = x[i * cols + j];
++        }
++        out[j] = median_small(buf);
++    }
++}
++
++// 1D median filter on a row with reflect padding
++static void median_filter_row(const float * in, float * out, int n, int width) {
++    int pad = width / 2;
++    if (n <= pad || width <= 1) {
++        memcpy(out, in, n * sizeof(float));
++        return;
++    }
++
++    std::vector<float> padded(n + 2 * pad);
++    // reflect padding
++    for (int i = 0; i < pad; i++) {
++        padded[pad - 1 - i]     = in[i + 1 < n ? i + 1 : 0];
++        padded[n + pad + i]     = in[n - 2 - i >= 0 ? n - 2 - i : n - 1];
++    }
++    memcpy(padded.data() + pad, in, n * sizeof(float));
++
++    std::vector<float> window(width);
++    for (int i = 0; i < n; i++) {
++        for (int k = 0; k < width; k++) {
++            window[k] = padded[i + k];
++        }
++        out[i] = median_small(window);
++    }
++}
++
++// 2D median filter on last dimension (column-wise per row)
++static void median_filter_2d(float * data, int rows, int cols, int width) {
++    if (width <= 1) return;
++    std::vector<float> row_buf(cols);
++    for (int i = 0; i < rows; i++) {
++        median_filter_row(data + i * cols, row_buf.data(), cols, width);
++        memcpy(data + i * cols, row_buf.data(), cols * sizeof(float));
++    }
++}
++
++// 3D median filter: [heads, tokens, frames] — filter along frames dimension
++static void median_filter_3d(float * data, int heads, int tokens, int frames, int width) {
++    if (width <= 1) return;
++    for (int h = 0; h < heads; h++) {
++        median_filter_2d(data + h * tokens * frames, tokens, frames, width);
++    }
++}
++
++// ====================== BIDIRECTIONAL CONSENSUS ======================
++
++// Apply bidirectional consensus denoising.
++// weights_stack: [n_heads, n_tokens, n_frames]
++// Returns: calc_matrix [n_tokens, n_frames] (averaged across heads)
++// Port of MusicStampsAligner._apply_bidirectional_consensus
++static void bidirectional_consensus(const float * weights_stack,
++                                    int n_heads, int n_tokens, int n_frames,
++                                    float violence_level, int medfilt_width,
++                                    float * calc_matrix) {
++    int HxTxF = n_heads * n_tokens * n_frames;
++    int TxF   = n_tokens * n_frames;
++
++    // Work buffer: [heads, tokens, frames]
++    std::vector<float> processed(HxTxF);
++
++    // For each head: row_softmax * col_softmax
++    std::vector<float> row_prob(TxF);
++    std::vector<float> col_prob(TxF);
++
++    for (int h = 0; h < n_heads; h++) {
++        const float * src = weights_stack + h * TxF;
++        float *       dst = processed.data() + h * TxF;
++
++        // A. Bidirectional consensus
++        softmax_rows(src, row_prob.data(), n_tokens, n_frames);  // Token → Frame
++        softmax_cols(src, col_prob.data(), n_tokens, n_frames);  // Frame → Token
++
++        for (int i = 0; i < TxF; i++) {
++            dst[i] = row_prob[i] * col_prob[i];
++        }
++
++        // 1. Row suppression: subtract violence * row_median, ReLU
++        std::vector<float> r_med(n_tokens);
++        row_medians(dst, r_med.data(), n_tokens, n_frames);
++        for (int t = 0; t < n_tokens; t++) {
++            float threshold = violence_level * r_med[t];
++            for (int f = 0; f < n_frames; f++) {
++                float v = dst[t * n_frames + f] - threshold;
++                dst[t * n_frames + f] = v > 0.0f ? v : 0.0f;
++            }
++        }
++
++        // 2. Column suppression: subtract violence * col_median, ReLU
++        std::vector<float> c_med(n_frames);
++        col_medians(dst, c_med.data(), n_tokens, n_frames);
++        for (int t = 0; t < n_tokens; t++) {
++            for (int f = 0; f < n_frames; f++) {
++                float v = dst[t * n_frames + f] - violence_level * c_med[f];
++                dst[t * n_frames + f] = v > 0.0f ? v : 0.0f;
++            }
++        }
++
++        // C. Power sharpening (^2)
++        for (int i = 0; i < TxF; i++) {
++            dst[i] = dst[i] * dst[i];
++        }
++    }
++
++    // D. Z-Score normalization (across all heads)
++    {
++        double sum = 0.0, sum_sq = 0.0;
++        for (int i = 0; i < HxTxF; i++) {
++            sum    += processed[i];
++            sum_sq += (double) processed[i] * processed[i];
++        }
++        float mean = (float) (sum / HxTxF);
++        float var  = (float) (sum_sq / HxTxF - (double) mean * mean);
++        float std  = sqrtf(var > 0.0f ? var : 0.0f);
++        float inv  = 1.0f / (std + 1e-9f);
++        for (int i = 0; i < HxTxF; i++) {
++            processed[i] = (processed[i] - mean) * inv;
++        }
++    }
++
++    // E. Median filtering along frames dimension
++    median_filter_3d(processed.data(), n_heads, n_tokens, n_frames, medfilt_width);
++
++    // Average across heads → calc_matrix [tokens, frames]
++    memset(calc_matrix, 0, TxF * sizeof(float));
++    float inv_heads = 1.0f / (float) n_heads;
++    for (int h = 0; h < n_heads; h++) {
++        const float * src = processed.data() + h * TxF;
++        for (int i = 0; i < TxF; i++) {
++            calc_matrix[i] += src[i] * inv_heads;
++        }
++    }
++}
++
++// ====================== TOKEN TIMESTAMPS ======================
++
++struct TokenTimestamp {
++    int         token_id;
++    std::string text;
++    float       start;
++    float       end;
++};
++
++// Generate per-token timestamps using DTW.
++// calc_matrix: [n_tokens, n_frames]
++// Returns a TokenTimestamp for each token.
++static std::vector<TokenTimestamp> token_timestamps(
++    const float *                      calc_matrix,
++    int                                n_tokens,
++    int                                n_frames,
++    const std::vector<int> &           lyric_token_ids,
++    const std::vector<std::string> &   token_texts,
++    float                              total_duration) {
++
++    // Negate calc_matrix for DTW (DTW minimizes cost)
++    std::vector<double> neg_matrix(n_tokens * n_frames);
++    for (int i = 0; i < n_tokens * n_frames; i++) {
++        neg_matrix[i] = -(double) calc_matrix[i];
++    }
++
++    std::vector<int> text_idx, time_idx;
++    dtw_cpu(neg_matrix.data(), n_tokens, n_frames, text_idx, time_idx);
++
++    float seconds_per_frame = total_duration / (float) n_frames;
++
++    std::vector<TokenTimestamp> results(n_tokens);
++    for (int i = 0; i < n_tokens; i++) {
++        results[i].token_id = lyric_token_ids[i];
++        results[i].text     = (i < (int) token_texts.size()) ? token_texts[i] : "";
++        results[i].start    = 0.0f;
++        results[i].end      = 0.0f;
++    }
++
++    // For each token, find the time indices that map to it
++    for (int i = 0; i < n_tokens; i++) {
++        float first_time = -1.0f;
++        float last_time  = -1.0f;
++        for (int p = 0; p < (int) text_idx.size(); p++) {
++            if (text_idx[p] == i) {
++                float t = (float) time_idx[p] * seconds_per_frame;
++                if (first_time < 0.0f) first_time = t;
++                last_time = t;
++            }
++        }
++        if (first_time >= 0.0f) {
++            results[i].start = first_time;
++            results[i].end   = last_time;
++        } else if (i > 0) {
++            results[i].start = results[i - 1].end;
++            results[i].end   = results[i - 1].end;
++        }
++        if (results[i].end < results[i].start) {
++            results[i].end = results[i].start;
++        }
++    }
++
++    return results;
++}
++
++// ====================== SENTENCE GROUPING ======================
++
++struct SentenceTimestamp {
++    std::string text;
++    float       start;
++    float       end;
++};
++
++// Group token timestamps into sentences (split on \n boundaries).
++static std::vector<SentenceTimestamp> sentence_timestamps(
++    const std::vector<TokenTimestamp> & token_stamps) {
++
++    std::vector<SentenceTimestamp> results;
++    std::string current_text;
++    float       sentence_start = -1.0f;
++    float       sentence_end   = 0.0f;
++
++    for (const auto & tok : token_stamps) {
++        if (sentence_start < 0.0f) {
++            sentence_start = tok.start;
++        }
++        sentence_end = tok.end;
++        current_text += tok.text;
++
++        if (tok.text.find('\n') != std::string::npos) {
++            // Trim whitespace
++            std::string trimmed = current_text;
++            size_t s = trimmed.find_first_not_of(" \t\n\r");
++            size_t e = trimmed.find_last_not_of(" \t\n\r");
++            if (s != std::string::npos && e != std::string::npos) {
++                trimmed = trimmed.substr(s, e - s + 1);
++            } else {
++                trimmed.clear();
++            }
++
++            if (!trimmed.empty()) {
++                results.push_back({trimmed, sentence_start, sentence_end});
++            }
++            current_text.clear();
++            sentence_start = -1.0f;
++        }
++    }
++
++    // Handle last sentence
++    if (!current_text.empty()) {
++        std::string trimmed = current_text;
++        size_t s = trimmed.find_first_not_of(" \t\n\r");
++        size_t e = trimmed.find_last_not_of(" \t\n\r");
++        if (s != std::string::npos && e != std::string::npos) {
++            trimmed = trimmed.substr(s, e - s + 1);
++        } else {
++            trimmed.clear();
++        }
++        if (!trimmed.empty()) {
++            results.push_back({trimmed, sentence_start, sentence_end});
++        }
++    }
++
++    return results;
++}
++
++// ====================== LRC FORMATTING ======================
++
++// Format timestamp as [mm:ss.xx]
++static std::string format_lrc_time(float seconds) {
++    if (seconds < 0.0f) seconds = 0.0f;
++    int   mins = (int) (seconds / 60.0f);
++    float secs = seconds - (float) mins * 60.0f;
++    char  buf[32];
++    snprintf(buf, sizeof(buf), "[%02d:%05.2f]", mins, secs);
++    return buf;
++}
++
++// ====================== MAIN ENTRY POINT ======================
++
++struct LrcResult {
++    std::string lrc_text;
++    bool        success;
++    std::string error;
++};
++
++// Full LRC alignment pipeline:
++//   attention_scores [n_heads, n_tokens, n_frames] →
++//   bidirectional consensus → DTW → sentence grouping → LRC text
++//
++// lyric_token_ids: pure lyric tokens (header stripped, endoftext stripped)
++// token_texts: decoded text per token (incremental decode)
++// total_duration: audio duration in seconds
++static LrcResult lrc_align(
++    const float *                      attention_scores,
++    int                                n_heads,
++    int                                n_tokens,
++    int                                n_frames,
++    const std::vector<int> &           lyric_token_ids,
++    const std::vector<std::string> &   token_texts,
++    float                              total_duration,
++    float                              violence_level = 2.0f,
++    int                                medfilt_width  = 1) {
++
++    LrcResult result;
++    result.success = false;
++
++    if (n_heads <= 0 || n_tokens <= 0 || n_frames <= 0) {
++        result.error = "Invalid dimensions";
++        return result;
++    }
++    if ((int) lyric_token_ids.size() != n_tokens) {
++        result.error = "Token count mismatch";
++        return result;
++    }
++
++    fprintf(stderr, "[LRC-Align] n_heads=%d, n_tokens=%d, n_frames=%d, duration=%.1fs\n",
++            n_heads, n_tokens, n_frames, total_duration);
++
++    // Step 1: Bidirectional consensus denoising
++    std::vector<float> calc_matrix(n_tokens * n_frames);
++    bidirectional_consensus(attention_scores, n_heads, n_tokens, n_frames,
++                            violence_level, medfilt_width, calc_matrix.data());
++
++    // Step 2: Token timestamps via DTW
++    auto tok_stamps = token_timestamps(calc_matrix.data(), n_tokens, n_frames,
++                                        lyric_token_ids, token_texts, total_duration);
++
++    // Step 3: Group into sentences
++    auto sent_stamps = sentence_timestamps(tok_stamps);
++
++    if (sent_stamps.empty()) {
++        result.error   = "No sentences found";
++        result.lrc_text = "";
++        result.success  = true;  // not an error, just no content
++        return result;
++    }
++
++    // Step 4: Format as LRC
++    std::string lrc;
++    for (const auto & sent : sent_stamps) {
++        lrc += format_lrc_time(sent.start);
++        lrc += sent.text;
++        lrc += "\n";
++    }
++
++    result.lrc_text = lrc;
++    result.success  = true;
++    fprintf(stderr, "[LRC-Align] Generated %d lines\n", (int) sent_stamps.size());
++    return result;
++}
+diff --git a/src/pipeline-synth-impl.h b/src/pipeline-synth-impl.h
+index b7199e5..3682b77 100644
+--- a/src/pipeline-synth-impl.h
++++ b/src/pipeline-synth-impl.h
+@@ -128,6 +128,14 @@ struct SynthState {
+     std::vector<float> noise;
+     std::vector<float> output;
+ 
++    // LRC alignment data (captured during text encoding, consumed by Phase 3)
++    std::vector<int>         lyric_token_ids;    // raw tokenized lyric IDs (full lyric prompt)
++    std::vector<std::string> lyric_token_texts;  // per-token decoded text (incremental)
++    int                      lyric_start_idx;    // pure lyric start (after header tokens)
++    int                      lyric_end_idx;      // pure lyric end
++    std::string              vocal_language;     // "en", "zh", etc. (from request)
++    bool                     get_lrc;            // whether LRC was requested
++
+     // debug / timing
+     DebugDumper dbg;
+     Timer       timer;
+diff --git a/src/pipeline-synth-ops.cpp b/src/pipeline-synth-ops.cpp
+index 58bcd10..fe6038c 100644
+--- a/src/pipeline-synth-ops.cpp
++++ b/src/pipeline-synth-ops.cpp
+@@ -474,6 +474,77 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n,
+             int  S_text    = (int) text_ids.size();
+             int  S_lyric   = (int) lyric_ids.size();
+ 
++            // Capture lyric token IDs for LRC alignment (batch 0 only)
++            if (b == 0 && reqs[0].get_lrc) {
++                s.get_lrc         = true;
++                s.lyric_token_ids = lyric_ids;
++                s.vocal_language  = reqs[0].vocal_language.empty() ? "en" : reqs[0].vocal_language;
++
++                // Build header to find pure lyric boundary
++                const char * lang_b = s.vocal_language.c_str();
++                std::string  hdr    = std::string("# Languages\n") + lang_b + "\n\n# Lyric\n";
++                auto         hdr_ids = bpe_encode(bpe, hdr.c_str(), false);
++                s.lyric_start_idx = (int) hdr_ids.size();
++
++                // Find <|endoftext|> (151643) for end boundary
++                s.lyric_end_idx = (int) lyric_ids.size();
++                for (int ti = 0; ti < (int) lyric_ids.size(); ti++) {
++                    if (lyric_ids[ti] == 151643) { s.lyric_end_idx = ti; break; }
++                }
++
++                // Incremental per-token text decode (matches Python _decode_tokens_incrementally)
++                int pure_n = s.lyric_end_idx - s.lyric_start_idx;
++                s.lyric_token_texts.resize(pure_n);
++                if (pure_n > 0) {
++                    // Use byte-level BPE reverse: each token's id_to_str gives its BPE-encoded
++                    // string. The GPT-2 byte encoder maps bytes→unicode codepoints; we must reverse
++                    // that to get raw UTF-8 bytes. For the alignment, the key is just whether a
++                    // token contains a newline — so we do a simpler decode via id_to_str.
++                    std::string prev_full;
++                    for (int ti = s.lyric_start_idx; ti < s.lyric_end_idx; ti++) {
++                        // Decode all tokens from start to current position
++                        std::vector<int> prefix(lyric_ids.begin() + s.lyric_start_idx,
++                                                lyric_ids.begin() + ti + 1);
++                        // Use byte-level reverse to get text
++                        std::string full;
++                        for (int pid : prefix) {
++                            if (pid >= 0 && pid < bpe->n_vocab) {
++                                const std::string & bpe_str = bpe->id_to_str[pid];
++                                // Reverse GPT-2 byte encoding: each BPE char → original byte
++                                for (size_t ci = 0; ci < bpe_str.size(); ) {
++                                    int adv;
++                                    int cp = utf8_codepoint(bpe_str.c_str() + ci, &adv);
++                                    // Find which byte maps to this codepoint
++                                    bool found = false;
++                                    for (int by = 0; by < 256; by++) {
++                                        int a2;
++                                        int cp2 = utf8_codepoint(bpe->byte2str[by].c_str(), &a2);
++                                        if (cp2 == cp && (int) bpe->byte2str[by].size() == adv) {
++                                            full += (char)(unsigned char) by;
++                                            found = true;
++                                            break;
++                                        }
++                                    }
++                                    if (!found) full += '?';
++                                    ci += adv;
++                                }
++                            }
++                        }
++                        // Token contribution = new bytes since last prefix
++                        int idx = ti - s.lyric_start_idx;
++                        if (full.size() > prev_full.size()) {
++                            s.lyric_token_texts[idx] = full.substr(prev_full.size());
++                        } else {
++                            s.lyric_token_texts[idx] = "";
++                        }
++                        prev_full = full;
++                    }
++                }
++
++                fprintf(stderr, "[Encode-Text] LRC: captured %d lyric tokens [%d..%d) of %d total\n",
++                        pure_n, s.lyric_start_idx, s.lyric_end_idx, (int) lyric_ids.size());
++            }
++
+             main_fwd[b].S_text  = S_text;
+             main_fwd[b].S_lyric = S_lyric;
+             main_fwd[b].text_hidden.resize((size_t) H_text * S_text);
+diff --git a/src/pipeline-synth.cpp b/src/pipeline-synth.cpp
+index 9571bc1..9848489 100644
+--- a/src/pipeline-synth.cpp
++++ b/src/pipeline-synth.cpp
+@@ -14,6 +14,11 @@
+ #include "pipeline-synth-ops.h"
+ #include "task-types.h"
+ 
++// LRC alignment (Phase 3)
++#include "alignment-config.h"
++#include "dit-alignment-graph.h"
++#include "lrc-alignment.h"
++
+ #include <cctype>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -695,3 +700,120 @@ void ace_synth_free(AceSynth * ctx) {
+     }
+     delete ctx;
+ }
++
++// Phase 3: LRC timestamp generation
++int ace_synth_job_run_lrc(AceSynth *    ctx,
++                          AceSynthJob * job,
++                          std::string * lrc_out,
++                          int           batch_n) {
++    if (!ctx || !job || !lrc_out) {
++        return -1;
++    }
++
++    SynthState & s = job->state;
++
++    // Initialize all outputs to empty
++    for (int b = 0; b < batch_n; b++) {
++        lrc_out[b].clear();
++    }
++
++    // Skip if LRC not requested or no lyric tokens captured
++    if (!s.get_lrc) {
++        fprintf(stderr, "[LRC] Skipped: get_lrc=false\n");
++        return 0;
++    }
++    int pure_n = s.lyric_end_idx - s.lyric_start_idx;
++    if (pure_n <= 0 || s.lyric_token_ids.empty()) {
++        fprintf(stderr, "[LRC] Skipped: no lyric tokens (pure_n=%d)\n", pure_n);
++        return 0;
++    }
++
++    Timer lrc_timer;
++
++    // Resolve alignment config from model metadata
++    AlignmentConfig align_cfg = alignment_config_resolve(
++        "",  // TODO: read from DiTMeta when GGUF field is available
++        ctx->meta->cfg.n_layers);
++    if (!align_cfg.valid) {
++        fprintf(stderr, "[LRC] WARNING: no valid alignment config, skipping\n");
++        return 0;
++    }
++
++    // Acquire DiT
++    DiTGGML * dit = store_require_dit(ctx->store, ctx->dit_key);
++    if (!dit) {
++        fprintf(stderr, "[LRC] WARNING: store_require_dit failed, skipping\n");
++        return 0;
++    }
++    ModelHandle dit_guard(ctx->store, dit);
++
++    // Force f32 attention for alignment (no flash_attn)
++    bool saved_fa = dit->use_flash_attn;
++    dit->use_flash_attn = false;
++
++    // Extract attention scores (batch 0 only — LRC is per-song, not per-variation)
++    int total_scores = align_cfg.total_heads * s.enc_S * s.S;
++    std::vector<float> scores(total_scores);
++
++    int rc = dit_alignment_extract(
++        dit, align_cfg,
++        s.output.data(),           // pred_latent [T, Oc]
++        s.context.data(),          // context [T, ctx_ch]
++        s.enc_hidden.data(),       // enc_hidden [enc_S, H_cond]
++        s.T, s.S, s.enc_S,
++        s.num_steps,
++        scores.data());
++
++    dit->use_flash_attn = saved_fa;
++
++    if (rc != 0) {
++        fprintf(stderr, "[LRC] WARNING: alignment extraction failed\n");
++        return 0;
++    }
++
++    // Transpose scores from [heads, enc_S, S] to [heads, S, enc_S]
++    // Python convention: calc_matrix is [Tokens, Frames] = [enc_S_range, S]
++    // The attention scores are [enc_S, S] per head (KV × Q)
++    // For DTW we need [n_tokens, n_frames] = [pure_n, S]
++    // Slice to pure lyric range and transpose
++    std::vector<float> sliced_scores(align_cfg.total_heads * pure_n * s.S);
++    for (int h = 0; h < align_cfg.total_heads; h++) {
++        const float * src = scores.data() + h * s.enc_S * s.S;
++        float *       dst = sliced_scores.data() + h * pure_n * s.S;
++        for (int t = 0; t < pure_n; t++) {
++            int enc_idx = s.lyric_start_idx + t;
++            for (int f = 0; f < s.S; f++) {
++                // src layout: [enc_S, S] (row=enc_idx, col=frame)
++                dst[t * s.S + f] = src[enc_idx * s.S + f];
++            }
++        }
++    }
++
++    // Build pure lyric token IDs and texts
++    std::vector<int> pure_ids(s.lyric_token_ids.begin() + s.lyric_start_idx,
++                               s.lyric_token_ids.begin() + s.lyric_end_idx);
++
++    // Run LRC alignment
++    LrcResult result = lrc_align(
++        sliced_scores.data(),
++        align_cfg.total_heads, pure_n, s.S,
++        pure_ids, s.lyric_token_texts,
++        s.duration,
++        2.0f,  // violence_level
++        1);    // medfilt_width
++
++    if (result.success && !result.lrc_text.empty()) {
++        // Copy to all batch outputs (same lyrics for all variations)
++        for (int b = 0; b < batch_n; b++) {
++            lrc_out[b] = result.lrc_text;
++        }
++        fprintf(stderr, "[LRC] Generated %zu bytes in %.1f ms\n",
++                result.lrc_text.size(), lrc_timer.ms());
++    } else {
++        fprintf(stderr, "[LRC] Alignment %s: %s (%.1f ms)\n",
++                result.success ? "empty" : "failed",
++                result.error.c_str(), lrc_timer.ms());
++    }
++
++    return 0;
++}
+diff --git a/src/pipeline-synth.h b/src/pipeline-synth.h
+index 4f23161..4ca3017 100644
+--- a/src/pipeline-synth.h
++++ b/src/pipeline-synth.h
+@@ -94,6 +94,18 @@ int ace_synth_job_run_vae(AceSynth *    ctx,
+                           bool (*cancel)(void *) = nullptr,
+                           void * cancel_data     = nullptr);
+ 
++// Phase 3: LRC timestamp generation. Acquires the DiT for a single alignment
++// forward pass through the first max(target_layers) layers with manual
++// cross-attention to extract attention scores. Runs DTW + bidirectional
++// consensus on CPU to produce LRC-format synchronized lyrics.
++// lrc_out[batch_n] filled with LRC text (empty string on skip/error).
++// Must be called BEFORE ace_synth_job_free (needs SynthState data).
++// Returns 0 on success.
++int ace_synth_job_run_lrc(AceSynth *    ctx,
++                          AceSynthJob * job,
++                          std::string * lrc_out,
++                          int           batch_n);
++
+ void ace_synth_job_free(AceSynthJob * job);
+ 
+ void ace_audio_free(AceAudio * audio);
+diff --git a/src/request.cpp b/src/request.cpp
+index 8633862..eefcee4 100644
+--- a/src/request.cpp
++++ b/src/request.cpp
+@@ -63,6 +63,7 @@ void request_init(AceRequest * r) {
+     r->vae                  = "";
+     r->peak_clip            = 10;
+     r->mp3_bitrate          = 128;
++    r->get_lrc              = false;
+ }
+ 
+ // helper: get yyjson string as std::string
+@@ -210,6 +211,14 @@ static void request_parse_obj(yyjson_val * obj, AceRequest * r) {
+     }
+ 
+     // bool
++    if ((v = yyjson_obj_get(obj, "get_lrc"))) {
++        if (yyjson_is_bool(v)) {
++            r->get_lrc = yyjson_get_bool(v);
++        } else if (yyjson_is_str(v)) {
++            const char * s = yyjson_get_str(v);
++            r->get_lrc     = (strcmp(s, "true") == 0 || strcmp(s, "1") == 0);
++        }
++    }
+     if ((v = yyjson_obj_get(obj, "use_cot_caption"))) {
+         if (yyjson_is_bool(v)) {
+             r->use_cot_caption = yyjson_get_bool(v);
+@@ -455,6 +464,9 @@ static yyjson_mut_doc * request_build_doc(const AceRequest * r, bool sparse) {
+     if (all || r->mp3_bitrate != def.mp3_bitrate) {
+         yyjson_mut_obj_add_int(doc, root, "mp3_bitrate", r->mp3_bitrate);
+     }
++    if (all || r->get_lrc != def.get_lrc) {
++        yyjson_mut_obj_add_bool(doc, root, "get_lrc", r->get_lrc);
++    }
+     if (all || r->synth_model != def.synth_model) {
+         yyjson_mut_obj_add_str(doc, root, "synth_model", r->synth_model.c_str());
+     }
+diff --git a/src/request.h b/src/request.h
+index 8ce72e5..173e5f3 100644
+--- a/src/request.h
++++ b/src/request.h
+@@ -114,6 +114,11 @@ struct AceRequest {
+     float       adapter_scale;  // 1.0
+     std::string vae;            // ""
+ 
++    // LRC timestamp generation toggle. When true, the synth pipeline runs an
++    // additional DiT forward pass post-generation to extract cross-attention
++    // alignment and produce LRC-format synchronized lyrics.
++    bool get_lrc;  // false
++
+     // audio output: peak clip via percentile normalization.
+     // 0 = peak normalization (100.0000th percentile, no clipping).
+     // 10 = default (99.9990th percentile, clips top 0.001%).
+diff --git a/tools/ace-server.cpp b/tools/ace-server.cpp
+index 1e5d316..4ccf0ad 100644
+--- a/tools/ace-server.cpp
++++ b/tools/ace-server.cpp
+@@ -214,6 +214,8 @@ struct Job {
+     std::atomic<JobStatus> status{ JobStatus::RUNNING };
+     std::string            result_body;
+     std::string            result_mime;
++    /// Base64 LRC lyric timestamps, set when the request asked for them.
++    std::string            result_lrc;
+     std::atomic<bool>      cancel{ false };
+ 
+     // memory ordering contract: result_body and result_mime are written
+@@ -514,6 +516,24 @@ static bool server_cancel_job(void * data) {
+     return flag && flag->load(std::memory_order_relaxed);
+ }
+ 
++// base64 for header transport. Kept local rather than pulled in as a dependency
++// for one call site.
++static std::string base64_encode(const std::string & in) {
++    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    std::string out;
++    out.reserve((in.size() + 2) / 3 * 4);
++    for (size_t i = 0; i < in.size(); i += 3) {
++        uint32_t v = ((uint8_t) in[i]) << 16;
++        if (i + 1 < in.size()) v |= ((uint8_t) in[i + 1]) << 8;
++        if (i + 2 < in.size()) v |= ((uint8_t) in[i + 2]);
++        out += b64[(v >> 18) & 0x3F];
++        out += b64[(v >> 12) & 0x3F];
++        out += (i + 1 < in.size()) ? b64[(v >> 6) & 0x3F] : '=';
++        out += (i + 2 < in.size()) ? b64[v & 0x3F] : '=';
++    }
++    return out;
++}
++
+ // helper: set a JSON error response
+ static void json_error(httplib::Response & res, int status, const char * msg) {
+     yyjson_mut_doc * doc  = yyjson_mut_doc_new(NULL);
+@@ -829,9 +849,11 @@ static void synth_worker(std::shared_ptr<Job>    job,
+     const float *                   src_lat_ptr = src_latents.empty() ? nullptr : src_latents.data();
+     const float *                   ref_lat_ptr = ref_latents.empty() ? nullptr : ref_latents.data();
+     std::vector<std::vector<float>> captured_latents;
++    // One LRC slot per allocated track; empty when get_lrc was not requested.
++    std::vector<std::string> lrc_results(total_alloc);
+     const int rc = synth_batch_run(ctx, groups, src_interleaved, src_len, src_lat_ptr, src_T_latent, ref_interleaved,
+                                    ref_len, ref_lat_ptr, ref_T_latent, audio.data(), &captured_latents,
+-                                   server_cancel_job, (void *) &job->cancel);
++                                   server_cancel_job, (void *) &job->cancel, lrc_results.data());
+     ace_synth_free(ctx);
+     free(src_interleaved);
+     free(ref_interleaved);
+@@ -887,6 +909,15 @@ static void synth_worker(std::shared_ptr<Job>    job,
+     job->result_body = multipart_build_audio_latent(encoded, mime, captured_latents);
+     job->result_mime = MULTIPART_MIME;
+ 
++    // LRC travels as a response header. Headers must be single-line ASCII, and
++    // LRC text is UTF-8 with newlines, so it is base64-encoded here and decoded
++    // by the client.
++    if (!lrc_results.empty() && !lrc_results[0].empty()) {
++        job->result_lrc = base64_encode(lrc_results[0]);
++        fprintf(stderr, "[Server] LRC: %zu bytes raw -> %zu base64\n",
++                lrc_results[0].size(), job->result_lrc.size());
++    }
++
+     job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::DONE);
+     fprintf(stderr, "[Server] Job %s done (%d tracks)\n", job->id.c_str(), total_tracks);
+ }
+@@ -1809,6 +1840,9 @@ int main(int argc, char ** argv) {
+                 json_error(res, 404, "Result not ready");
+                 return;
+             }
++            if (!job->result_lrc.empty()) {
++                res.set_header("X-LRC-Text", job->result_lrc);
++            }
+             res.set_content(job->result_body, job->result_mime);
+             return;
+         }
+diff --git a/tools/synth-batch-runner.h b/tools/synth-batch-runner.h
+index f63f829..f8cecdd 100644
+--- a/tools/synth-batch-runner.h
++++ b/tools/synth-batch-runner.h
+@@ -44,7 +44,8 @@ static int synth_batch_run(AceSynth *                             ctx,
+                            AceAudio *                             audio_out,
+                            std::vector<std::vector<float>> *      latents_out = nullptr,
+                            bool (*cancel)(void *)                             = nullptr,
+-                           void * cancel_data                                 = nullptr) {
++                           void * cancel_data                                 = nullptr,
++                           std::string *                          lrc_out  = nullptr) {
+     const int                  n_groups = (int) groups.size();
+     std::vector<AceSynthJob *> jobs(n_groups, nullptr);
+     std::vector<int>           audio_off(n_groups, 0);
+@@ -89,6 +90,16 @@ static int synth_batch_run(AceSynth *                             ctx,
+     // acquired and released by ops_vae_decode inside ace_synth_job_run_vae.
+     for (int g = 0; g < n_groups; g++) {
+         const int rc = ace_synth_job_run_vae(ctx, jobs[g], audio_out + audio_off[g], cancel, cancel_data);
++
++        // Phase 3: LRC alignment (optional). Runs after the VAE but *before*
++        // the job is freed -- SynthState still holds the encoder hidden states
++        // and lyric tokens the alignment graph needs, and those are the only
++        // copies of them.
++        if (lrc_out && groups[g][0].get_lrc) {
++            const int gn = (int) groups[g].size();
++            ace_synth_job_run_lrc(ctx, jobs[g], lrc_out + audio_off[g], gn);
++        }
++
+         ace_synth_job_free(jobs[g]);
+         jobs[g] = nullptr;
+         if (rc != 0) {
+-- 
+2.43.0
+

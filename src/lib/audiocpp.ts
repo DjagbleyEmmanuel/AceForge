@@ -26,6 +26,10 @@ export interface YuE2Params {
   numInferenceSteps: number | null;
   cot: string | null;
   stopAfter: string | null;
+  /** YuE2's length control. Semantic codec tokens, not seconds -- audio.cpp
+   *  documents no conversion rate. Default 9000. */
+  semanticMaxTokens: number | null;
+  semanticMinTokens: number | null;
 }
 
 /** One selectable model plus everything the picker needs to describe it. */

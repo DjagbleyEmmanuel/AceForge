@@ -1,13 +1,20 @@
+pub mod annotations;
 pub mod audiocpp;
+pub mod covers;
 pub mod downloads;
 pub mod engines;
 pub mod generate;
+pub mod lyricsync;
+pub mod mastering;
 pub mod music;
 pub mod paths;
 pub mod presets;
+pub mod queue;
 pub mod server;
 pub mod settings;
 pub mod user_presets;
+pub mod wav;
+pub mod wildcards;
 pub mod store;
 
 use serde::Serialize;
@@ -41,6 +48,7 @@ struct SettingsView {
     env_override: Option<String>,
     library_dir: String,
     resolved_library_dir: String,
+    covers_dir: String,
 }
 
 #[tauri::command]
@@ -62,6 +70,7 @@ fn get_settings() -> SettingsView {
         models_dir: saved.models_dir,
         library_dir: saved.library_dir,
         resolved_library_dir: paths::library_dir().display().to_string(),
+        covers_dir: saved.covers_dir,
         autostart_server: saved.autostart_server,
         env_override: env,
     }
@@ -193,6 +202,25 @@ fn adopt_bundled_engine(app: tauri::AppHandle) -> Result<bool, String> {
         return Ok(false);
     }
     engines::adopt_from(&bundled).map(|_| true)
+}
+
+/// Replace the installed ACE-Step engine with the one bundled in this release.
+///
+/// An engine is refreshed automatically when this app installed it and the
+/// bundled copy has since changed. One installed before that provenance was
+/// recorded cannot be told apart from a user's own build, so that case needs to
+/// be asked for rather than guessed at.
+#[tauri::command]
+fn reinstall_bundled_engine(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri::Manager;
+    let Some(resource_dir) = app.path().resource_dir().ok() else {
+        return Ok(false);
+    };
+    let bundled = resource_dir.join("aceforge-runtime");
+    if !bundled.join("ace-server").is_file() {
+        return Ok(false);
+    }
+    engines::reinstall_from(&bundled).map(|_| true)
 }
 
 /// Adopt the audio.cpp server shipped inside the app bundle. Unlike the
@@ -593,6 +621,322 @@ fn cancel_track(port: u16, job_id: String) -> Result<(), String> {
     generate::cancel(port, &job_id)
 }
 
+/// Write a cropped copy of a track between two times in seconds.
+///
+/// The original is kept: trimming is a guess, and re-cropping from the source
+/// has to stay possible after the guess is wrong. `crop_track` is the
+/// in-place variant and confirms with the user first.
+#[tauri::command]
+fn trim_track(path: String, from_secs: f32, to_secs: f32) -> Result<f32, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let wav = wav::read(&bytes)?;
+    let trimmed = wav
+        .trim(from_secs, to_secs)
+        .ok_or_else(|| format!("{from_secs}s to {to_secs}s is empty"))?;
+
+    let stem = std::path::Path::new(&path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("track");
+    let out = crate::paths::unique_path(&crate::paths::library_dir(), stem, "wav");
+    std::fs::write(&out, wav::write(&trimmed)).map_err(|e| format!("cannot write: {e}"))?;
+    Ok(trimmed.duration_secs())
+}
+
+/// Crop a track to a time range.
+///
+/// `replace` chooses between the two things "crop this" can mean. Keeping the
+/// original is the default because a render is expensive and a crop is a
+/// judgement call that is often wrong. Replacing is offered because trimming to
+/// length is a normal thing to want to do to a finished file, and asking the
+/// user to clean up a duplicate by hand every time is its own chore -- but it
+/// overwrites the only copy, so the UI confirms it separately.
+#[tauri::command]
+fn crop_track(
+    path: String,
+    from_secs: f32,
+    to_secs: f32,
+    replace: bool,
+    keep: CropKeep,
+) -> Result<CropResult, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let wav = wav::read(&bytes)?;
+    let cropped = match keep {
+        CropKeep::Only => wav.trim(from_secs, to_secs),
+        CropKeep::Except => wav.delete_range(from_secs, to_secs),
+    }
+    .ok_or_else(|| format!("nothing to keep between {from_secs}s and {to_secs}s"))?;
+    let seconds = cropped.duration_secs();
+
+    if replace {
+        // Write beside the original and rename over it. Writing in place would
+        // leave a half-written file if the process died mid-write, and the
+        // original is the only copy of a render that took minutes.
+        let staged = std::path::PathBuf::from(&path).with_extension("cropping.tmp");
+        std::fs::write(&staged, wav::write(&cropped))
+            .map_err(|e| format!("cannot write: {e}"))?;
+        std::fs::rename(&staged, &path)
+            .map_err(|e| format!("cannot replace {}: {e}", path))?;
+    } else {
+        let stem = std::path::Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("track");
+        let suffix = match keep {
+            CropKeep::Only => "clip",
+            CropKeep::Except => "cut",
+        };
+        let out =
+            crate::paths::unique_path(&crate::paths::library_dir(), stem, suffix);
+        std::fs::write(&out, wav::write(&cropped))
+            .map_err(|e| format!("cannot write: {e}"))?;
+    }
+
+    Ok(CropResult {
+        seconds,
+        replaced: replace,
+    })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CropKeep {
+    /// Keep only the highlighted range.
+    Only,
+    /// Cut the highlighted range out and keep the rest.
+    Except,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CropResult {
+    seconds: f32,
+    replaced: bool,
+}
+
+/// Normalise a rendered track to a loudness target and write a new file.
+///
+/// The original is never touched. A pass that clips or is aimed at the wrong
+/// target is not something to discover by having destroyed the render.
+#[tauri::command]
+fn normalise_track(
+    path: String,
+    target: mastering::LoudnessTarget,
+    ceiling_dbfs: Option<f32>,
+    reference_path: Option<String>,
+    max_tilt_db: Option<f32>,
+) -> Result<mastering::NormaliseReport, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let mut wav = wav::read(&bytes)?;
+
+    // Brightness match runs first so the loudness measurement afterwards sees
+    // the finished spectrum; the tilt changes the level, and the level is what
+    // gets normalised.
+    let mut tilt_db = None;
+    if let Some(reference) = reference_path.as_deref().filter(|r| !r.trim().is_empty()) {
+        let rbytes = std::fs::read(reference)
+            .map_err(|e| format!("cannot read reference {reference}: {e}"))?;
+        let ref_wav = wav::read(&rbytes)?;
+        tilt_db = mastering::match_brightness(&mut wav, &ref_wav, max_tilt_db.unwrap_or(6.0));
+    }
+
+    let report = mastering::normalise(
+        &mut wav,
+        target,
+        ceiling_dbfs.unwrap_or(mastering::DEFAULT_CEILING_DBFS),
+    );
+
+    let stem = std::path::Path::new(&path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("track");
+    let out = crate::paths::unique_path(&crate::paths::library_dir(), stem, "wav");
+    std::fs::write(&out, wav::write(&wav)).map_err(|e| format!("cannot write: {e}"))?;
+
+    Ok(mastering::NormaliseReport {
+        brightness_tilt_db: tilt_db,
+        ..report
+    })
+}
+
+/// Enumerate cover art: the user's directory first, then the bundled set.
+#[tauri::command]
+fn lyric_sync_pending() -> Vec<generate::Track> {
+    lyricsync::pending()
+}
+
+#[tauri::command]
+fn lyric_sync_start(app: tauri::AppHandle, paths: Vec<String>) -> lyricsync::SyncProgress {
+    lyricsync::start(app, paths);
+    lyricsync::progress()
+}
+
+#[tauri::command]
+fn lyric_sync_progress() -> lyricsync::SyncProgress {
+    lyricsync::progress()
+}
+
+#[tauri::command]
+fn lyric_sync_cancel() {
+    lyricsync::cancel();
+}
+
+#[tauri::command]
+fn list_covers() -> Vec<covers::CoverEntry> {
+    covers::list_covers()
+}
+
+/// Point cover art at a directory of the user's choosing.
+///
+/// Unlike the library, covers do not need an asset-protocol grant: the scope
+/// ships as `$APPDATA/**` and a cover outside it would not load, so it is
+/// widened here the same way the library directory is.
+#[tauri::command]
+fn set_covers_dir(app: tauri::AppHandle, path: String) -> Result<SettingsView, String> {
+    let trimmed = path.trim();
+    if !trimmed.is_empty() {
+        let dir = std::path::PathBuf::from(trimmed);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        use tauri::Manager;
+        app.asset_protocol_scope()
+            .allow_directory(&dir, true)
+            .map_err(|e| format!("cannot grant read access to {}: {e}", dir.display()))?;
+    }
+    let mut current = settings::load();
+    current.covers_dir = trimmed.to_string();
+    settings::save(&current)?;
+    Ok(get_settings())
+}
+
+#[tauri::command]
+fn lyric_timings(track_path: String) -> Option<annotations::LyricTimings> {
+    annotations::lyric_timings(&track_path)
+}
+
+#[tauri::command]
+fn save_lyric_timings(
+    track_path: String,
+    lines: Vec<annotations::LyricLine>,
+) -> Result<(), String> {
+    annotations::save_lyric_timings(&track_path, lines)
+}
+
+#[tauri::command]
+fn track_notes(track_id: String) -> annotations::TrackNotes {
+    annotations::notes_for(&track_id)
+}
+
+#[tauri::command]
+fn add_marker(track_id: String, at_secs: f32, label: String) -> Result<annotations::TrackNotes, String> {
+    annotations::add_marker(&track_id, at_secs, label)
+}
+
+#[tauri::command]
+fn remove_marker(track_id: String, index: usize) -> Result<annotations::TrackNotes, String> {
+    annotations::remove_marker(&track_id, index)
+}
+
+#[tauri::command]
+fn songs() -> Vec<annotations::SongProject> {
+    annotations::songs()
+}
+
+#[tauri::command]
+fn save_song(song: annotations::SongProject) -> Result<Vec<annotations::SongProject>, String> {
+    annotations::save_song(song)
+}
+
+#[tauri::command]
+fn delete_song(id: String) -> Result<Vec<annotations::SongProject>, String> {
+    annotations::delete_song(id)
+}
+
+#[tauri::command]
+fn layer_stacks() -> Vec<annotations::LayerStack> {
+    annotations::layer_stacks()
+}
+
+#[tauri::command]
+fn save_layer_stack(stack: annotations::LayerStack) -> Result<Vec<annotations::LayerStack>, String> {
+    annotations::save_layer_stack(stack)
+}
+
+#[tauri::command]
+fn delete_layer_stack(id: String) -> Result<Vec<annotations::LayerStack>, String> {
+    annotations::delete_layer_stack(id)
+}
+
+#[tauri::command]
+fn saved_seeds() -> Vec<annotations::SavedSeed> {
+    annotations::seeds()
+}
+
+#[tauri::command]
+fn save_seed(seed: i64, caption: String) -> Result<Vec<annotations::SavedSeed>, String> {
+    annotations::save_seed(seed, caption)
+}
+
+#[tauri::command]
+fn toggle_star_seed(seed: i64) -> Result<Vec<annotations::SavedSeed>, String> {
+    annotations::toggle_star(seed)
+}
+
+#[tauri::command]
+fn remove_seed(seed: i64) -> Result<Vec<annotations::SavedSeed>, String> {
+    annotations::remove_seed(seed)
+}
+
+#[tauri::command]
+fn ab_slots() -> Option<[String; 2]> {
+    annotations::ab_slots()
+}
+
+#[tauri::command]
+fn set_ab_slot(index: usize, track_id: String) -> Result<[String; 2], String> {
+    annotations::set_ab_slot(index, track_id)
+}
+
+#[tauri::command]
+fn expand_wildcards(text: String, seed: i64) -> String {
+    wildcards::expand(&text, wildcards::resolve_seed(seed))
+}
+
+#[tauri::command]
+fn queue_list() -> Vec<queue::QueuedJob> {
+    queue::list()
+}
+
+#[tauri::command]
+fn queue_add(params: generate::GenerateParams) -> queue::QueuedJob {
+    queue::enqueue(params)
+}
+
+#[tauri::command]
+fn queue_cancel(job_id: String) -> Result<(), String> {
+    queue::cancel(job_id)
+}
+
+#[tauri::command]
+fn queue_retry(job_id: String) -> Result<queue::QueuedJob, String> {
+    queue::retry(job_id)
+}
+
+#[tauri::command]
+fn queue_discard(job_id: String) -> Result<(), String> {
+    queue::discard(job_id)
+}
+
+#[tauri::command]
+fn queue_clear_done() {
+    queue::clear_done()
+}
+
+#[tauri::command]
+fn queue_reset() {
+    queue::reset()
+}
+
 #[tauri::command]
 fn library() -> Vec<generate::Track> {
     generate::list_tracks()
@@ -803,6 +1147,21 @@ fn server_props(port: u16) -> Result<serde_json::Value, String> {
     server::props(port)
 }
 
+/// The app handle, for background workers that emit events.
+///
+/// Both the generation queue and the lyric-sync batch run on their own threads
+/// and need to push progress to the UI; keeping one handle here avoids each
+/// module holding its own copy.
+static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+pub fn set_app_handle(app: tauri::AppHandle) {
+    let _ = APP_HANDLE.set(app);
+}
+
+pub fn app_handle() -> Option<tauri::AppHandle> {
+    APP_HANDLE.get().cloned()
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
@@ -828,6 +1187,7 @@ pub fn run() {
             list_engines,
             list_adapters,
             adopt_bundled_engine,
+            reinstall_bundled_engine,
             adopt_bundled_audiocpp,
             inspect_engine,
             install_engine,
@@ -861,6 +1221,40 @@ pub fn run() {
             list_imports,
             remove_import,
             set_library_dir,
+            trim_track,
+            crop_track,
+            normalise_track,
+            lyric_sync_pending,
+            lyric_sync_start,
+            lyric_sync_progress,
+            lyric_sync_cancel,
+            list_covers,
+            set_covers_dir,
+            lyric_timings,
+            save_lyric_timings,
+            track_notes,
+            add_marker,
+            remove_marker,
+            songs,
+            save_song,
+            delete_song,
+            layer_stacks,
+            save_layer_stack,
+            delete_layer_stack,
+            saved_seeds,
+            save_seed,
+            toggle_star_seed,
+            remove_seed,
+            ab_slots,
+            set_ab_slot,
+            expand_wildcards,
+            queue_list,
+            queue_add,
+            queue_cancel,
+            queue_retry,
+            queue_discard,
+            queue_clear_done,
+            queue_reset,
         ])
         .setup(|app| {
             // The asset-protocol scope ships as `$APPDATA/**`. A library
@@ -871,6 +1265,17 @@ pub fn run() {
             let dir = paths::library_dir();
             if let Err(e) = app.asset_protocol_scope().allow_directory(&dir, true) {
                 eprintln!("[library] asset scope for {} failed: {e}", dir.display());
+            }
+            // The queue runner needs the handle to emit progress, and must start
+            // before any UI can enqueue. Jobs left `running` by a previous
+            // process are downgraded to `interrupted` when the queue loads, so a
+            // restart never silently re-runs work.
+            set_app_handle(app.handle().clone());
+            queue::spawn_runner();
+            // Bundled cover art lives beside the other packaged resources,
+            // which is not the executable's directory in a deb install.
+            if let Ok(dir) = app.path().resource_dir() {
+                covers::set_resource_dir(dir);
             }
             Ok(())
         })

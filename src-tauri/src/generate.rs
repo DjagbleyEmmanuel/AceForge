@@ -15,7 +15,17 @@ use std::path::{Path, PathBuf};
 const BOUNDARY: &str = "ace-batch-boundary";
 
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
-const JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Hard ceiling on one stage. Generous for 4 GB hardware: a repaint of a
+/// five-minute source has been measured at a few minutes, and the failure this
+/// replaces was an indefinite hang rather than a slow render.
+const JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// A stage that stops writing to stderr for this long has stopped making
+/// progress. Measured against the log's byte length, not against polls: the
+/// sidecar logs steadily through model loads, sampling and decode, so silence
+/// is the signal. Chosen well above the longest observed gap between log lines
+/// on this machine so a slow render cannot trip it.
+const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -306,6 +316,8 @@ pub struct Track {
     pub vocal_language: String,
     pub duration_secs: f32,
     pub created_at: u64,
+    /// Absolute path to this track's cover image, if one could be assigned.
+    pub cover: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -335,6 +347,12 @@ fn submit(port: u16, path: &str, body: serde_json::Value) -> Result<String, Stri
     job_id_from(response.into_json().map_err(|e| format!("bad submit response: {e}"))?, path)
 }
 
+/// True when the render is instrumental, so lyric alignment is pointless.
+fn is_instrumental(params: &GenerateParams) -> bool {
+    let lyrics = params.lyrics.trim();
+    lyrics.eq_ignore_ascii_case("[instrumental]") || lyrics.is_empty()
+}
+
 fn job_id_from(value: serde_json::Value, path: &str) -> Result<String, String> {
     value
         .get("id")
@@ -353,7 +371,7 @@ fn job_id_from(value: serde_json::Value, path: &str) -> Result<String, String> {
 /// Sending either one switches the request from plain JSON to multipart, which
 /// is why this is not just "always multipart": the JSON path is cheaper and is
 /// what a plain text-to-music render should keep using.
-fn submit_synth_with_audio(
+pub fn submit_synth_with_audio(
     port: u16,
     requests: &serde_json::Value,
     source: Option<&Path>,
@@ -449,7 +467,7 @@ fn resolve_library_audio(path: &str) -> Result<Option<PathBuf>, String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobState {
+pub enum JobState {
     Running,
     Done,
     Failed,
@@ -540,7 +558,7 @@ fn clip_lines(lines: &[&String], max_lines: usize) -> String {
 ///
 /// `mark` is the stderr log length captured before the job was submitted; only
 /// bytes past it are read if the job fails.
-fn wait_for_job(
+pub fn wait_for_job(
     port: u16,
     id: &str,
     mark: u64,
@@ -548,8 +566,27 @@ fn wait_for_job(
 ) -> Result<JobState, String> {
     let deadline = std::time::Instant::now() + JOB_TIMEOUT;
     let mut last_report = std::time::Instant::now();
+    let models_dir = crate::settings::resolve_models_dir(None);
+    let mut last_progress = std::time::Instant::now();
+    let mut seen_len = crate::server::stderr_len(&models_dir);
 
     while std::time::Instant::now() < deadline {
+        // Watchdog. The sidecar logs continuously through loads, sampling and
+        // decode, so a log that stops growing means the job has stopped making
+        // progress. Without this the old one-hour ceiling was the only guard,
+        // and an indefinite hang looked exactly like a slow render.
+        let len = crate::server::stderr_len(&models_dir);
+        if len != seen_len {
+            seen_len = len;
+            last_progress = std::time::Instant::now();
+        } else if last_progress.elapsed() > STALL_TIMEOUT {
+            return Err(format!(
+                "job {id} stalled — the backend stopped writing to its log for {}s. \\
+                 The runtime is probably wedged; restart it from the sidebar.",
+                STALL_TIMEOUT.as_secs()
+            ));
+        }
+
         let url = format!("http://127.0.0.1:{port}/job?id={id}");
         let body = ureq::get(&url)
             .timeout(std::time::Duration::from_secs(10))
@@ -600,15 +637,60 @@ fn wait_for_job(
     Err(format!("job {id} timed out"))
 }
 
-fn fetch_result(port: u16, id: &str) -> Result<Vec<u8>, String> {
+/// The result body plus any `X-LRC-Text` header, which is base64 LRC text.
+pub struct FetchedResult {
+    pub body: Vec<u8>,
+    pub lrc: Option<String>,
+}
+
+pub fn fetch_result(port: u16, id: &str) -> Result<FetchedResult, String> {
     let url = format!("http://127.0.0.1:{port}/job?id={id}&result=1");
-    ureq::get(&url)
+    let response = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(120))
         .call()
-        .map_err(|e| format!("result fetch failed: {e}"))?
+        .map_err(|e| format!("result fetch failed: {e}"))?;
+    let lrc = response
+        .header("X-LRC-Text")
+        .map(decode_base64)
+        .transpose()?;
+    let body = response
         .into_reader()
         .read_to_end_bytes()
-        .map_err(|e| format!("result read failed: {e}"))
+        .map_err(|e| format!("result read failed: {e}"))?;
+    Ok(FetchedResult { body, lrc })
+}
+
+/// Decode standard base64. Written out rather than pulled from a crate: the
+/// app already vendors its dependencies and this is one call site.
+fn decode_base64(input: &str) -> Result<String, String> {
+    fn value(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut i = 0;
+    while i < bytes.len() {
+        let quad: Vec<u32> = bytes[i..(i + 4).min(bytes.len())]
+            .iter()
+            .map(|c| value(*c).ok_or_else(|| format!("bad base64 character {:?}", *c as char)))
+            .collect::<Result<Vec<u32>, String>>()?;
+        out.push(((quad[0] << 2) | (quad[1] >> 4)) as u8);
+        if quad.len() > 2 && bytes[i + 2] != b'=' {
+            out.push((((quad[1] & 0xF) << 4) | (quad[2] >> 2)) as u8);
+        }
+        if quad.len() > 3 && bytes[i + 3] != b'=' {
+            out.push((((quad[2] & 0x3) << 6) | quad[3]) as u8);
+        }
+        i += 4;
+    }
+    String::from_utf8(out).map_err(|e| format!("LRC was not valid UTF-8: {e}"))
 }
 
 pub fn cancel(port: u16, id: &str) -> Result<(), String> {
@@ -705,6 +787,20 @@ pub fn generate(
         return Err("caption is required".to_string());
     }
 
+    // Resolve wildcards here rather than in the UI. Expansion is a function of
+    // the seed, so doing it before submission means the text that reaches the
+    // engine is the text recorded on the job, and a retry renders the same
+    // prompt instead of rolling the dice again. The seed itself was already
+    // made concrete when the job was enqueued.
+    let expanded_caption = crate::wildcards::expand(&params.caption, params.seed);
+    let expanded_lyrics = crate::wildcards::expand(&params.lyrics, params.seed);
+    let params = &{
+        let mut p = params.clone();
+        p.caption = expanded_caption;
+        p.lyrics = expanded_lyrics;
+        p
+    };
+
     let out_dir = library_dir();
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
@@ -729,7 +825,7 @@ pub fn generate(
         return Ok(GenerateOutcome { tracks: Vec::new(), cancelled: true });
     }
 
-    let lm_body = fetch_result(port, &lm_id)?;
+    let lm_body = fetch_result(port, &lm_id)?.body;
     let lm_json: serde_json::Value = serde_json::from_slice(&lm_body)
         .map_err(|e| format!("bad /lm result: {e}"))?;
 
@@ -779,6 +875,19 @@ pub fn generate(
         out
     };
 
+    // Ask the engine for lyric timestamps. The engine runs an extra DiT pass
+    // for cross-attention alignment, which is opt-in and costs a little time;
+    // it is skipped for instrumental tracks, where there is nothing to align.
+    let wants_lrc = !is_instrumental(&params);
+    let mut requests = requests;
+    if wants_lrc {
+        for r in requests.iter_mut() {
+            if let Some(obj) = r.as_object_mut() {
+                obj.insert("get_lrc".to_string(), serde_json::Value::Bool(true));
+            }
+        }
+    }
+
     let synth_id = submit_synth_with_audio(
         port,
         &serde_json::Value::Array(requests.clone()),
@@ -793,7 +902,8 @@ pub fn generate(
     }
 
     on_stage("synth", "decoding audio");
-    let result = fetch_result(port, &synth_id)?;
+    let fetched = fetch_result(port, &synth_id)?;
+    let result = fetched.body;
     let parts = parse_audio_parts(&result);
     if parts.is_empty() {
         return Err("synth returned no audio parts".to_string());
@@ -830,6 +940,18 @@ pub fn generate(
         std::fs::write(&path, &data)
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
 
+        // Write the LRC beside the audio so the library can pick it up. A
+        // failure here must not lose the render -- the song is already on disk
+        // and the lyrics are still in the request.
+        if let Some(lrc) = fetched.lrc.as_deref() {
+            let lrc_path = path.with_extension("lrc");
+            if let Err(e) = std::fs::write(&lrc_path, lrc) {
+                eprintln!("[lrc] cannot write {}: {e}", lrc_path.display());
+            } else {
+                eprintln!("[lrc] wrote {} ({} bytes)", lrc_path.display(), lrc.len());
+            }
+        }
+
         let track = Track {
             id,
             bytes: data.len() as u64,
@@ -843,6 +965,7 @@ pub fn generate(
             vocal_language: meta.5,
             duration_secs: meta.6,
             created_at: stamp,
+            cover: crate::covers::cover_for(&path.display().to_string()),
         };
         write_metadata(&track);
         tracks.push(track);
@@ -939,6 +1062,7 @@ fn track_from_path(path: &Path) -> Track {
         timesignature: String::new(),
         vocal_language: String::new(),
         duration_secs: 0.0,
+        cover: crate::covers::cover_for(&path.display().to_string()),
         created_at: id
             .split('-')
             .next()
@@ -1203,6 +1327,7 @@ mod tests {
             vocal_language: "en".to_string(),
             duration_secs: 30.0,
             created_at: 1_700_000_000,
+            cover: Some("/covers/01-arcs.svg".to_string()),
         };
         let v = serde_json::to_value(&t).expect("serialize");
         for key in [

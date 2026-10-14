@@ -1,14 +1,18 @@
 import { AudioCppPanel } from "./components/AudioCppPanel";
 import { EngineSwitcher } from "./components/EngineSwitcher";
 import { GeneratePanel } from "./components/GeneratePanel";
+import { queue as queueApi, type GenerateParams } from "./lib/api";
 import { LibraryPanel } from "./components/LibraryPanel";
+import { QueuePanel } from "./components/QueuePanel";
 import { LogViewer } from "./components/LogViewer";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { ThemeChooser, useTheme } from "./components/ThemeChooser";
 import { StorePanel } from "./components/StorePanel";
 import { useEffect, useRef } from "react";
 import { useApp } from "./store/useApp";
 
 export default function App() {
+  const [theme, setTheme] = useTheme();
   const app = useApp();
   const running = app.status?.ready ?? false;
 
@@ -63,6 +67,7 @@ export default function App() {
         </nav>
 
         <div className="mt-auto space-y-2 pt-4">
+          <ThemeChooser theme={theme} onChange={setTheme} />
           <div className="panel p-3">
             <div className="flex items-center justify-between">
               <span className="text-[11px] text-ink-400">Runtime</span>
@@ -143,8 +148,39 @@ export default function App() {
                 params={app.params}
                 setParams={app.setParams}
                 onBrowseModels={() => app.setView("models")}
-                onGenerated={app.handleGenerated}
                 tracks={app.tracks}
+                onBuildSection={(o) => {
+                  // A section is a repaint that outpaints past the end of the
+                  // audio built so far, queued rather than awaited so four
+                  // variants can be in flight without blocking the form.
+                  app.setParams((p: GenerateParams) => ({
+                    ...p,
+                    taskType: "repaint",
+                    sourceAudio: o.sourcePath,
+                    repaintingStart: o.startSecs,
+                    repaintingEnd: o.startSecs + o.lengthSecs,
+                    seed: o.seed,
+                  }));
+                  void queueApi.add({
+                    ...app.params,
+                    taskType: "repaint",
+                    sourceAudio: o.sourcePath,
+                    repaintingStart: o.startSecs,
+                    repaintingEnd: o.startSecs + o.lengthSecs,
+                    seed: o.seed,
+                  });
+                }}
+                onStemLayer={(stem, sourcePath) => {
+                  // A layer request is just a lego render pointed at the top of
+                  // a stack; routing it through the form keeps every
+                  // validation and preset rule in one place.
+                  app.setParams((p: GenerateParams) => ({
+                    ...p,
+                    taskType: "lego",
+                    track: stem,
+                    sourceAudio: sourcePath,
+                  }));
+                }}
               />
             )}
 
@@ -156,10 +192,19 @@ export default function App() {
                 onRendered={() => app.refreshLibrary()}
               />
             )}
+
+            {/* The queue is shared by both engines, so it sits outside the
+                per-engine branches. It stays mounted while the panels above it
+                unmount, which is what keeps running-job rows visible. */}
+            <QueuePanel onGenerated={app.refreshLibrary} />
           </div>
 
           <div hidden={app.view !== "library"} className="space-y-5">
-            <LibraryPanel tracks={app.tracks} onChanged={app.refreshLibrary} />
+            <LibraryPanel
+              tracks={app.tracks}
+              onChanged={app.refreshLibrary}
+              running={running}
+            />
             <LogViewer running={running} />
           </div>
 

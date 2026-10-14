@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { settings, type SettingsView } from "../lib/api";
+import { coverUrl, covers, settings, type CoverEntry, type SettingsView } from "../lib/api";
 
 interface Props {
   view: SettingsView;
@@ -25,10 +25,18 @@ export function SettingsPanel({
   const [draft, setDraft] = useState(view.models_dir);
   const [saved, setSaved] = useState(false);
   const [libDraft, setLibDraft] = useState(view.library_dir);
+  const [coverDraft, setCoverDraft] = useState(view.covers_dir);
+  const [coverBusy, setCoverBusy] = useState(false);
+  const [coverError, setCoverError] = useState<string | null>(null);
+  const [coverList, setCoverList] = useState<CoverEntry[]>([]);
   const [libBusy, setLibBusy] = useState(false);
   const [libError, setLibError] = useState<string | null>(null);
   const [chunk, setChunk] = useState(view.vae_chunk);
   const [max_seq, setMaxSeq] = useState(view.max_seq);
+
+  useEffect(() => {
+    void refreshCovers();
+  }, []);
 
   useEffect(() => {
     setDraft(view.models_dir);
@@ -75,6 +83,46 @@ export function SettingsPanel({
       setLibError(String(e));
     } finally {
       setLibBusy(false);
+    }
+  }
+
+  async function refreshCovers() {
+    try {
+      setCoverList(await covers.list());
+    } catch {
+      // A missing preview is not worth an error banner next to the setting.
+      setCoverList([]);
+    }
+  }
+
+  async function browseCovers() {
+    setCoverBusy(true);
+    setCoverError(null);
+    try {
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose a folder of cover images",
+      });
+      if (typeof picked === "string") setCoverDraft(picked);
+    } catch (e) {
+      setCoverError(String(e));
+    } finally {
+      setCoverBusy(false);
+    }
+  }
+
+  async function saveCovers(path: string) {
+    setCoverBusy(true);
+    setCoverError(null);
+    try {
+      await covers.setDir(path);
+      await refreshCovers();
+      onChanged();
+    } catch (e) {
+      setCoverError(String(e));
+    } finally {
+      setCoverBusy(false);
     }
   }
 
@@ -216,6 +264,79 @@ export function SettingsPanel({
         {libError && (
           <p className="text-xs text-rose-300">{libError}</p>
         )}
+      </div>
+
+      <div className="space-y-2 border-t border-ink-800 pt-4">
+        <div>
+          <h3 className="text-sm font-semibold">Cover art</h3>
+          <p className="mt-1 text-xs text-ink-500">
+            Songs are given artwork automatically. Leave this empty to use the
+            artwork bundled with the app, or point it at a folder of your own
+            pictures — any format the system can decode.
+          </p>
+        </div>
+
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <input
+            value={coverDraft}
+            onChange={(e) => setCoverDraft(e.target.value)}
+            placeholder="bundled artwork"
+            spellCheck={false}
+            aria-label="Cover art folder path"
+            className="field min-w-0 flex-1"
+          />
+          <div className="flex gap-2">
+            <button
+              onClick={() => void browseCovers()}
+              disabled={coverBusy}
+              className="btn btn-ghost px-3 py-1.5 text-xs disabled:opacity-40"
+            >
+              browse…
+            </button>
+            <button
+              onClick={() => void saveCovers(coverDraft)}
+              disabled={coverBusy || coverDraft.trim() === view.covers_dir.trim()}
+              className="btn btn-primary px-4 py-1.5 text-xs disabled:opacity-40"
+            >
+              Save
+            </button>
+          </div>
+        </div>
+
+        {coverList.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {coverList.slice(0, 24).map((c) => {
+              const url = coverUrl(c.path);
+              return (
+                <img
+                  key={c.path}
+                  src={url ?? undefined}
+                  alt={c.name}
+                  title={
+                    c.fromUserDir
+                      ? `${c.name}\nfrom your cover folder`
+                      : `${c.name}\nbundled`
+                  }
+                  className="size-11 rounded-md object-cover ring-1 ring-ink-800"
+                />
+              );
+            })}
+            {coverList.length > 24 && (
+              <span className="self-center text-[11px] text-ink-500">
+                +{coverList.length - 24} more
+              </span>
+            )}
+          </div>
+        )}
+
+        {coverList.length === 0 && (
+          <p className="text-xs text-amber-400/80">
+            No cover images found. The bundled set ships with the app; if this is
+            empty the install may be incomplete.
+          </p>
+        )}
+
+        {coverError && <p className="text-xs text-rose-300">{coverError}</p>}
       </div>
 
       <div className="border-t border-ink-800 pt-3">

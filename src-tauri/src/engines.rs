@@ -102,6 +102,23 @@ struct Manifest {
     /// launch, so it is better to refuse it here.
     #[serde(default)]
     files: Vec<String>,
+    /// Hash of the engine binary when *we* installed it. Absent for an engine
+    /// the user supplied themselves.
+    #[serde(default)]
+    source_hash: Option<String>,
+}
+
+/// FNV-1a over the binary. Not a security hash -- it only has to notice that
+/// the engine we shipped is not the one that got installed, which is why it can
+/// be cheap and dependency-free.
+fn hash_binary(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(format!("{hash:016x}"))
 }
 
 fn engines_dir() -> PathBuf {
@@ -338,10 +355,56 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
 
 /// Register an already-present runtime directory (the one inside the app
 /// bundle) as an installed engine, writing the manifest it needs.
+/// Whether the installed engine should be replaced by the bundled one.
+///
+/// True only when the installed copy carries a `source_hash` -- meaning this
+/// app put it there -- and that hash differs from the bundled engine's. An
+/// engine with no recorded hash came from the user and is left alone.
+fn should_refresh(id: EngineId, source: &Path) -> bool {
+    let dir = engines_dir().join(id.as_str());
+    let Ok(text) = std::fs::read_to_string(dir.join("manifest.json")) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<Manifest>(&text) else {
+        return false;
+    };
+    let Some(installed) = manifest.source_hash else {
+        return false;
+    };
+    let Some(bundled) = hash_binary(&source.join("ace-server")) else {
+        return false;
+    };
+    if installed == bundled {
+        return false;
+    }
+    eprintln!("[engines] refreshing the bundled ACE-Step engine ({installed} -> {bundled})");
+    true
+}
+
+/// Discard an installed engine and re-adopt the bundled one.
+///
+/// Needed once by installs made before engine provenance was recorded: those
+/// manifests carry no hash, so the automatic refresh cannot tell an engine this
+/// app installed from one the user installed, and guessing wrong would discard
+/// somebody's build. Explicit is the right call for that ambiguity.
+pub fn reinstall_from(source: &Path) -> Result<(), String> {
+    let id = EngineId::AceStep;
+    let _ = std::fs::remove_dir_all(engines_dir().join(id.as_str()));
+    adopt_from(source)
+}
+
 pub fn adopt_from(source: &Path) -> Result<(), String> {
     let id = EngineId::AceStep;
     if binary_path(id).is_some() {
-        return Ok(());
+        // Already installed. Refresh it only when the copy on disk is one *we*
+        // put there and the bundled engine has since changed -- otherwise a
+        // new app release would silently overwrite an engine the user built or
+        // installed themselves.
+        if !should_refresh(id, source) {
+            return Ok(());
+        }
+        let destination = engines_dir().join(id.as_str());
+        let _ = std::fs::remove_dir_all(&destination);
     }
     let root = engines_dir();
     let destination = root.join(id.as_str());
@@ -366,6 +429,7 @@ pub fn adopt_from(source: &Path) -> Result<(), String> {
         "label": "ACE-Step (acestep.cpp)",
         "binary": "ace-server",
         "files": files,
+        "sourceHash": hash_binary(&destination.join("ace-server")),
     });
     std::fs::write(
         destination.join("manifest.json"),
@@ -518,5 +582,33 @@ mod tests {
         .unwrap();
         let report = inspect(&dir);
         assert!(report.ok, "problems: {:?}", report.problems);
+    }
+}
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    /// The decision that matters most: an engine the user installed must never
+    /// be replaced by a bundled one, however old it is.
+    #[test]
+    fn hashing_is_stable_and_distinguishes_content() {
+        let dir = std::env::temp_dir().join("aceforge-hash-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let a = dir.join("a.bin");
+        let b = dir.join("b.bin");
+        std::fs::write(&a, b"engine version one").unwrap();
+        std::fs::write(&b, b"engine version two!").unwrap();
+
+        let ha = hash_binary(&a).expect("hashes");
+        let hb = hash_binary(&b).expect("hashes");
+        assert_eq!(ha, hash_binary(&a).unwrap(), "hashing must be stable");
+        assert_ne!(ha, hb, "different content must hash differently");
+        assert_eq!(ha.len(), 16);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_binary_hashes_to_nothing_rather_than_panicking() {
+        assert!(hash_binary(std::path::Path::new("/nonexistent/ace-server")).is_none());
     }
 }

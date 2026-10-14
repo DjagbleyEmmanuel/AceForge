@@ -42,6 +42,11 @@ pub struct Settings {
     /// written fine and then fail to play.
     #[serde(default)]
     pub library_dir: String,
+    /// A folder of images used as cover art. Empty means "use the covers
+    /// bundled with the app". Anything the webview can decode is accepted, so
+    /// this is not limited to a fixed extension list at the settings level.
+    #[serde(default)]
+    pub covers_dir: String,
 }
 
 fn default_ac_backend() -> String {
@@ -72,6 +77,7 @@ impl Default for Settings {
             audiocpp_device: 0,
             audiocpp_threads: 0,
             library_dir: String::new(),
+            covers_dir: String::new(),
         }
     }
 }

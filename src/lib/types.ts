@@ -1,3 +1,5 @@
+import type { GenerateParams } from "./api";
+
 export type Role = "Planner" | "TextEncoder" | "Dit" | "Vae";
 
 export interface WeightFile {
@@ -82,4 +84,89 @@ export function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
   const m = Math.floor(seconds / 60);
   return `${m}m ${Math.round(seconds % 60)}s`;
+}
+/** Queue lifecycle. `interrupted` means the app exited mid-render: the job
+ *  never resumes on its own, so a restart can never run the same work twice. */
+export type JobState =
+  | "queued"
+  | "running"
+  | "done"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export interface QueuedJob {
+  id: string;
+  params: GenerateParams;
+  state: JobState;
+  error: string | null;
+  track_ids: string[];
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  audio_secs: number;
+  elapsed_secs: number;
+}
+
+export interface Marker {
+  atSecs: number;
+  label: string;
+}
+
+export interface TrackNotes {
+  markers: Marker[];
+}
+
+export type LoudnessTarget = "streaming14" | "club9" | "broadcast24" | "loud6";
+
+export interface NormaliseReport {
+  measuredLufs: number | null;
+  targetLufs: number;
+  appliedGainDb: number;
+  limited: boolean;
+  peakBeforeDbfs: number;
+  peakAfterDbfs: number;
+  /** Spectral tilt applied to match a reference, if one was given. */
+  brightnessTiltDb: number | null;
+}
+
+export interface SavedSeed {
+  seed: number;
+  caption: string;
+  starred: boolean;
+  createdAt: number;
+}
+
+export interface Layer {
+  id: string;
+  label: string;
+  path: string;
+}
+
+export interface LayerStack {
+  id: string;
+  name: string;
+  layers: Layer[];
+  updatedAt: number;
+}
+
+export interface Section {
+  id: string;
+  name: string;
+  lyrics: string;
+  lengthSecs: number;
+  variants: string[];
+  chosen: number | null;
+  basePath: string | null;
+}
+
+export interface SongProject {
+  id: string;
+  name: string;
+  caption: string;
+  bpm: number;
+  keyscale: string;
+  timesignature: string;
+  sections: Section[];
+  updatedAt: number;
 }

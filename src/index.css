@@ -275,3 +275,112 @@ input[type="range"]::-moz-range-thumb {
     animation: none;
   }
 }
+/* ---------------------------------------------------------------------------
+ * Themes
+
+ * Every colour in the app resolves through a custom property, so a theme is
+ * just a different set of values on the root element. Overriding them in a
+ * `[data-theme]` rule is enough: no utility class changes, and every component
+ * follows along. Selectors are written as `html[data-theme=...]` because
+ * `:root` alone has lower specificity than the `:root` rule Tailwind emits.
+ *
+ * Each theme keeps the same lightness ramp so contrast is identical between
+ * them; only the hue and the tint of the neutrals move. That is deliberate --
+ * a theme that also changed brightness would make a chosen preset unreadable in
+ * some themes and not others.
+ * ------------------------------------------------------------------------- */
+
+[data-theme="aurora"] {
+  --color-glow-500: #8b5cf6;
+  --color-glow-400: #a78bfa;
+  --color-glow-300: #c4b5fd;
+  --color-mint-400: #34d399;
+  --color-ink-950: #08080b;
+  --color-ink-900: #0c0c11;
+  --color-ink-850: #101017;
+  --theme-wash-2: #34d399;
+}
+
+[data-theme="ember"] {
+  --color-glow-500: #f97316;
+  --color-glow-400: #fb923c;
+  --color-glow-300: #fdba74;
+  --color-mint-400: #fbbf24;
+  --color-ink-950: #0c0705;
+  --color-ink-900: #120b08;
+  --color-ink-850: #18100c;
+  --color-ink-800: #201510;
+  --color-ink-750: #2a1b14;
+  --color-ink-700: #362218;
+  --theme-wash-2: #fbbf24;
+}
+
+[data-theme="ocean"] {
+  --color-glow-500: #0ea5e9;
+  --color-glow-400: #38bdf8;
+  --color-glow-300: #7dd3fc;
+  --color-mint-400: #2dd4bf;
+  --color-ink-950: #04090f;
+  --color-ink-900: #070e16;
+  --color-ink-850: #0b131d;
+  --color-ink-800: #101a26;
+  --color-ink-750: #16222f;
+  --color-ink-700: #1d2b3a;
+  --theme-wash-2: #2dd4bf;
+}
+
+[data-theme="neon"] {
+  --color-glow-500: #22c55e;
+  --color-glow-400: #4ade80;
+  --color-glow-300: #86efac;
+  --color-mint-400: #a3e635;
+  --color-ink-950: #050b06;
+  --color-ink-900: #08110a;
+  --color-ink-850: #0b170e;
+  --color-ink-800: #0f2013;
+  --color-ink-750: #142a18;
+  --color-ink-700: #1a351f;
+  --theme-wash-2: #a3e635;
+}
+
+[data-theme="orchid"] {
+  --color-glow-500: #d946ef;
+  --color-glow-400: #e879f9;
+  --color-glow-300: #f0abfc;
+  --color-mint-400: #fb7185;
+  --color-ink-950: #0b0410;
+  --color-ink-900: #12071a;
+  --color-ink-850: #180a22;
+  --color-ink-800: #1f0e2b;
+  --color-ink-750: #271334;
+  --color-ink-700: #30193f;
+  --theme-wash-2: #fb7185;
+}
+
+[data-theme="solar"] {
+  --color-glow-500: #eab308;
+  --color-glow-400: #facc15;
+  --color-glow-300: #fde047;
+  --color-mint-400: #fb923c;
+  --color-ink-950: #0b0904;
+  --color-ink-900: #120f07;
+  --color-ink-850: #19140a;
+  --color-ink-800: #211b0e;
+  --color-ink-750: #2a2212;
+  --color-ink-700: #342b17;
+  --theme-wash-2: #fb923c;
+}
+
+[data-theme="spectrum"] {
+  --color-glow-500: #06b6d4;
+  --color-glow-400: #22d3ee;
+  --color-glow-300: #67e8f9;
+  --color-mint-400: #e879f9;
+  --color-ink-950: #07080c;
+  --color-ink-900: #0b0d13;
+  --color-ink-850: #10131c;
+  --color-ink-800: #161a26;
+  --color-ink-750: #1d2231;
+  --color-ink-700: #252b3c;
+  --theme-wash-2: #e879f9;
+}

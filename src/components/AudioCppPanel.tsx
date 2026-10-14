@@ -7,6 +7,7 @@ import {
   type ScanResult,
 } from "../lib/audiocpp";
 import { formatBytes } from "../lib/types";
+import { Select } from "./Select";
 
 const BACKENDS = ["cpu", "cuda", "vulkan", "metal", "hip"] as const;
 const COT_MODES = ["off", "melody", "full"] as const;
@@ -65,6 +66,7 @@ export function AudioCppPanel({
   const [steps, setSteps] = useState("8");
   const [cot, setCot] = useState("off");
   const [stopAfter, setStopAfter] = useState("audio");
+  const [length, setLength] = useState("9000");
 
   const [useGpu, setUseGpu] = useState(false);
   const [device, setDevice] = useState(0);
@@ -212,13 +214,25 @@ export function AudioCppPanel({
         numInferenceSteps: num(steps),
         cot,
         stopAfter,
+        semanticMaxTokens: length.trim() === "" ? null : Number(length),
+        semanticMinTokens: null,
       });
       setResult(out);
       onRendered(out.path);
       setStatus({ running: false, note: "done" });
     } catch (e) {
-      setError(String(e));
-      setStatus({ running: false, note: "failed" });
+      const msg = String(e);
+      // A cancel kills the runtime, so the render cannot succeed. That is an
+      // outcome the user chose, not a fault, and it must not land in the error
+      // slot. It also leaves the engine down, which is worth showing.
+      if (msg.includes("cancelled")) {
+        setError(null);
+        setLoaded([]);
+        setStatus({ running: false, note: "cancelled — runtime stopped" });
+      } else {
+        setError(msg);
+        setStatus({ running: false, note: "failed" });
+      }
     } finally {
       setBusy(false);
     }
@@ -274,22 +288,18 @@ export function AudioCppPanel({
 
         {options.length > 0 && (
           <div className="space-y-2">
-            <label className="label" htmlFor="audiocpp-model">
-              Model
-            </label>
-            <select
-              id="audiocpp-model"
+            <Select
+              label="Model"
               value={chosen}
-              onChange={(e) => setChosen(e.target.value)}
-              className="w-full rounded-lg border border-ink-700 bg-ink-850 px-3 py-2 text-sm text-ink-100 outline-none transition focus:border-glow-500/60 focus:ring-1 focus:ring-glow-500/40"
-            >
-              {options.map((o) => (
-                <option key={o.entry.id} value={o.entry.id}>
-                  {describe(o)}
-                  {isLoaded(o.entry.id) ? "" : "  (not loaded)"}
-                </option>
-              ))}
-            </select>
+              options={options.map((o) => ({
+                value: o.entry.id,
+                label: describe(o),
+                // On disk but not resident is the common case here, and it is
+                // not obvious from the label alone.
+                meta: isLoaded(o.entry.id) ? "loaded" : "not loaded",
+              }))}
+              onChange={setChosen}
+            />
 
             {selected && (
               <div className="flex flex-wrap items-center gap-1.5">
@@ -393,22 +403,20 @@ export function AudioCppPanel({
               <label className="label" htmlFor="ac-backend">
                 Backend
               </label>
-              <select
-                id="ac-backend"
+              <Select
+                label="Backend"
                 value={useGpu ? "cuda" : "cpu"}
-                onChange={(e) => {
-                  const gpu = e.target.value === "cuda";
+                options={BACKENDS.map((b) => ({
+                  value: b,
+                  label: b,
+                  note: b === "cuda" ? "needs the split offload setup" : undefined,
+                }))}
+                onChange={(v) => {
+                  const gpu = v === "cuda";
                   setUseGpu(gpu);
                   void pushRuntime(gpu, device, threads);
                 }}
-                className="field mt-1.5"
-              >
-                {BACKENDS.map((b) => (
-                  <option key={b} value={b}>
-                    {b}
-                  </option>
-                ))}
-              </select>
+              />
             </div>
             <div>
               <label className="label" htmlFor="ac-device">
@@ -547,18 +555,12 @@ export function AudioCppPanel({
             <label className="label" htmlFor="ac-cot">
               Planning
             </label>
-            <select
-              id="ac-cot"
+            <Select
+              label="Reasoning"
               value={cot}
-              onChange={(e) => setCot(e.target.value)}
-              className="field mt-1.5"
-            >
-              {COT_MODES.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
+              options={COT_MODES.map((c) => ({ value: c, label: c }))}
+              onChange={setCot}
+            />
           </div>
           <div>
             <label className="label" htmlFor="ac-guidance">
@@ -591,21 +593,45 @@ export function AudioCppPanel({
         </div>
 
         <div>
+          <label className="label" htmlFor="ac-length">
+            Length
+          </label>
+          <input
+            id="ac-length"
+            type="number"
+            min={200}
+            max={60000}
+            step={100}
+            value={length}
+            onChange={(e) => setLength(e.target.value)}
+            className="field mt-1.5"
+          />
+          <p className="mt-1 text-[10px] leading-relaxed text-ink-500">
+            In semantic codec tokens, not seconds — audio.cpp documents no rate
+            between the two, so guessing one would make this number a lie.
+            The planner stops at the cap and the song is truncated there
+            (9000 is the model's default). Lower it for a short sketch; a
+            truncated render stops at the boundary rather than fading out.
+          </p>
+        </div>
+
+        <div>
           <label className="label" htmlFor="ac-stop">
             Stop after
           </label>
-          <select
-            id="ac-stop"
+          <Select
+            label="Stop after"
             value={stopAfter}
-            onChange={(e) => setStopAfter(e.target.value)}
-            className="field mt-1.5"
-          >
-            {STOP_AFTER.map((s) => (
-              <option key={s} value={s}>
-                {s === "audio" ? "audio (full render)" : `${s} (skips decode)`}
-              </option>
-            ))}
-          </select>
+            options={STOP_AFTER.map((s) => ({
+              value: s,
+              label: s === "audio" ? "audio (full render)" : s,
+              note:
+                s === "audio"
+                  ? "writes the file, slowest"
+                  : `${s} — stops before the VAE decode`,
+            }))}
+            onChange={setStopAfter}
+          />
           <p className="mt-1 text-[10px] leading-relaxed text-ink-500">
             Use <span className="font-mono">semantic</span> to check a model
             really loaded without paying for the VAE decode — it stops after the
@@ -616,12 +642,16 @@ export function AudioCppPanel({
 
         <div className="flex items-center justify-between gap-3">
           <p className="text-[10px] leading-relaxed text-ink-500">
-            Cannot be cancelled once started — stopping means killing the
-            runtime and losing the partial render.
+            {busy
+              ? "audio.cpp has no cancel route — stopping kills the runtime and discards the partial render."
+              : "A render cannot be interrupted once started; cancel stops the runtime."}
           </p>
           {busy ? (
             <button
-              onClick={() => void audiocpp.cancel()}
+              onClick={() => {
+                setStatus({ running: true, note: "stopping the runtime…" });
+                void audiocpp.cancel();
+              }}
               className="btn btn-ghost min-w-28"
             >
               cancel

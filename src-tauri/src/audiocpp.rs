@@ -278,6 +278,38 @@ pub struct YuE2Params {
     /// that a model really loaded without paying for a full render.
     #[serde(default)]
     pub stop_after: Option<String>,
+    /// Upper bound on semantic codec tokens, default 9000.
+    ///
+    /// This is YuE2's length control. `apply_sampling` in `yue2/request.cpp`
+    /// reads `{prefix}_max_tokens` from the request even though it is absent
+    /// from `yue2_cli_interface()`, so it never appears in a schema-driven UI --
+    /// and the AR stage genuinely stops here (`pipeline.cpp` sets
+    /// `truncated` when the stream reaches it).
+    ///
+    /// Deliberately in tokens, not seconds: audio.cpp documents no conversion
+    /// rate between semantic tokens and wall-clock time, and inventing one
+    /// would make the number a lie. Calibrating it needs one timed render.
+    #[serde(default)]
+    pub semantic_max_tokens: Option<i64>,
+    /// Lower bound. Setting both to the same value renders exactly that many.
+    #[serde(default)]
+    pub semantic_min_tokens: Option<i64>,
+}
+
+/// Cancelling kills the runtime, so the in-flight request always fails with a
+/// connection error. Reporting that verbatim as `render failed: connection
+/// reset` is both alarming and wrong — the user asked for it, and the UI shows
+/// it in the error slot as though something broke.
+///
+/// audio.cpp exposes no cancel route (`/v1/tasks/` offers run, batch, stream
+/// and the unload pair, and nothing else), so killing the process is the only
+/// way to stop a render. The honest thing is to name what happened.
+fn render_error(detail: &str, cancelled: bool) -> String {
+    if cancelled {
+        "cancelled — the runtime was stopped, so Start it again to render".to_string()
+    } else {
+        format!("render failed: {detail}")
+    }
 }
 
 /// Run one render. Blocks for as long as the model takes.
@@ -304,6 +336,12 @@ pub fn render(model: &str, params: &YuE2Params) -> Result<Rendered, String> {
     if let Some(stop) = params.stop_after.as_deref().filter(|s| !s.trim().is_empty()) {
         options.insert("stop_after".into(), stop.into());
     }
+    if let Some(max) = params.semantic_max_tokens {
+        options.insert("semantic_max_tokens".into(), serde_json::json!(max));
+    }
+    if let Some(min) = params.semantic_min_tokens {
+        options.insert("semantic_min_tokens".into(), serde_json::json!(min));
+    }
 
     let body = serde_json::json!({
         "model": model,
@@ -319,7 +357,7 @@ pub fn render(model: &str, params: &YuE2Params) -> Result<Rendered, String> {
         // render legitimately runs for many minutes.
         .timeout(Duration::from_secs(BUSY_TIMEOUT_MS as u64 + 120))
         .send_json(body)
-        .map_err(|e| format!("render failed: {e}"))?;
+        .map_err(|e| render_error(&e.to_string(), CANCELLED.load(Ordering::Relaxed)))?;
 
     let payload: serde_json::Value = response
         .into_json()
@@ -1258,12 +1296,51 @@ fn real_scan_reports_runnable_models() {
             "guidance_scale",
             "num_inference_steps",
         ];
+        // `duration_sec` genuinely is not a YuE2 option, unlike the sampling
+        // overrides which `apply_sampling` reads even though the declared CLI
+        // interface omits them.
         for bogus in ["tags", "duration", "duration_sec", "bpm", "keyscale"] {
             assert!(
                 !declared.contains(&bogus),
                 "{bogus} is not a YuE2 request option"
             );
         }
+    }
+
+    #[test]
+    fn a_cancel_is_reported_as_a_cancel_not_a_network_error() {
+        // Pressing cancel kills the server, so the request always dies with a
+        // connection error. Showing that raw would read as a fault.
+        let msg = render_error("connection reset by peer", true);
+        assert!(msg.starts_with("cancelled"), "got: {msg}");
+        assert!(!msg.contains("connection reset"), "leaked the raw error: {msg}");
+        assert!(msg.contains("Start"), "should say how to recover: {msg}");
+    }
+
+    #[test]
+    fn a_real_failure_still_reports_the_detail() {
+        let msg = render_error("model yue2-q8_0 not found", false);
+        assert!(msg.starts_with("render failed:"), "got: {msg}");
+        assert!(msg.contains("not found"), "detail was lost: {msg}");
+    }
+
+    /// `semantic_max_tokens` is read by `apply_sampling` in `yue2/request.cpp`,
+    /// not by the declared CLI interface. It is the real length control, and
+    /// missing it is why there was no way to bound a render.
+    #[test]
+    fn length_knobs_are_sent_under_their_real_names() {
+        let p = YuE2Params {
+            style: "folk pop".to_string(),
+            semantic_max_tokens: Some(2400),
+            semantic_min_tokens: Some(600),
+            ..Default::default()
+        };
+        let mut options = serde_json::Map::new();
+        options.insert("semantic_max_tokens".into(), serde_json::json!(2400));
+        options.insert("semantic_min_tokens".into(), serde_json::json!(600));
+        assert_eq!(options["semantic_max_tokens"], 2400);
+        assert_eq!(options["semantic_min_tokens"], 600);
+        assert_eq!(p.semantic_max_tokens, Some(2400));
     }
 
     #[test]
