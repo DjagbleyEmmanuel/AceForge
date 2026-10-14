@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/resources/bin/
+
+# Vendored engine binaries. Over the 100 MB per-file hard limit on GitHub
+# (audiocpp_server alone is 144 MB), and both are build output rather than
+# source. `scripts/fetch-resources.sh` puts them back.
+src-tauri/resources/
+
+# Tauri regenerates these from tauri.conf.json.
+src-tauri/gen/

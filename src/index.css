@@ -1,0 +1,277 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink-950: #08080b;
+  --color-ink-900: #0c0c11;
+  --color-ink-850: #101017;
+  --color-ink-800: #16161f;
+  --color-ink-750: #1d1d28;
+  --color-ink-700: #262633;
+  --color-ink-600: #35354a;
+  --color-ink-500: #4a4a63;
+  --color-ink-400: #6b6b85;
+  --color-ink-300: #9a9ab3;
+  --color-ink-200: #c8c8da;
+  --color-ink-100: #e8e8f2;
+
+  --color-glow-500: #8b5cf6;
+  --color-glow-400: #a78bfa;
+  --color-glow-300: #c4b5fd;
+  --color-mint-400: #34d399;
+  --color-rose-400: #fb7185;
+  --color-amber-400: #fbbf24;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-ink-950);
+    color: var(--color-ink-100);
+    font-family:
+      "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+    /* Two soft radial washes so the page is not a flat black rectangle. */
+    background-image:
+      radial-gradient(
+        ellipse 80% 50% at 15% -10%,
+        color-mix(in oklab, var(--color-glow-500) 16%, transparent),
+        transparent
+      ),
+      radial-gradient(
+        ellipse 60% 40% at 100% 0%,
+        color-mix(in oklab, var(--color-mint-400) 8%, transparent),
+        transparent
+      );
+    background-attachment: fixed;
+  }
+
+  /* Firefox scrollbar styling; the webkit rules live below. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-ink-700) transparent;
+  }
+}
+
+@layer components {
+  .panel {
+    background: color-mix(in oklab, var(--color-ink-850) 82%, transparent);
+    border: 1px solid var(--color-ink-750);
+    border-radius: 1rem;
+    backdrop-filter: blur(12px);
+  }
+
+  .field {
+    width: 100%;
+    background: var(--color-ink-900);
+    border: 1px solid var(--color-ink-700);
+    border-radius: 0.75rem;
+    padding: 0.625rem 0.875rem;
+    font-size: 0.8125rem;
+    color: var(--color-ink-100);
+    outline: none;
+    transition:
+      border-color 140ms ease,
+      box-shadow 140ms ease;
+  }
+
+  .field:focus {
+    border-color: var(--color-glow-500);
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-glow-500) 22%, transparent);
+  }
+
+  .field::placeholder {
+    color: var(--color-ink-500);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 0.75rem;
+    padding: 0.5rem 1rem;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    transition:
+      background-color 140ms ease,
+      transform 100ms ease,
+      opacity 140ms ease;
+  }
+
+  .btn:active:not(:disabled) {
+    transform: scale(0.97);
+  }
+
+  .btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .btn-primary {
+    background: linear-gradient(
+      135deg,
+      var(--color-glow-500),
+      color-mix(in oklab, var(--color-glow-500) 55%, #4f46e5)
+    );
+    color: white;
+    box-shadow: 0 6px 20px -8px color-mix(in oklab, var(--color-glow-500) 70%, transparent);
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.08);
+  }
+
+  .btn-ghost {
+    background: var(--color-ink-800);
+    border: 1px solid var(--color-ink-700);
+    color: var(--color-ink-200);
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    background: var(--color-ink-750);
+  }
+
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    border-radius: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8125rem;
+    color: var(--color-ink-300);
+    transition:
+      background-color 140ms ease,
+      color 140ms ease;
+  }
+
+  .nav-item:hover {
+    background: var(--color-ink-850);
+    color: var(--color-ink-100);
+  }
+
+  .nav-item[data-active="true"] {
+    background: var(--color-ink-800);
+    color: white;
+    box-shadow: inset 0 0 0 1px var(--color-ink-700);
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    border-radius: 9999px;
+    padding: 0.125rem 0.5rem;
+    font-size: 0.6875rem;
+    font-weight: 500;
+  }
+
+  .label {
+    display: block;
+    font-size: 0.6875rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--color-ink-400);
+  }
+
+  code,
+  pre {
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+}
+
+/* Range inputs need explicit track/thumb styling to look right on dark. */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--color-ink-700);
+  outline: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: var(--color-glow-400);
+  border: 2px solid var(--color-ink-900);
+  cursor: pointer;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--color-ink-900);
+  border-radius: 9999px;
+  background: var(--color-glow-400);
+  cursor: pointer;
+}
+
+/* The native audio element cannot be restyled, so the controls are hidden and
+   replaced with our own play button plus this slim progress strip. */
+.player-native {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.sheen {
+  position: relative;
+  overflow: hidden;
+}
+
+.sheen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    120deg,
+    transparent 20%,
+    color-mix(in oklab, white 6%, transparent) 50%,
+    transparent 80%
+  );
+  transform: translateX(-100%);
+  animation: sheen 2.4s ease-in-out infinite;
+}
+
+@keyframes sheen {
+  0% {
+    transform: translateX(-100%);
+  }
+  60%,
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.pulsing {
+  animation: pulse-soft 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheen::after,
+  .pulsing {
+    animation: none;
+  }
+}
