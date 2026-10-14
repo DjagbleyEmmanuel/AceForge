@@ -462,8 +462,7 @@ export function GeneratePanel({
 
         <div className="grid gap-3 sm:grid-cols-2">
           <ModelPicker
-            id="lmModel"
-            label="Planner LM"
+                        label="Planner LM"
             hint="writes lyrics and audio codes"
             value={params.lmModel}
             onChange={(v) => set("lmModel", v)}
@@ -471,8 +470,7 @@ export function GeneratePanel({
             files={catalog.filter((f) => f.role === "Planner" && f.present)}
           />
           <ModelPicker
-            id="synthModel"
-            label="DiT"
+                        label="DiT"
             hint="renders the audio"
             value={params.synthModel}
             onChange={(v) => {
@@ -680,9 +678,6 @@ function LanguageField({
   const auto = value === "";
   return (
     <div>
-      <label className="label" htmlFor="vocalLanguage">
-        Vocal language
-      </label>
       <Select
         label="Vocal language"
         value={value}
@@ -705,7 +700,6 @@ function LanguageField({
 }
 
 function ModelPicker({
-  id,
   label,
   hint,
   value,
@@ -713,7 +707,6 @@ function ModelPicker({
   files,
   goToModels,
 }: {
-  id: string;
   label: string;
   hint: string;
   value: string;
@@ -737,10 +730,9 @@ function ModelPicker({
 
   return (
     <div>
-      <div className="flex items-center justify-between gap-2">
-        <label className="label" htmlFor={id}>
-          {label}
-        </label>
+      {/* The Select renders its own label; this row only carries the count
+          chip beside it. The label used to be here as well, and both appeared. */}
+      <div className="flex items-center justify-end gap-2">
         <span
           className={`chip ${
             none
@@ -921,9 +913,6 @@ function TaskSection({
 
           {stemMode === "single" && (
             <div>
-              <label className="label" htmlFor="stem-name">
-                Stem
-              </label>
               <Select
                 label="Stem"
                 value={params.track}

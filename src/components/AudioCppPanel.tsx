@@ -400,9 +400,6 @@ export function AudioCppPanel({
           </summary>
           <div className="grid grid-cols-3 gap-3 pt-1">
             <div>
-              <label className="label" htmlFor="ac-backend">
-                Backend
-              </label>
               <Select
                 label="Backend"
                 value={useGpu ? "cuda" : "cpu"}
@@ -616,9 +613,6 @@ export function AudioCppPanel({
         </div>
 
         <div>
-          <label className="label" htmlFor="ac-stop">
-            Stop after
-          </label>
           <Select
             label="Stop after"
             value={stopAfter}
