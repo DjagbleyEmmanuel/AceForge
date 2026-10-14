@@ -281,6 +281,12 @@ pub fn cancel(job_id: String) -> Result<(), String> {
 /// original parameters, so a retry is the same request, not a reconstruction.
 pub fn retry(job_id: String) -> Result<QueuedJob, String> {
     let inner = state();
+    // Allocate the id before taking the lock. `next_id` reads the job count and
+    // locks `jobs` itself, so calling it from inside the update closure would
+    // re-enter a Mutex that is not reentrant: the thread blocks while holding
+    // the lock and every later queue call blocks behind it. That is what made
+    // Retry freeze the window instead of requeueing the job.
+    let fresh_id = next_id();
     let mut retried: Option<QueuedJob> = None;
     inner.update(|jobs| {
         let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) else {
@@ -290,7 +296,7 @@ pub fn retry(job_id: String) -> Result<QueuedJob, String> {
             return;
         }
         let fresh = QueuedJob {
-            id: next_id(),
+            id: fresh_id,
             params: job.params.clone(),
             state: JobState::Queued,
             error: None,
@@ -601,5 +607,59 @@ mod tests {
             serde_json::to_string(&JobState::Interrupted).unwrap(),
             "\"interrupted\""
         );
+    }
+
+    /// `retry` allocated its new id from inside the update closure, and
+    /// `next_id` locks the very mutex the closure already held. A `Mutex` is not
+    /// reentrant, so the thread parked forever holding the lock and every queue
+    /// call after it hung with it -- the window froze rather than requeueing.
+    ///
+    /// Both the retry and the read that follows it run on threads with a
+    /// deadline: a regression blocks the test instead of hanging the suite.
+    #[test]
+    fn retry_returns_and_leaves_the_queue_usable() {
+        let inner = state();
+        // The queue state is a process-wide singleton, so other tests may have
+        // rows in it. Compare against a baseline rather than an exact count.
+        let before = inner.jobs.lock().unwrap_or_else(|e| e.into_inner()).len();
+        inner.update(|jobs| {
+            jobs.push(QueuedJob {
+                id: "q-retry-src".into(),
+                params: params_with_caption("retry me"),
+                state: JobState::Failed,
+                error: Some("boom".into()),
+                track_ids: Vec::new(),
+                created_at: now_secs(),
+                started_at: Some(now_secs()),
+                finished_at: Some(now_secs()),
+                audio_secs: 0.0,
+                elapsed_secs: 1.0,
+            });
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let retried = retry("q-retry-src".to_string());
+            let listed = state()
+                .jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
+            let _ = tx.send((retried, listed));
+        });
+
+        let (retried, listed) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("retry deadlocked on the job lock");
+        let retried = retried.expect("a failed job can be retried");
+        assert_eq!(retried.state, JobState::Queued);
+        assert_eq!(retried.params.caption, "retry me");
+        assert!(retried.error.is_none(), "the retry starts clean");
+        assert_eq!(
+            listed,
+            before + 2,
+            "the original stays for history, the retry is added"
+        );
+        assert_ne!(retried.id, "q-retry-src", "a retry is a new row, not a reuse");
     }
 }
