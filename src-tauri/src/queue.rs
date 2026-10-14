@@ -142,8 +142,6 @@ struct Inner {
     jobs: Mutex<Vec<QueuedJob>>,
     /// Bumped on every mutation so the runner wakes.
     wake: Condvar,
-    /// Held so queued work can be emitted to the UI. Set once during startup.
-    app: Mutex<Option<tauri::AppHandle>>,
     /// Engine-side job id of the render in flight, for cancel.
     backend_job: Mutex<Option<String>>,
 }
@@ -179,7 +177,6 @@ fn state() -> &'static Arc<Inner> {
         Arc::new(Inner {
             jobs: Mutex::new(jobs),
             wake: Condvar::new(),
-            app: Mutex::new(None),
             backend_job: Mutex::new(None),
         })
     })
@@ -366,24 +363,38 @@ fn current_running_backend_job() -> Option<String> {
 
 /// Remember the app handle so queue events can reach the UI. Called once during
 /// startup, before the runner thread begins.
-pub fn set_app(app: tauri::AppHandle) {
-    *state().app.lock().unwrap_or_else(|e| e.into_inner()) = Some(app);
-}
-
+/// The shared app handle.
+///
+/// This used to be a slot held here, set by `set_app`. When the lyric-sync
+/// runner needed a handle too, the two were unified in `crate::app_handle`
+/// -- and the call that populated this slot was replaced rather than removed,
+/// so it was never written. Nothing noticed because every action still mutated
+/// the backend correctly; only the events went missing, so the list stopped
+/// refreshing after Clear done, Reset, Retry or Discard, and per-job progress
+/// stopped arriving.
 fn app() -> Option<tauri::AppHandle> {
-    state()
-        .app
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    crate::app_handle()
 }
 
 /// Emit `queue://changed` so the list re-renders. Failure is not fatal: the
-/// queue is still correct on disk and refreshes on the next action.
+/// queue is still correct on disk.
+///
+/// Says so once when there is no handle. This function failing quietly is how
+/// the queue ended up mutating correctly while the UI sat there unchanged: no
+/// warning, no error, and every button looking broken.
 fn emit_change() {
     use tauri::Emitter;
-    if let Some(app) = app() {
-        let _ = app.emit("queue://changed", ());
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    match app() {
+        Some(app) => {
+            let _ = app.emit("queue://changed", ());
+        }
+        None => WARNED.call_once(|| {
+            eprintln!(
+                "[queue] no app handle: the queue will keep working but the UI will \
+                 not refresh until something else triggers it"
+            );
+        }),
     }
 }
 
