@@ -409,6 +409,9 @@ export const lyricSync = {
 export interface CropResult {
   seconds: number;
   replaced: boolean;
+  /** The caller asked to overwrite but the source is compressed, so a sibling
+   *  was written instead and the original survives. */
+  keptOriginal: boolean;
 }
 
 export const trimming = {
@@ -427,11 +430,7 @@ export const trimming = {
 
 /** Loudness normalisation. Writes a new file; the original is left alone. */
 export const mastering = {
-  normalise: (
-    path: string,
-    target: LoudnessTarget,
-    referencePath?: string,
-  ) =>
+  normalise: (path: string, target: LoudnessTarget, referencePath?: string) =>
     invoke<NormaliseReport>("normalise_track", {
       path,
       target,

@@ -684,33 +684,43 @@ fn crop_track(
     .ok_or_else(|| format!("nothing to keep between {from_secs}s and {to_secs}s"))?;
     let seconds = cropped.duration_secs();
 
-    if replace {
+    // The result is always WAV. The input may have been MP3, and writing WAV
+    // bytes over a `.mp3` would leave a file whose contents disagree with its
+    // name, which is the kind of break nobody notices until playback fails.
+    let original = std::path::Path::new(&path);
+    let is_wav = original
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false);
+
+    if replace && is_wav {
         // Write beside the original and rename over it. Writing in place would
         // leave a half-written file if the process died mid-write, and the
         // original is the only copy of a render that took minutes.
-        let staged = std::path::PathBuf::from(&path).with_extension("cropping.tmp");
+        let staged = original.with_extension("cropping.tmp");
         std::fs::write(&staged, wav::write(&cropped))
             .map_err(|e| format!("cannot write: {e}"))?;
         std::fs::rename(&staged, &path)
             .map_err(|e| format!("cannot replace {}: {e}", path))?;
     } else {
-        let stem = std::path::Path::new(&path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("track");
+        let stem = original.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
         let suffix = match keep {
             CropKeep::Only => "clip",
             CropKeep::Except => "cut",
         };
-        let out =
-            crate::paths::unique_path(&crate::paths::library_dir(), stem, suffix);
+        let name = format!("{stem}-{suffix}");
+        let out = crate::paths::unique_path(&crate::paths::library_dir(), &name, "wav");
         std::fs::write(&out, wav::write(&cropped))
             .map_err(|e| format!("cannot write: {e}"))?;
     }
 
     Ok(CropResult {
         seconds,
-        replaced: replace,
+        // Report what actually happened. The caller asked to overwrite, and on
+        // an MP3 that cannot be done in place.
+        replaced: replace && is_wav,
+        kept_original: !(replace && is_wav),
     })
 }
 
@@ -728,6 +738,9 @@ enum CropKeep {
 struct CropResult {
     seconds: f32,
     replaced: bool,
+    /// True when the caller asked to overwrite a compressed file and a sibling
+    /// was written instead, so the original is still on disk.
+    kept_original: bool,
 }
 
 /// Normalise a rendered track to a loudness target and write a new file.

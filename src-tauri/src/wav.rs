@@ -106,12 +106,30 @@ fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
     ]))
 }
 
+/// Read a WAV or an MP3 into interleaved float samples.
+///
+/// Renders default to MP3, so a reader that only spoke RIFF failed on exactly
+/// the files this app produces: crop and normalise both reported "not a
+/// RIFF/WAVE file" on every MP3 in the library. MP3 now decodes here rather
+/// than being handed over the IPC bridge as samples -- a five minute stereo
+/// track is nearly thirty million floats, which is not something to serialise
+/// into JSON.
 pub fn read(bytes: &[u8]) -> Result<Wav, String> {
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return read_wav(bytes);
+    }
+    if let Ok(mp3) = read_mp3(bytes) {
+        return Ok(mp3);
+    }
+    if bytes.len() < 44 {
+        return Err("file is too short to be audio".to_string());
+    }
+    Err("not a WAV or MP3 file".to_string())
+}
+
+fn read_wav(bytes: &[u8]) -> Result<Wav, String> {
     if bytes.len() < 44 {
         return Err("file is too short to be a WAV".to_string());
-    }
-    if &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err("not a RIFF/WAVE file".to_string());
     }
 
     // Chunk walking, because a WAV may carry LIST/fact/cue chunks before the
@@ -273,6 +291,225 @@ pub fn write(wav: &Wav) -> Vec<u8> {
         out.extend_from_slice(&s.to_le_bytes());
     }
     out
+}
+
+/// Decode MP3 to interleaved float samples with minimp3 (CC0, public domain).
+///
+/// Vendored rather than pulled in as a crate: the app builds offline against a
+/// fixed dependency set, and this is the same decoder the engine already uses,
+/// so the app and the engine agree on what a render sounds like.
+fn read_mp3(bytes: &[u8]) -> Result<Wav, String> {
+    let mut decoder = Mp3Decoder::new();
+    let mut pcm: Vec<i16> = Vec::new();
+    let mut rate = 0u32;
+    let mut channels = 0u16;
+
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let info = decoder.decode_frame(&bytes[offset..]);
+        if info.frame_bytes == 0 {
+            break;
+        }
+        offset += info.frame_bytes;
+        // The first frame that reports a format is the one to trust; skip the
+        // padding some encoders put in front of the stream.
+        if info.channels == 0 || info.sample_rate == 0 {
+            continue;
+        }
+        rate = info.sample_rate as u32;
+        channels = info.channels as u16;
+        pcm.extend_from_slice(&info.samples);
+    }
+
+    if pcm.is_empty() || channels == 0 || rate == 0 {
+        return Err("no MP3 frames decoded".to_string());
+    }
+
+    // i16 to float: 32768 rather than 32767 so that full negative scale maps to
+    // -1.0 exactly instead of one step inside it.
+    let samples = pcm
+        .into_iter()
+        .map(|v| v as f32 / 32768.0)
+        .collect::<Vec<f32>>();
+    Ok(Wav {
+        sample_rate: rate,
+        channels,
+        samples,
+    })
+}
+
+/// FFI surface of the vendored minimp3 decoder.
+mod mp3 {
+    use std::os::raw::{c_int, c_uchar};
+
+    /// Opaque decoder state. Its layout belongs to the C side, so it is sized
+    /// here rather than described: getting this wrong makes the decoder write
+    /// past the struct and return garbage frame lengths rather than failing.
+    #[repr(C)]
+    pub struct Mp3dec {
+        _private: [u8; 6668],
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Mp3decFrameInfo {
+        pub frame_bytes: c_int,
+        pub frame_offset: c_int,
+        pub channels: c_int,
+        /// Sample rate in Hz.
+        pub hz: c_int,
+        pub layer: c_int,
+        pub bitrate_kbps: c_int,
+    }
+
+    /// The decoder hands back PCM for the frame, at most this many samples.
+    pub const MAX_SAMPLES_PER_FRAME: usize = 1152 * 2;
+
+    extern "C" {
+        pub fn mp3dec_init(dec: *mut Mp3dec);
+        pub fn mp3dec_decode_frame(
+            dec: *mut Mp3dec,
+            mp3: *const c_uchar,
+            mp3_bytes: c_int,
+            pcm: *mut i16,
+            info: *mut Mp3decFrameInfo,
+        ) -> c_int;
+    }
+}
+
+use mp3::{
+    mp3dec_decode_frame, mp3dec_init, Mp3dec, Mp3decFrameInfo, MAX_SAMPLES_PER_FRAME,
+};
+
+struct FrameInfo {
+    frame_bytes: usize,
+    samples: Vec<i16>,
+    channels: usize,
+    sample_rate: usize,
+}
+
+/// The FFI structs mirror C layout, and a mismatch there is memory corruption
+/// rather than a compile error. These catch a drift in minimp3 at build time.
+const _: () = {
+    assert!(std::mem::size_of::<Mp3dec>() == 6668);
+    assert!(std::mem::size_of::<Mp3decFrameInfo>() == 24);
+    assert!(std::mem::size_of::<i16>() == 2);
+};
+
+struct Mp3Decoder {
+    state: Mp3dec,
+    pcm: [i16; MAX_SAMPLES_PER_FRAME],
+}
+
+impl Mp3Decoder {
+    fn new() -> Self {
+        // Every field in mp3dec_t is a plain integer, so all-zero is a valid
+        // starting point, which is what mp3dec_init documents being handed.
+        let mut state: Mp3dec = unsafe { std::mem::zeroed() };
+        // Safety: mp3dec_init only writes to the struct it is given.
+        unsafe { mp3dec_init(&mut state) };
+        Mp3Decoder {
+            state,
+            pcm: [0; MAX_SAMPLES_PER_FRAME],
+        }
+    }
+
+    fn decode_frame(&mut self, data: &[u8]) -> FrameInfo {
+        let mut info = Mp3decFrameInfo::default();
+        // Safety: `data` is a live slice for the duration of the call and the
+        // output buffer is sized to the maximum a frame can produce, which is
+        // the contract mp3dec_decode_frame documents.
+        let produced = unsafe {
+            mp3dec_decode_frame(
+                &mut self.state,
+                data.as_ptr(),
+                data.len() as std::os::raw::c_int,
+                self.pcm.as_mut_ptr(),
+                &mut info,
+            )
+        };
+        // The return is samples *per channel*; the buffer it filled holds that
+        // many per channel, interleaved. Slicing it as if it were already
+        // interleaved keeps only half the audio and pairs left samples with
+        // right ones, which sounds like it is playing at half speed with the
+        // channels swapped.
+        let channels = info.channels.max(1) as usize;
+        let produced = (produced.max(0) as usize).saturating_mul(channels);
+        let produced = produced.min(MAX_SAMPLES_PER_FRAME);
+        FrameInfo {
+            frame_bytes: info.frame_bytes.max(0) as usize,
+            samples: self.pcm[..produced].to_vec(),
+            channels: info.channels.max(0) as usize,
+            sample_rate: info.hz.max(0) as usize,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mp3_reads {
+    /// 1.2s of 440 Hz stereo at 44.1 kHz, written by ffmpeg as a stand-in for
+    /// what a render leaves in the library.
+    const TONE: &[u8] = include_bytes!("testdata/tone.mp3");
+
+    /// Renders default to MP3 and `read` only spoke RIFF, so crop and normalise
+    /// reported "not a RIFF/WAVE file" on every track in the library.
+    #[test]
+    fn reads_mp3() {
+        let w = super::read(TONE).expect("an MP3 must decode");
+        assert_eq!(w.channels, 2);
+        assert_eq!(w.sample_rate, 44100);
+        // Encoder delay means the decoded length runs a little past the
+        // nominal 1.2s; what matters is that it is not truncated to half.
+        assert!(
+            w.duration_secs() > 1.15 && w.duration_secs() < 1.45,
+            "decoded {}s, expected about 1.2",
+            w.duration_secs()
+        );
+        assert!(w.peak() > 0.6, "tone decoded at peak {}", w.peak());
+    }
+
+    /// The decoder reports samples *per channel* while filling an interleaved
+    /// buffer. Slicing the buffer as if it were already interleaved keeps half
+    /// the audio and pairs left samples with right ones -- a track that plays
+    /// at half speed with swapped channels, which still looks like plausible
+    /// length data and is easy to miss.
+    #[test]
+    fn keeps_both_channels_and_the_full_length() {
+        let w = super::read(TONE).expect("decode");
+        let ch = w.channels as usize;
+        let frames = w.samples.len() / ch;
+        assert!(frames > 50000, "only {frames} frames survived");
+
+        // A 440 Hz tone is identical in both channels, so they must agree
+        // closely. If the interleave were wrong the pairs would be offset and
+        // this correlation would collapse.
+        let mut dot = 0f64;
+        let mut ll = 0f64;
+        let mut rr = 0f64;
+        for i in 0..frames {
+            let l = w.samples[i * ch] as f64;
+            let r = w.samples[i * ch + 1] as f64;
+            dot += l * r;
+            ll += l * l;
+            rr += r * r;
+        }
+        let corr = dot / (ll.sqrt() * rr.sqrt());
+        assert!(corr > 0.95, "channels disagree, correlation {corr}");
+    }
+
+    /// The loudness chain has to see the same levels the engine produced.
+    #[test]
+    fn full_scale_mp3_reports_a_sane_peak() {
+        let w = super::read(TONE).expect("decode");
+        assert!(w.peak() <= 1.0, "i16 scaled by 32768 cannot exceed 1.0");
+        assert!(w.peak() > 0.6, "peak was only {}", w.peak());
+    }
+
+    #[test]
+    fn rejects_bytes_that_are_neither() {
+        assert!(super::read(b"this is not audio at all").is_err());
+        assert!(super::read(&[0u8; 8]).is_err());
+    }
 }
 
 #[cfg(test)]

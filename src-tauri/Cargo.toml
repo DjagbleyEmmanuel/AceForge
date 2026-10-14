@@ -1,6 +1,6 @@
 [package]
 name = "AceForge"
-version = "0.4.4"
+version = "0.4.5"
 description = "Local ACE-Step music generation"
 authors = ["ghost"]
 edition = "2021"
@@ -12,6 +12,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# minimp3 is a single-header C decoder. It has to be compiled by a C compiler,
+# which is what cc is for; a Rust include! cannot parse its preprocessor.
+cc = "1"
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
