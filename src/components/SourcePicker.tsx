@@ -126,6 +126,17 @@ export function SourcePicker({
           >
             {selected ? selected.name : placeholder}
           </span>
+          {/* How many are available. Without this the closed picker reads
+              identically whether nothing was ever imported or five files are
+              waiting one click away -- which is indistinguishable from the app
+              having forgotten them. Generation settings are not persisted, so
+              the selection is empty again on every launch and this is the only
+              thing that says the files are still there. */}
+          {files.length > 0 && !selected && (
+            <span className="shrink-0 rounded-full bg-ink-800 px-1.5 py-0.5 font-mono text-[10px] text-ink-300 ring-1 ring-ink-700">
+              {files.length} available
+            </span>
+          )}
           <span className="shrink-0 text-[10px] text-ink-500">
             {expanded ? "▲" : "▼"}
           </span>
@@ -149,6 +160,11 @@ export function SourcePicker({
             </p>
           ) : (
             <>
+              {!selected && (
+                <p className="mb-1.5 px-1 text-[11px] text-glow-300">
+                  {files.length} imported — pick one to use it
+                </p>
+              )}
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}

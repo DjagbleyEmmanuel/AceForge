@@ -1344,3 +1344,4 @@ mod tests {
         assert_eq!(std::fs::read(&first).unwrap(), b"first", "not overwritten");
     }
 }
+

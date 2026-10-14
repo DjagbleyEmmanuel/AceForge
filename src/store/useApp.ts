@@ -11,6 +11,7 @@ import {
 } from "../lib/api";
 import type { ServerStatus, StoreSnapshot } from "../lib/types";
 import type { GenerateParams } from "../lib/api";
+import { recall, remember } from "../lib/session";
 import { engines as enginesApi, type Engine, type EngineId } from "../lib/engines";
 
 /** Studio form defaults. Owned here, not in the panel: panels unmount on tab
@@ -84,6 +85,32 @@ export function useApp() {
     } catch (e) {
       setError(String(e));
     }
+  }, []);
+
+  // Remember the file selections as they change. Sampling knobs and the prompt
+  // stay out of it on purpose: those are decisions made fresh each time, while
+  // a source track is usually the same one for a run of work.
+  useEffect(() => {
+    remember({
+      sourceAudio: params.sourceAudio,
+      refAudio: params.refAudio,
+      track: params.track,
+      title: params.title,
+    });
+  }, [params.sourceAudio, params.refAudio, params.track, params.title]);
+
+  // Restore which files the last session was working with. Only pointers are
+  // kept, and a pointer whose file has since been deleted is dropped by the
+  // picker rather than shown as a broken selection.
+  useEffect(() => {
+    const saved = recall();
+    setParams((p) => ({
+      ...p,
+      sourceAudio: saved.sourceAudio ?? p.sourceAudio,
+      refAudio: saved.refAudio ?? p.refAudio,
+      track: saved.track ?? p.track,
+      title: saved.title ?? p.title,
+    }));
   }, []);
 
   // Reading the registry is cheap; adopting the bundled runtime is not. After
