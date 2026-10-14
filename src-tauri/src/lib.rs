@@ -201,7 +201,7 @@ fn adopt_bundled_engine(app: tauri::AppHandle) -> Result<bool, String> {
     if !bundled.join("ace-server").is_file() {
         return Ok(false);
     }
-    engines::adopt_from(&bundled).map(|_| true)
+    engines::adopt_from(engines::EngineId::AceStep, &bundled).map(|_| true)
 }
 
 /// Replace the installed ACE-Step engine with the one bundled in this release.
@@ -239,7 +239,7 @@ fn adopt_bundled_audiocpp(app: tauri::AppHandle) -> Result<bool, String> {
     if !bundled.join("audiocpp_server").is_file() {
         return Ok(false);
     }
-    engines::adopt_from(&bundled).map(|_| true)
+    engines::adopt_from(engines::EngineId::AudioCpp, &bundled).map(|_| true)
 }
 
 /// Validate an engine directory the user has extracted somewhere.

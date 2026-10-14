@@ -6,6 +6,11 @@ interface Props {
   running: boolean;
   /** Re-run after a batch so newly written sidecars disappear from `pending`. */
   onChanged: () => void;
+  /** Songs awaiting timings, from the parent -- it already has this list for
+   *  the library filter and asking twice would race the two. */
+  unsyncedCount: number;
+  /** Refresh that list once a batch finishes. */
+  onRefresh: () => void;
 }
 
 /**
@@ -16,7 +21,12 @@ interface Props {
  * track at a time because every pass acquires the DiT, and two at once would
  * fight over VRAM on a 4 GB card.
  */
-export function LyricSyncPanel({ running, onChanged }: Props) {
+export function LyricSyncPanel({
+  running,
+  onChanged,
+  unsyncedCount,
+  onRefresh,
+}: Props) {
   const [progress, setProgress] = useState<SyncProgress | null>(null);
   const [pending, setPending] = useState<{ path: string; name: string }[]>([]);
   const [showList, setShowList] = useState(false);
@@ -36,7 +46,6 @@ export function LyricSyncPanel({ running, onChanged }: Props) {
   }, []);
 
   useEffect(() => {
-    void refresh();
     void lyricSync.progress().then(setProgress).catch(() => setProgress(null));
     let alive = true;
     const unlisten = lyricSync.onProgress((p) => {
@@ -44,6 +53,7 @@ export function LyricSyncPanel({ running, onChanged }: Props) {
       setProgress(p);
       if (!p.running && p.done > 0) {
         void refresh();
+        onRefresh();
         onChanged();
       }
     });
@@ -57,8 +67,10 @@ export function LyricSyncPanel({ running, onChanged }: Props) {
   const total = progress?.total ?? pending.length;
   const done = progress?.done ?? 0;
 
-  // Nothing to do is the common case and should not shout about itself.
-  if (pending.length === 0 && !active) return null;
+  // Nothing to do is the common case and should not shout about itself. The
+  // count comes from the parent so the panel does not appear a moment before
+  // the library toolbar has already updated.
+  if (unsyncedCount === 0 && !active && pending.length === 0) return null;
 
   return (
     <div className="panel space-y-2 p-4">
@@ -73,7 +85,7 @@ export function LyricSyncPanel({ running, onChanged }: Props) {
               </>
             ) : (
               <>
-                {pending.length} song{pending.length === 1 ? "" : "s"} have lyrics
+                {unsyncedCount} song{unsyncedCount === 1 ? "" : "s"} have lyrics
                 but no timings
               </>
             )}
@@ -89,12 +101,18 @@ export function LyricSyncPanel({ running, onChanged }: Props) {
             </button>
           ) : (
             <button
-              onClick={() => void lyricSync.start(pending.map((p) => p.path))}
-              disabled={!running || pending.length === 0}
+              onClick={() =>
+                void lyricSync.start(
+                  pending.length > 0
+                    ? pending.map((p) => p.path)
+                    : [],
+                )
+              }
+              disabled={!running || unsyncedCount === 0}
               title={
                 !running
                   ? "Start the engine first"
-                  : `Time the lyrics of ${pending.length} songs, about 13 seconds each`
+                  : `Time the lyrics of ${unsyncedCount} songs, about 13 seconds each`
               }
               className="chip px-2 py-1 text-[11px] disabled:opacity-40"
             >

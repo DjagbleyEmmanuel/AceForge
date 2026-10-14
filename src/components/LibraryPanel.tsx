@@ -1,10 +1,11 @@
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   LOUDNESS_TARGETS,
   annotations,
   library,
   coverUrl,
+  lyricSync,
   mastering,
   type Track,
 } from "../lib/api";
@@ -21,10 +22,64 @@ interface Props {
   running?: boolean;
 }
 
+type Sort = "newest" | "oldest" | "longest" | "name";
+type Filter = "all" | "unsynced" | "synced" | "instrumental" | "wav";
+
 export function LibraryPanel({ tracks, onChanged, running = false }: Props) {
   // `tracks` is the single source of truth: this panel stays mounted now, so a
   // local mirror would go stale instead of re-seeding on remount.
-  const items = tracks;
+  const [sort, setSort] = useState<Sort>("newest");
+  const [filter, setFilter] = useState<Filter>("all");
+  const [search, setSearch] = useState("");
+  // Paths of songs that have lyrics but no timings. Asked for once here rather
+  // than in both the filter and the sync panel.
+  const [unsynced, setUnsynced] = useState<Set<string>>(new Set());
+
+  const refreshUnsynced = useCallback(async () => {
+    try {
+      const list = await lyricSync.pending();
+      setUnsynced(new Set(list.map((t) => t.path)));
+    } catch {
+      setUnsynced(new Set());
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshUnsynced();
+  }, [refreshUnsynced, tracks]);
+
+  const items = useMemo(() => {
+    // The library passes sorted-by-newest, which is right by default but makes
+    // everything else awkward to find once there are dozens of tracks.
+    const needle = search.trim().toLowerCase();
+    const out = tracks.filter((t) => {
+      if (filter === "unsynced" && !unsynced.has(t.path)) return false;
+      if (filter === "synced" && unsynced.has(t.path)) return false;
+      if (filter === "instrumental" && !t.lyrics.includes("[Instrumental]")) {
+        return false;
+      }
+      if (filter === "wav" && t.format !== "wav") return false;
+      if (needle) {
+        const hay = `${t.caption} ${t.id} ${t.lyrics.slice(0, 120)}`.toLowerCase();
+        if (!hay.includes(needle)) return false;
+      }
+      return true;
+    });
+
+    const byTime = (a: Track, b: Track) => b.createdAt - a.createdAt;
+    switch (sort) {
+      case "oldest":
+        return [...out].sort((a, b) => -byTime(a, b));
+      case "longest":
+        return [...out].sort((a, b) => b.durationSecs - a.durationSecs);
+      case "name":
+        return [...out].sort((a, b) =>
+          (a.caption || a.id).localeCompare(b.caption || b.id),
+        );
+      default:
+        return [...out].sort(byTime);
+    }
+  }, [tracks, sort, filter, search, unsynced]);
   const [slots, setSlots] = useState<[string, string] | null>(null);
   const [normalising, setNormalising] = useState<string | null>(null);
   const [cropping, setCropping] = useState<Track | null>(null);
@@ -135,7 +190,48 @@ export function LibraryPanel({ tracks, onChanged, running = false }: Props) {
         </div>
       )}
 
-      <LyricSyncPanel running={running} onChanged={onChanged} />
+      <div className="panel flex flex-wrap items-center gap-2 p-3">
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="search songs"
+          aria-label="Search songs"
+          className="field min-w-40 flex-1 py-1 text-xs"
+        />
+        <select
+          value={filter}
+          onChange={(e) => setFilter(e.target.value as Filter)}
+          aria-label="Filter songs"
+          className="field w-36 py-1 text-[11px]"
+        >
+          <option value="all">all songs</option>
+          <option value="synced">lyrics synced</option>
+          <option value="unsynced">lyrics not synced</option>
+          <option value="instrumental">instrumental</option>
+          <option value="wav">wav only</option>
+        </select>
+        <select
+          value={sort}
+          onChange={(e) => setSort(e.target.value as Sort)}
+          aria-label="Sort songs"
+          className="field w-32 py-1 text-[11px]"
+        >
+          <option value="newest">newest first</option>
+          <option value="oldest">oldest first</option>
+          <option value="longest">longest first</option>
+          <option value="name">by name</option>
+        </select>
+        <span className="text-[11px] text-ink-500">
+          {items.length} of {tracks.length}
+        </span>
+      </div>
+
+      <LyricSyncPanel
+        running={running}
+        onChanged={onChanged}
+        unsyncedCount={unsynced.size}
+        onRefresh={refreshUnsynced}
+      />
 
       {pinned.length === 2 && <AbCompare a={pinned[0]} b={pinned[1]} />}
 
@@ -145,6 +241,21 @@ export function LibraryPanel({ tracks, onChanged, running = false }: Props) {
           onClose={() => setCropping(null)}
           onSaved={refresh}
         />
+      )}
+
+      {items.length === 0 && tracks.length > 0 && (
+        <div className="panel p-8 text-center">
+          <p className="text-sm text-ink-400">Nothing matches that.</p>
+          <button
+            onClick={() => {
+              setSearch("");
+              setFilter("all");
+            }}
+            className="mt-2 text-xs text-glow-300 underline-offset-2 hover:underline"
+          >
+            clear the search and filter
+          </button>
+        </div>
       )}
 
       {items.map((track) => {

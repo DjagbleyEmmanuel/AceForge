@@ -9,8 +9,8 @@ import {
 interface Props {
   selected: EngineId;
   onSelect: (id: EngineId) => void;
-  /** Owned by the parent, which adopts the bundled runtime before reading the
-   *  registry. Fetching here raced that and showed both engines as missing. */
+  /** Owned by the parent. Reading it here raced adoption and showed both
+   *  engines as missing. */
   engines: Engine[];
 }
 
@@ -19,6 +19,24 @@ export function EngineSwitcher({ selected, onSelect, engines: list }: Props) {
   const [expanded, setExpanded] = useState(false);
 
   const active = list.find((e) => e.id === selected);
+
+  // The registry read is a round trip, and adoption can follow it with a long
+  // one. Reserving the space means the Studio does not jump when they land.
+  if (list.length === 0) {
+    return (
+      <div className="flex gap-2" aria-busy="true">
+        {["ACE-Step (acestep.cpp)", "audio.cpp"].map((name) => (
+          <div
+            key={name}
+            className="flex-1 animate-pulse rounded-xl border border-ink-800 bg-ink-900/40 px-3 py-2.5"
+          >
+            <div className="h-3 w-28 rounded bg-ink-800" />
+            <div className="mt-2 h-2.5 w-40 rounded bg-ink-850" />
+          </div>
+        ))}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-3">

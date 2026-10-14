@@ -86,20 +86,37 @@ export function useApp() {
     }
   }, []);
 
-  // Adopt the bundled runtime so a fresh install has a working engine, then
-  // read the registry. Neither touches the network.
+  // Reading the registry is cheap; adopting the bundled runtime is not. After
+  // an upgrade the refresh copies ~250 MB of engine binaries, and the Studio's
+  // runtime cards render nothing until that finishes -- so they used to be the
+  // last thing on screen. List first, adopt in the background, list again.
   useEffect(() => {
+    let alive = true;
     void (async () => {
+      try {
+        setEngineList(await enginesApi.list());
+      } catch {
+        // The registry stays empty; the rest of the app still works.
+      }
       try {
         await enginesApi.adoptBundled();
         // audio.cpp ships in the bundle too; adopting it is a no-op once the
         // user has their own copy installed.
         await enginesApi.adoptBundledAudioCpp();
+      } catch {
+        // Adoption failing must not block the app: the engine list below still
+        // reports whatever is installed.
+      }
+      if (!alive) return;
+      try {
         setEngineList(await enginesApi.list());
       } catch {
-        // Engine list stays empty; the rest of the app still works.
+        // Leave the first list in place.
       }
     })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
   // First paint comes from the local scan alone — no network on this path,

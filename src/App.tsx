@@ -4,6 +4,7 @@ import { GeneratePanel } from "./components/GeneratePanel";
 import { queue as queueApi, type GenerateParams } from "./lib/api";
 import { LibraryPanel } from "./components/LibraryPanel";
 import { QueuePanel } from "./components/QueuePanel";
+import { SetupCheck } from "./components/SetupCheck";
 import { LogViewer } from "./components/LogViewer";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ThemeChooser, useTheme } from "./components/ThemeChooser";
@@ -130,6 +131,13 @@ export default function App() {
             initial load on every tab switch, which is what made the library
             flash empty before repopulating. */}
           <div hidden={app.view !== "studio"} className="space-y-5">
+            <SetupCheck
+              engines={app.engineList}
+              running={running}
+              snapshot={app.snapshot}
+              modelsDir={app.settingsView?.models_dir ?? ""}
+            />
+
             <EngineSwitcher
               selected={app.engine}
               onSelect={app.setEngine}

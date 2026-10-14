@@ -390,11 +390,10 @@ fn should_refresh(id: EngineId, source: &Path) -> bool {
 pub fn reinstall_from(source: &Path) -> Result<(), String> {
     let id = EngineId::AceStep;
     let _ = std::fs::remove_dir_all(engines_dir().join(id.as_str()));
-    adopt_from(source)
+    adopt_from(id, source)
 }
 
-pub fn adopt_from(source: &Path) -> Result<(), String> {
-    let id = EngineId::AceStep;
+pub fn adopt_from(id: EngineId, source: &Path) -> Result<(), String> {
     if binary_path(id).is_some() {
         // Already installed. Refresh it only when the copy on disk is one *we*
         // put there and the bundled engine has since changed -- otherwise a
@@ -424,12 +423,19 @@ pub fn adopt_from(source: &Path) -> Result<(), String> {
         .collect();
     files.sort();
 
+    // The binary name and label come from the registry rather than being
+    // hardcoded, so a bundle adopted for one engine cannot be filed under
+    // another.
+    let (binary_name, label) = match id {
+        EngineId::AceStep => ("ace-server", "ACE-Step (acestep.cpp)"),
+        EngineId::AudioCpp => ("audiocpp_server", "audio.cpp"),
+    };
     let manifest = serde_json::json!({
         "id": id.as_str(),
-        "label": "ACE-Step (acestep.cpp)",
-        "binary": "ace-server",
+        "label": label,
+        "binary": binary_name,
         "files": files,
-        "sourceHash": hash_binary(&destination.join("ace-server")),
+        "sourceHash": hash_binary(&destination.join(binary_name)),
     });
     std::fs::write(
         destination.join("manifest.json"),
