@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { lyricsApi, type LyricLine, type LyricTimings } from "../lib/api";
+import { readFlag, writeFlag } from "../lib/prefs";
 
 interface Props {
   trackPath: string;
@@ -58,7 +59,8 @@ export function SyncedLyrics({
   const [following, setFollowing] = useState(true);
   /** Set briefly after a manual scroll, so our own smooth scroll is ignored. */
   const followLock = useRef(false);
-  const [hidden, setHidden] = useState(false);
+  const [hidden, setHidden] = useState(() => readFlag("lyrics.hidden", false));
+  const [expanded, setExpanded] = useState(() => readFlag("lyrics.expanded", false));
 
   const plain = useMemo(() => lyricLines(lyrics), [lyrics]);
 
@@ -231,10 +233,19 @@ export function SyncedLyrics({
     );
   }
 
+  function setHiddenState(v: boolean) {
+    setHidden(v);
+    writeFlag("lyrics.hidden", v);
+  }
+  function setExpandedState(v: boolean) {
+    setExpanded(v);
+    writeFlag("lyrics.expanded", v);
+  }
+
   if (hidden) {
     return (
       <button
-        onClick={() => setHidden(false)}
+        onClick={() => setHiddenState(false)}
         className="self-start text-[11px] text-ink-500 underline-offset-2 hover:text-ink-300 hover:underline"
       >
         show lyrics
@@ -266,7 +277,22 @@ export function SyncedLyrics({
   return (
     <div className="space-y-1.5">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[11px] text-ink-400">Lyrics</span>
+        <button
+          onClick={() => setExpandedState(!expanded)}
+          className="flex items-center gap-1.5 text-[11px] text-ink-400 transition hover:text-ink-200"
+          aria-expanded={expanded}
+        >
+          <span
+            className={`inline-block text-[9px] transition-transform ${expanded ? "rotate-90" : ""}`}
+          >
+            ▶
+          </span>
+          Lyrics
+          <span className="text-ink-600">
+            {timings.lines.filter((l) => !/^\s*\[?[a-z_ ]+\]?\s*$/i.test(l.text)).length}{" "}
+            lines
+          </span>
+        </button>
         <span className="flex items-center gap-2">
           {!following && (
             <button
@@ -287,13 +313,14 @@ export function SyncedLyrics({
             re-time
           </button>
           <button
-            onClick={() => setHidden(true)}
+            onClick={() => setHiddenState(true)}
             className="text-[10px] text-ink-500 underline-offset-2 hover:text-ink-300 hover:underline"
           >
             hide
           </button>
         </span>
       </div>
+      {expanded && (
       <ol
         ref={listRef}
         className="max-h-40 space-y-0.5 overflow-auto rounded-lg bg-ink-900 p-2"
@@ -318,6 +345,7 @@ export function SyncedLyrics({
           );
         })}
       </ol>
+      )}
       {timings.source === "sidecar" ? (
         <p className="text-[10px] text-ink-600">timed from the .lrc beside the audio</p>
       ) : (

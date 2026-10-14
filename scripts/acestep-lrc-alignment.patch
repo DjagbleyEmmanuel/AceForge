@@ -1,35 +1,3 @@
-From 85427c76108a1edc13a4ccdd578b51245d56efcf Mon Sep 17 00:00:00 2001
-From: DjagbleyEmmanuel <djagbleyemmanuel@users.noreply.github.com>
-Date: Wed, 14 Oct 2026 12:49:54 +0000
-Subject: [PATCH] feat(lrc): port native synchronized lyric alignment
-
-Ports the get_lrc pipeline from the HOT-Step fork of acestep.cpp: an
-extra DiT pass for cross-attention alignment, DTW lyric-audio
-alignment with bidirectional consensus, and LRC formatting.
-
-Upstream lacks the LoRA/section parameters the fork's graph helpers
-carry, so the alignment graph's self-attention call takes the upstream
-argument list -- it passed nullptr for the LoRA parameter anyway.
-
-The fork's X-LRC-Text header is emitted from ace-server rather than
-hot-step-server; base64 is implemented locally for the one call site.
----
- src/alignment-config.h     | 172 +++++++++++++
- src/dit-alignment-graph.h  | 367 ++++++++++++++++++++++++++
- src/lrc-alignment.h        | 516 +++++++++++++++++++++++++++++++++++++
- src/pipeline-synth-impl.h  |   8 +
- src/pipeline-synth-ops.cpp |  71 +++++
- src/pipeline-synth.cpp     | 122 +++++++++
- src/pipeline-synth.h       |  12 +
- src/request.cpp            |  12 +
- src/request.h              |   5 +
- tools/ace-server.cpp       |  36 ++-
- tools/synth-batch-runner.h |  13 +-
- 11 files changed, 1332 insertions(+), 2 deletions(-)
- create mode 100644 src/alignment-config.h
- create mode 100644 src/dit-alignment-graph.h
- create mode 100644 src/lrc-alignment.h
-
 diff --git a/src/alignment-config.h b/src/alignment-config.h
 new file mode 100644
 index 0000000..00be44c
@@ -208,6 +176,44 @@ index 0000000..00be44c
 +    invalid.valid       = false;
 +    return invalid;
 +}
+diff --git a/src/audio-io.h b/src/audio-io.h
+index 5f59b76..de5368f 100644
+--- a/src/audio-io.h
++++ b/src/audio-io.h
+@@ -339,14 +339,27 @@ static void audio_normalize(float * audio, int n_total, int peak_clip = 10) {
+         return;
+     }
+ 
+-    // scale so the target percentile hits 1.0, hard clip the rest
+-    float gain = 1.0f / ref;
++    // scale so the target percentile hits a ceiling with a little headroom, then
++// soft-clip whatever is still above it.
++//
++// The old version normalized the percentile to exactly 1.0 and hard-clamped the
++// remainder. In practice the model peaks well below full scale (a typical render
++// sits near -5 dBFS), so that applied +5 dB and then flattened the overshoot
++// into square edges. That is audible as a squashed master with the vocal
++// sitting no louder than the drums, which reads as "the gain is down" even
++// though the file measures loud. Leaving a dB of headroom and rounding the
++// overshoot keeps transients intact instead of shredding them.
++    static const float ceiling = 0.891f; // -1.0 dBFS
++    float gain = ceiling / ref;
+     for (int i = 0; i < n_total; i++) {
+         float v = audio[i] * gain;
+-        if (v > 1.0f) {
+-            v = 1.0f;
+-        } else if (v < -1.0f) {
+-            v = -1.0f;
++        // transparent below the threshold, asymptoting to the ceiling above it
++        if (v > ceiling) {
++            const float over = (v - ceiling) / (1.0f - ceiling);
++            v = ceiling + (1.0f - ceiling) * (over / (1.0f + over));
++        } else if (v < -ceiling) {
++            const float over = (-v - ceiling) / (1.0f - ceiling);
++            v = -(ceiling + (1.0f - ceiling) * (over / (1.0f + over)));
+         }
+         audio[i] = v;
+     }
 diff --git a/src/dit-alignment-graph.h b/src/dit-alignment-graph.h
 new file mode 100644
 index 0000000..341266c
@@ -1525,6 +1531,3 @@ index f63f829..f8cecdd 100644
          ace_synth_job_free(jobs[g]);
          jobs[g] = nullptr;
          if (rc != 0) {
--- 
-2.43.0
-

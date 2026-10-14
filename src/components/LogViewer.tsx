@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { server } from "../lib/api";
+import { readFlag, writeFlag } from "../lib/prefs";
 
 /** How often to ask for new lines while following. */
 const POLL_MS = 1000;
@@ -23,10 +24,13 @@ interface Props {
  */
 export function LogViewer({ running }: Props) {
   const [lines, setLines] = useState<string[]>([]);
-  const [follow, setFollow] = useState(true);
+  const [follow, setFollowRaw] = useState(() => readFlag("log.follow", true));
+  const setFollow = useCallback((v: boolean) => {
+    setFollowRaw(v);
+    writeFlag("log.follow", v);
+  }, []);
   const [filter, setFilter] = useState("");
   const [cursor, setCursor] = useState(0);
-  const bottomRef = useRef<HTMLDivElement>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -79,8 +83,12 @@ export function LogViewer({ running }: Props) {
     };
   }, [running, follow, cursor, refresh]);
 
+  const boxRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
-    if (follow) bottomRef.current?.scrollIntoView({ block: "end" });
+    if (!follow) return;
+    const el = boxRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [lines, follow]);
 
   const needle = filter.trim().toLowerCase();
@@ -98,7 +106,7 @@ export function LogViewer({ running }: Props) {
             className="w-28 rounded border border-ink-700 bg-ink-900 px-2 py-1 text-[11px] text-ink-200 outline-none focus:border-glow-500/60"
           />
           <button
-            onClick={() => setFollow((v) => !v)}
+            onClick={() => setFollow(!follow)}
             className={`chip ${
               follow
                 ? "bg-glow-500/15 text-glow-300 ring-1 ring-glow-500/40"
@@ -114,7 +122,8 @@ export function LogViewer({ running }: Props) {
       </div>
 
       <div
-        className="max-h-80 overflow-y-auto rounded-lg bg-ink-950 p-2.5 font-mono text-[11px] leading-relaxed"
+        ref={boxRef}
+        className="max-h-80 overflow-y-auto overscroll-contain rounded-lg bg-ink-950 p-2.5 font-mono text-[11px] leading-relaxed"
         onScroll={(e) => {
           // Scrolling up is an implicit pause: yanking the view back to the
           // bottom while someone is reading a stack trace is infuriating.
@@ -145,7 +154,6 @@ export function LogViewer({ running }: Props) {
             </div>
           ))
         )}
-        <div ref={bottomRef} />
       </div>
 
       <p className="text-[10px] text-ink-500">

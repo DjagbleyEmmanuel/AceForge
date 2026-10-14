@@ -9,6 +9,7 @@ import {
   type Track,
 } from "../lib/api";
 import { formatBytes, type LoudnessTarget, type NormaliseReport } from "../lib/types";
+import { readText, writeText } from "../lib/prefs";
 import { TrackPlayer } from "./TrackPlayer";
 import { Select } from "./Select";
 import { CoverArt } from "./CoverArt";
@@ -28,12 +29,20 @@ type Filter = "all" | "unsynced" | "synced" | "instrumental" | "wav";
 export function LibraryPanel({ tracks, onChanged, running = false }: Props) {
   // `tracks` is the single source of truth: this panel stays mounted now, so a
   // local mirror would go stale instead of re-seeding on remount.
-  const [sort, setSort] = useState<Sort>("newest");
-  const [filter, setFilter] = useState<Filter>("all");
-  const [search, setSearch] = useState("");
+  // How the library was left last time. Re-sorting to newest and dropping the
+  // filter on every launch means the list rearranges under the user.
+  const [sort, setSort] = useState<Sort>(() => readText("library.sort", "newest") as Sort);
+  const [filter, setFilter] = useState<Filter>(
+    () => readText("library.filter", "all") as Filter,
+  );
+  const [search, setSearch] = useState(() => readText("library.search", ""));
   // Paths of songs that have lyrics but no timings. Asked for once here rather
   // than in both the filter and the sync panel.
   const [unsynced, setUnsynced] = useState<Set<string>>(new Set());
+
+  useEffect(() => writeText("library.sort", sort), [sort]);
+  useEffect(() => writeText("library.filter", filter), [filter]);
+  useEffect(() => writeText("library.search", search), [search]);
 
   const refreshUnsynced = useCallback(async () => {
     try {
