@@ -82,14 +82,31 @@ fn get_settings() -> SettingsView {
 /// for a folder chosen in an earlier session, and the setter when the user
 /// changes it -- and missing one of them means covers silently stop working
 /// after a restart.
-fn grant_covers(app: &tauri::AppHandle, dir: &std::path::Path) {
+/// Grant the webview read access to a directory, for both protocols the app
+/// uses.
+///
+/// Covers and audio are read through the fs plugin, whose scope comes from a
+/// static capability that only names `$APPDATA/**`. The asset protocol has its
+/// own scope. Widening one and not the other is what left every cover outside
+/// the app data folder rendering as a broken image while the backend happily
+/// enumerated it: the folder was reachable to Rust and refused to the webview.
+fn grant_read(app: &tauri::AppHandle, dir: &std::path::Path) {
     use tauri::Manager;
+    use tauri_plugin_fs::FsExt;
+
     if !dir.is_dir() {
         return;
     }
     if let Err(e) = app.asset_protocol_scope().allow_directory(dir, true) {
-        eprintln!("[covers] asset scope for {} failed: {e}", dir.display());
+        eprintln!("[scope] asset protocol for {} failed: {e}", dir.display());
     }
+    if let Err(e) = app.fs_scope().allow_directory(dir, true) {
+        eprintln!("[scope] fs plugin for {} failed: {e}", dir.display());
+    }
+}
+
+fn grant_covers(app: &tauri::AppHandle, dir: &std::path::Path) {
+    grant_read(app, dir);
 }
 
 /// Point the app at a different weights directory.
@@ -820,6 +837,10 @@ fn list_covers() -> Vec<covers::CoverEntry> {
 /// Unlike the library, covers do not need an asset-protocol grant: the scope
 /// ships as `$APPDATA/**` and a cover outside it would not load, so it is
 /// widened here the same way the library directory is.
+/// Covers are loaded by the webview through the fs plugin, whose capability
+/// only names `$APPDATA/**`, so a folder anywhere else is refused and renders
+/// as a broken thumbnail. Grant it at the moment it is chosen rather than
+/// waiting for a restart, or saving the setting appears to do nothing.
 #[tauri::command]
 fn set_covers_dir(app: tauri::AppHandle, path: String) -> Result<SettingsView, String> {
     let trimmed = path.trim();
@@ -827,10 +848,11 @@ fn set_covers_dir(app: tauri::AppHandle, path: String) -> Result<SettingsView, S
         let dir = std::path::PathBuf::from(trimmed);
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        use tauri::Manager;
-        app.asset_protocol_scope()
+        use tauri_plugin_fs::FsExt;
+        app.fs_scope()
             .allow_directory(&dir, true)
             .map_err(|e| format!("cannot grant read access to {}: {e}", dir.display()))?;
+        grant_covers(&app, &dir);
     }
     let mut current = settings::load();
     current.covers_dir = trimmed.to_string();
@@ -1292,6 +1314,7 @@ pub fn run() {
             // Widen the scope at runtime for wherever the library actually is.
             use tauri::Manager;
             let dir = paths::library_dir();
+            grant_read(app.handle(), &dir);
             if let Err(e) = app.asset_protocol_scope().allow_directory(&dir, true) {
                 eprintln!("[library] asset scope for {} failed: {e}", dir.display());
             }

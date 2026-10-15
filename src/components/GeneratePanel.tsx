@@ -21,6 +21,7 @@ import { Select } from "./Select";
 import { StemBuilder } from "./StemBuilder";
 import { SongBuilder } from "./SongBuilder";
 import { SourcePicker } from "./SourcePicker";
+import type { ImportedFile } from "../lib/api";
 import { SamplingGuide, presetTitle, samplingSummary } from "./SamplingGuide";
 import { formatBytes } from "../lib/types";
 
@@ -112,6 +113,10 @@ export function GeneratePanel({
   onBuildSection,
 }: Props) {
   const [notice, setNotice] = useState<string | null>(null);
+  // Imports live in `library/imports`, which the generated-song list does not
+  // walk, so both source pickers need it to tell a live import from a path that
+  // has since been deleted.
+  const [imported, setImported] = useState<ImportedFile[]>([]);
   const [preview, setPreview] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -366,12 +371,16 @@ export function GeneratePanel({
           params={params}
           setParams={setParams}
           catalog={catalog}
+          imported={imported}
+          onImported={setImported}
         />
         <VocalGenderToggle params={params} setParams={setParams} />
         <VoiceSection
           tracks={tracks}
           params={params}
           setParams={setParams}
+          imported={imported}
+          onImported={setImported}
         />
 
         <div>
@@ -810,11 +819,15 @@ function TaskSection({
   params,
   setParams,
   catalog,
+  imported,
+  onImported,
 }: {
   tracks: Track[];
   params: GenerateParams;
   setParams: React.Dispatch<React.SetStateAction<GenerateParams>>;
   catalog: WeightFile[];
+  imported: ImportedFile[];
+  onImported: (files: ImportedFile[]) => void;
 }) {
   /** Turbo cannot serve a stem task coherently. Derived from the chosen
    *  filename, the same way the sampling warning already is. */
@@ -852,16 +865,22 @@ function TaskSection({
     set("track", next.join(" | "));
   };
 
-  // A source that is no longer in the library (deleted in another view) must
-  // not linger as a path the backend would reject.
+  // Imports live in `library/imports`, which `list_tracks` deliberately does not
+  // walk, so an imported path is in neither list on its own. Checking only
+  // `tracks` made this clear the selection the instant a file was imported,
+  // which is why "cover" kept reporting that it needed a source track.
+  // `source` stays a Track because repaint needs its caption and timings; an
+  // import has no metadata, which is what `sourceExists` is for.
   const source = tracks.find((t) => t.path === params.sourceAudio) ?? null;
+  const sourceExists =
+    !!source || imported.some((f) => f.path === params.sourceAudio);
   // On by default: a repaint almost always wants the source's own style, and a
   // caption left over from the previous render is the wrong one far more often
   // than not.
   const [reuseSourceStyle, setReuseSourceStyle] = useState(true);
   useEffect(() => {
-    if (params.sourceAudio && !source) set("sourceAudio", "");
-  }, [params.sourceAudio, source, set]);
+    if (params.sourceAudio && !sourceExists) set("sourceAudio", "");
+  }, [params.sourceAudio, sourceExists, set]);
 
   const endAt =
     params.repaintingEnd < 0 ? null : params.repaintingEnd;
@@ -909,6 +928,7 @@ function TaskSection({
             label="Source audio"
             placeholder="Import or choose a file…"
             describe={(f) => `${f.name} · ${formatBytes(f.bytes)}`}
+            onFiles={onImported}
           />
 
           {stemMode === "single" && (
@@ -1193,10 +1213,14 @@ function VoiceSection({
   tracks,
   params,
   setParams,
+  imported,
+  onImported,
 }: {
   tracks: Track[];
   params: GenerateParams;
   setParams: React.Dispatch<React.SetStateAction<GenerateParams>>;
+  imported: ImportedFile[];
+  onImported: (files: ImportedFile[]) => void;
 }) {
   const set = useCallback(
     <K extends keyof GenerateParams>(key: K, value: GenerateParams[K]) =>
@@ -1204,11 +1228,14 @@ function VoiceSection({
     [setParams],
   );
 
-  // A track deleted from another view leaves a path the backend will reject.
+  // Same for a reference track: an import is not in `tracks`, so it has to be
+  // checked against the import list too or it is dropped the moment it is set.
   const reference = tracks.find((t) => t.path === params.refAudio) ?? null;
+  const referenceExists =
+    !!reference || imported.some((f) => f.path === params.refAudio);
   useEffect(() => {
-    if (params.refAudio && !reference) set("refAudio", "");
-  }, [params.refAudio, reference, set]);
+    if (params.refAudio && !referenceExists) set("refAudio", "");
+  }, [params.refAudio, referenceExists, set]);
 
   return (
     <div className="space-y-2 rounded-xl bg-ink-900/40 p-3 ring-1 ring-ink-800">
@@ -1218,6 +1245,7 @@ function VoiceSection({
         label="Voice reference"
         placeholder="No reference — voice follows the caption"
         describe={(f) => `timbre of ${f.name}`}
+        onFiles={onImported}
       />
       <p className="text-[10px] leading-relaxed text-ink-500">
         {reference ? (

@@ -10,6 +10,7 @@ interface Props {
   label: string;
   disabled?: boolean;
   describe?: (file: ImportedFile) => string;
+  onFiles?: (files: ImportedFile[]) => void;
 }
 
 /**
@@ -32,6 +33,9 @@ export function SourcePicker({
   label,
   disabled,
   describe,
+  /** Reports what is currently importable, so the caller can tell an import
+   *  from a path that no longer exists. */
+  onFiles,
 }: Props) {
   const [files, setFiles] = useState<ImportedFile[]>([]);
   const [expanded, setExpanded] = useState(false);
@@ -42,11 +46,13 @@ export function SourcePicker({
 
   const reload = useCallback(async () => {
     try {
-      setFiles(await imports.list());
+      const listed = await imports.list();
+      setFiles(listed);
+      onFiles?.(listed);
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [onFiles]);
 
   useEffect(() => {
     void reload();
