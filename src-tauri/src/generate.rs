@@ -448,6 +448,39 @@ pub fn submit_json(port: u16, path: &str, body: serde_json::Value) -> Result<Str
 /// the signal to leave that engine alone -- it wants `euler` and nothing else
 /// will do.
 pub fn engine_solvers(port: u16) -> Option<Vec<String>> {
+    engine_plugins(port, "solvers")
+}
+
+/// Guidance mode to send, given what was asked for.
+///
+/// Same shape of trap as the solver. HOT-Step's default is "apg" and no shipped
+/// plugin provides it; its sampler looks "apg" up again as the fallback and
+/// then dereferences the result, so the render dies one line after a solver fix
+/// would otherwise have succeeded. Unlike the solver there is nothing sensible
+/// to substitute: the registry answers an *empty* name with the first guidance
+/// plugin it has, which is both safe and genuinely its own choice.
+pub fn resolve_guidance(port: u16, requested: &str) -> String {
+    match engine_plugins(port, "guidance") {
+        Some(names) => decide_guidance(&names, requested),
+        // No registry: the engine is not HOT-Step and this field is inert.
+        None => requested.to_string(),
+    }
+}
+
+/// The decision itself, without the engine round trip.
+fn decide_guidance(names: &[String], requested: &str) -> String {
+    let asked = requested.trim();
+    if !asked.is_empty() && names.iter().any(|n| n == asked) {
+        return asked.to_string();
+    }
+    // Empty is the safe answer, not a shrug: HOT-Step's registry answers an
+    // empty name with the first guidance plugin it loaded.
+    String::new()
+}
+
+/// Names the running engine publishes under `key`, or `None` when it publishes
+/// no registry at all.
+fn engine_plugins(port: u16, key: &str) -> Option<Vec<String>> {
     let url = format!("http://127.0.0.1:{port}/plugins");
     let response = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(10))
@@ -455,7 +488,7 @@ pub fn engine_solvers(port: u16) -> Option<Vec<String>> {
         .ok()?;
     let body = response.into_reader().read_to_end_bytes().ok()?;
     let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
-    let solvers = json.get("solvers")?.as_array()?;
+    let solvers = json.get(key)?.as_array()?;
     let names: Vec<String> = solvers
         .iter()
         .filter_map(|s| s.get("name").and_then(|n| n.as_str()))
@@ -1194,6 +1227,25 @@ pub fn generate(
         let mut out = Vec::with_capacity(requests.len());
         for mut r in requests {
             if let Some(obj) = r.as_object_mut() {
+                // The solver has to be stated here as well as on `/lm`.
+                // HOT-Step runs `parse_server_fields` over the *synth* body and
+                // nowhere else -- `/lm` never reads it -- so a solver sent with
+                // the planner is simply discarded, and the render then runs on
+                // the engine's default `euler`, which has no plugin, and the
+                // sampler dereferences the null it gets back. Sending it on
+                // `/lm` alone looked correct and changed nothing.
+                //
+                // `guidance_mode` is the same trap one line later: the default is
+                // "apg", which no plugin provides either.
+                if !lm_params.solver.is_empty() {
+                    obj.insert("infer_method".into(), lm_params.solver.clone().into());
+                }
+                // Sent unconditionally, and sent even when empty: the engine's
+                // own default for this is a name that resolves to nothing, so
+                // leaving it out is the one choice guaranteed to crash. Empty
+                // means "first guidance plugin in the registry".
+                let guidance = resolve_guidance(port, &params.guidance_mode);
+                obj.insert("guidance_mode".into(), guidance.into());
                 if !codes.is_empty() {
                     obj.insert("audio_codes".into(), codes.into());
                 }
@@ -1862,6 +1914,24 @@ mod tests {
         let v = p.to_lm_json();
         assert_eq!(v["solver"], "md_confluence_v4", "acestep.cpp reads this");
         assert_eq!(v["infer_method"], "md_confluence_v4", "HOT-Step reads this");
+    }
+
+    /// The engine reads these off the *synth* body and nowhere else -- `/lm`
+    /// drops them, so a solver sent only with the planner is discarded and the
+    /// render silently runs on the engine's default. This is the line that
+    /// looked right and did nothing.
+    #[test]
+    fn guidance_is_left_to_the_registry_rather_than_the_engines_default() {
+        // "apg" is the engine's default and no plugin provides it, so the only
+        // safe thing to send when nothing was chosen is the empty name, which
+        // its own registry answers with the first guidance plugin it has.
+        let names: Vec<String> = ["md_clarity_v1", "md_storm_guidance"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(decide_guidance(&names, "apg"), "", "the engine default must not survive");
+        assert_eq!(decide_guidance(&names, ""), "");
+        assert_eq!(decide_guidance(&names, "md_clarity_v1"), "md_clarity_v1", "a real choice stands");
     }
 
     /// `guidance_mode` is the same trap one step later. HOT-Step defaults it to
