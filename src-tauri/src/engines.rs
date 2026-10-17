@@ -108,7 +108,13 @@ struct Manifest {
     files: Vec<String>,
     /// Hash of the engine binary when *we* installed it. Absent for an engine
     /// the user supplied themselves.
-    #[serde(default)]
+    ///
+    /// The rename is load-bearing and was missing for a long time. The manifest
+    /// is written with serde_json's own key, `sourceHash`, while this field was
+    /// left as `source_hash` with no rename -- so every read found `None`, the
+    /// refresh check bailed on its first line, and the bundled engine was never
+    /// refreshed automatically for anyone, silently, on any platform.
+    #[serde(default, rename = "sourceHash")]
     source_hash: Option<String>,
 }
 
@@ -254,7 +260,17 @@ pub fn list() -> Vec<Engine> {
 }
 
 pub fn binary_path(id: EngineId) -> Option<PathBuf> {
-    let dir = engines_dir().join(id.as_str());
+    binary_path_in(&engines_dir(), id)
+}
+
+/// The install lookup, with the root passed in.
+///
+/// The engine directory is process-wide, and a test that pointed it somewhere
+/// scratch through an environment variable raced every other test in the
+/// binary that touched it. Passing it in keeps the logic testable and the
+/// global in one place.
+fn binary_path_in(root: &Path, id: EngineId) -> Option<PathBuf> {
+    let dir = root.join(id.as_str());
     let manifest: Manifest = std::fs::read_to_string(dir.join("manifest.json"))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())?;
@@ -416,8 +432,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
 /// True only when the installed copy carries a `source_hash` -- meaning this
 /// app put it there -- and that hash differs from the bundled engine's. An
 /// engine with no recorded hash came from the user and is left alone.
-fn should_refresh(id: EngineId, source: &Path) -> bool {
-    let dir = engines_dir().join(id.as_str());
+fn should_refresh_in(root: &Path, id: EngineId, source: &Path) -> bool {
+    let dir = root.join(id.as_str());
     let Ok(text) = std::fs::read_to_string(dir.join("manifest.json")) else {
         return false;
     };
@@ -450,23 +466,30 @@ pub fn reinstall_from(source: &Path) -> Result<(), String> {
 }
 
 pub fn adopt_from(id: EngineId, source: &Path) -> Result<(), String> {
-    if binary_path(id).is_some() {
+    adopt_into(&engines_dir(), id, source)
+}
+
+fn adopt_into(root: &Path, id: EngineId, source: &Path) -> Result<(), String> {
+    let destination = root.join(id.as_str());
+    if binary_path_in(root, id).is_some() {
         // Already installed. Refresh it only when the copy on disk is one *we*
         // put there and the bundled engine has since changed -- otherwise a
         // new app release would silently overwrite an engine the user built or
         // installed themselves.
-        if !should_refresh(id, source) {
+        if !should_refresh_in(root, id, source) {
             return Ok(());
         }
-        let destination = engines_dir().join(id.as_str());
+        let _ = std::fs::remove_dir_all(&destination);
+    } else if destination.exists() {
+        // A directory with no manifest is not an install. `binary_path` cannot
+        // see it, so treating it as one left the app reporting "not installed"
+        // against a folder full of files, and refusing to copy over it -- a
+        // half-finished adopt, or an interrupted refresh, with nothing here
+        // able to repair it. Either way nothing of value is recorded, so it is
+        // cleared and adopted properly.
         let _ = std::fs::remove_dir_all(&destination);
     }
-    let root = engines_dir();
-    let destination = root.join(id.as_str());
-    if destination.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     copy_tree(source, &destination)?;
 
     // Only the backends actually shipped get listed: a model of the runtime
@@ -649,6 +672,184 @@ mod tests {
         assert!(report.ok, "problems: {:?}", report.problems);
     }
 }
+#[cfg(test)]
+mod adopt_tests {
+    use super::*;
+
+    /// Scratch engines directory. Passed in explicitly rather than set through
+    /// `ACEFORGE_DATA_DIR`: that variable is process-wide, so a test writing it
+    /// races every other test in the binary that reads it -- including the queue
+    /// suite, which points it at its own folder exactly once.
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("aceforge-adopt-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("engines")).unwrap();
+        dir
+    }
+
+    fn bundle(root: &Path, body: &str) -> PathBuf {
+        let src = root.join("bundle");
+        std::fs::create_dir_all(src.join("plugins/solvers")).unwrap();
+        std::fs::write(src.join("ace-server"), body).unwrap();
+        std::fs::write(src.join("plugins/solvers/one.lua"), "return 1").unwrap();
+        src
+    }
+
+    /// A plain adopt installs the engine and records it.
+    #[test]
+    fn a_first_adopt_installs_and_records_the_engine() {
+        let data = scratch("first");
+        let src = bundle(&data, "engine one");
+        let root = data.join("engines");
+        adopt_into(&root, EngineId::HotStep, &src).expect("adopt");
+
+        assert!(binary_path_in(&root, EngineId::HotStep).is_some(), "not recorded");
+        assert_eq!(
+            std::fs::read_to_string(root.join("hotstep/plugins/solvers/one.lua")).unwrap(),
+            "return 1",
+            "nested files must come across, not just the top level"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// The state a manual copy or an interrupted refresh leaves behind: the
+    /// directory is full of files and has no manifest. `binary_path` returns
+    /// None, so the app reports the engine as not installed -- and because the
+    /// directory exists, an adopt that trusted it would refuse to copy or record
+    /// anything, leaving nothing able to repair the folder.
+    #[test]
+    fn a_directory_without_a_manifest_is_repaired_rather_than_trusted() {
+        let data = scratch("orphan");
+        let src = bundle(&data, "engine one");
+        let root = data.join("engines");
+        let destination = root.join("hotstep");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("ace-server"), "half-copied").unwrap();
+        assert!(binary_path_in(&root, EngineId::HotStep).is_none(), "precondition");
+
+        adopt_into(&root, EngineId::HotStep, &src).expect("adopt");
+
+        assert!(
+            binary_path_in(&root, EngineId::HotStep).is_some(),
+            "the engine is still unrecorded after an adopt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("ace-server")).unwrap(),
+            "engine one",
+            "the stranded copy must be replaced, not adopted as-is"
+        );
+        assert!(
+            destination.join("plugins/solvers/one.lua").is_file(),
+            "repair must install the payload, not just the manifest"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// An engine this app installed is left alone when the bundled copy has not
+    /// moved on. The whole point of the fingerprint.
+    #[test]
+    fn an_up_to_date_install_is_not_touched_again() {
+        let data = scratch("stable");
+        let src = bundle(&data, "engine one");
+        let root = data.join("engines");
+        adopt_into(&root, EngineId::HotStep, &src).expect("first adopt");
+        let binary = root.join("hotstep/ace-server");
+        std::fs::write(&binary, "locally touched").unwrap();
+
+        adopt_into(&root, EngineId::HotStep, &src).expect("second adopt");
+
+        assert_eq!(
+            std::fs::read_to_string(&binary).unwrap(),
+            "locally touched",
+            "an unchanged bundle must not overwrite the installed engine"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A changed bundle does replace the install -- this is what carries a new
+    /// plugin set across an upgrade.
+    #[test]
+    fn a_changed_bundle_replaces_the_install() {
+        let data = scratch("changed");
+        let src = bundle(&data, "engine one");
+        let root = data.join("engines");
+        adopt_into(&root, EngineId::HotStep, &src).expect("first adopt");
+        std::fs::write(src.join("ace-server"), "engine two").unwrap();
+        std::fs::write(src.join("plugins/solvers/two.lua"), "return 2").unwrap();
+
+        eprintln!("DBG src hash: {:?}", hash_runtime(&src));
+        eprintln!("DBG should_refresh: {}", should_refresh_in(&root, EngineId::HotStep, &src));
+        adopt_into(&root, EngineId::HotStep, &src).expect("second adopt");
+
+        let installed = root.join("hotstep");
+        assert_eq!(std::fs::read_to_string(installed.join("ace-server")).unwrap(), "engine two");
+        assert!(installed.join("plugins/solvers/two.lua").is_file(), "new plugin must arrive");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// The manifest is written with serde_json's own keys and read back into a
+    /// struct, so every key has to be spelled the same way on both sides. The
+    /// fingerprint was written as `sourceHash` and read as `source_hash` for the
+    /// whole life of the refresh feature, which meant it was always absent and
+    /// the refresh never once ran. Nothing failed; it just declined to do
+    /// anything, forever.
+    #[test]
+    fn the_manifest_records_its_fingerprint_under_a_key_it_can_read_back() {
+        let data = scratch("wire");
+        let src = bundle(&data, "engine one");
+        let root = data.join("engines");
+        adopt_into(&root, EngineId::HotStep, &src).expect("adopt");
+
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("hotstep/manifest.json")).unwrap(),
+        )
+        .expect("manifest parses");
+        assert!(
+            written.get("sourceHash").and_then(|v| v.as_str()).is_some(),
+            "the fingerprint must be written as sourceHash: {written}"
+        );
+
+        let read: Manifest =
+            serde_json::from_value(written).expect("manifest deserialises");
+        assert!(
+            read.source_hash.is_some(),
+            "the fingerprint must survive the round trip"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// An engine with no recorded hash came from the user and must survive even
+    /// when the bundled copy has moved on.
+    #[test]
+    fn an_engine_with_no_recorded_hash_is_left_alone() {
+        let data = scratch("foreign");
+        let src = bundle(&data, "engine one");
+        let root = data.join("engines");
+        let destination = root.join("hotstep");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("ace-server"), "user build").unwrap();
+        // A manifest with no sourceHash: installed by hand, or by a build of
+        // this app old enough not to record one.
+        std::fs::write(
+            destination.join("manifest.json"),
+            r#"{"id":"hotstep","label":"HOT-Step CPP","binary":"ace-server","files":[]}"#,
+        )
+        .unwrap();
+
+        assert!(binary_path_in(&root, EngineId::HotStep).is_some(), "precondition");
+        std::fs::write(src.join("ace-server"), "bundled two").unwrap();
+        adopt_into(&root, EngineId::HotStep, &src).expect("adopt");
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("ace-server")).unwrap(),
+            "user build",
+            "an engine of unknown provenance must never be overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+}
+
 #[cfg(test)]
 mod refresh_tests {
     use super::*;
