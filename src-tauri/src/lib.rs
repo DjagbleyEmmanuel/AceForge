@@ -276,6 +276,24 @@ fn adopt_bundled_hotstep(app: tauri::AppHandle) -> Result<bool, String> {
     engines::adopt_from(engines::EngineId::HotStep, &bundled).map(|_| true)
 }
 
+/// How far the running render has got.
+///
+/// The engine reports no percentage of its own, so this is parsed from the
+/// progress lines it writes to stderr. Cheap enough to poll once a second:
+/// it only reads the tail of a file the watchdog is already tracking.
+#[tauri::command]
+fn job_progress(mark: Option<u64>) -> generate::JobProgress {
+    let dir = settings::resolve_models_dir(None);
+    generate::job_progress(&dir, mark.unwrap_or(0))
+}
+
+/// Log offset for a job that has not started yet, so the frontend can show a
+/// bar the moment it is queued rather than waiting for the runner.
+#[tauri::command]
+fn current_log_mark() -> u64 {
+    server::stderr_mark(&settings::resolve_models_dir(None))
+}
+
 /// What the YuE2 pipeline can currently do. The UI reads this to decide
 /// whether to show the YuE2 form at all: submitting without the weights is a
 /// 400 that says less than "download these two files".
@@ -794,10 +812,51 @@ fn list_covers() -> Vec<covers::CoverEntry> {
 /// override, which returns it to the ACE-Step folder.
 #[tauri::command]
 fn set_hotstep_models_dir(path: String) -> Result<SettingsView, String> {
+    let trimmed = path.trim().to_string();
+    if !trimmed.is_empty() {
+        check_hotstep_weights_dir(std::path::Path::new(&trimmed))?;
+    }
     let mut current = settings::load();
-    current.hotstep_models_dir = path.trim().to_string();
+    current.hotstep_models_dir = trimmed;
     settings::save(&current)?;
     Ok(get_settings())
+}
+
+/// Refuse a weights folder that cannot serve the ACE-Step form.
+///
+/// The engine's registry walks only the top level and deliberately skips files
+/// belonging to the other backends, so a folder holding just YuE2 weights comes
+/// up with an empty LM registry and every submit is refused with a bare 501.
+/// Catching it here names the cause instead, and points at the fix.
+///
+/// Not a hard error for a YuE2-only install: that is a legitimate
+/// configuration once the user has chosen the YuE2 tab. It is only wrong while
+/// the folder is paired with the ACE-Step form.
+fn check_hotstep_weights_dir(dir: &std::path::Path) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Err(format!("{} is not a folder", dir.display()));
+    }
+    // Read this folder directly. `list_tracks` scans the library, which is a
+    // different directory entirely and would answer a question nobody asked.
+    let names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_planner = names.iter().any(|n| n.starts_with("acestep-5hz-lm-"));
+    let has_yue = names.iter().any(|n| n.starts_with("yue2-"));
+    if has_yue && !has_planner {
+        return Err(format!(
+            "{} holds YuE2 weights only, so the ACE-Step form cannot run against it. \
+             Point this at the models root and let YuE2 use its yue2 subfolder, or \
+             switch to the YuE2 tab.",
+            dir.display()
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1189,6 +1248,8 @@ pub fn run() {
             list_adapters,
             adopt_bundled_engine,
             adopt_bundled_hotstep,
+            job_progress,
+            current_log_mark,
             yue2_props,
             yue2_render,
             reinstall_bundled_engine,

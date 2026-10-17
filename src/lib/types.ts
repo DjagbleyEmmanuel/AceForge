@@ -137,6 +137,9 @@ export interface QueuedJob {
   track_ids: string[];
   created_at: number;
   started_at: number | null;
+  /** Byte offset into the engine log when this job started. Progress is read
+   *  back out of the lines written since. */
+  log_mark: number;
   finished_at: number | null;
   audio_secs: number;
   elapsed_secs: number;

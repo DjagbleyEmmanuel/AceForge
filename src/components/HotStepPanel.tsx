@@ -121,9 +121,15 @@ export function HotStepPanel({
             </button>
           </div>
           <p className="mt-1 text-[10px] leading-relaxed text-ink-500">
-            Left empty this shares the ACE-Step folder, which both engines can read
-            for the ACE-Step backend. Point it elsewhere before downloading
-            MiniMax or YuE2 weights so the two do not load each other's files.
+            This is the models <em>root</em>, not a family subfolder. The engine
+            scans only the top level and skips weights that belong to another
+            backend, so pointing this at{" "}
+            <code className="font-mono">yue2/</code> or{" "}
+            <code className="font-mono">mm3/</code> leaves it with no ACE-Step
+            models and every submit refused. YuE2 finds its own weights in the{" "}
+            <code className="font-mono">yue2/</code> subfolder automatically, and
+            MiniMax in <code className="font-mono">mm3/</code>. Leave it empty to
+            share the ACE-Step folder.
           </p>
         </div>
 

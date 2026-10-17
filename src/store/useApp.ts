@@ -13,6 +13,8 @@ import type { ServerStatus, StoreSnapshot } from "../lib/types";
 import type { GenerateParams } from "../lib/api";
 import { recall, remember } from "../lib/session";
 import { engines as enginesApi, type Engine, type EngineId } from "../lib/engines";
+import type { QueuedJob } from "../lib/types";
+import { queue as queueApi } from "../lib/api";
 
 /** Studio form defaults. Owned here, not in the panel: panels unmount on tab
  *  switches, and form state must outlive that. */
@@ -72,6 +74,37 @@ export function useApp() {
   const [snapshot, setSnapshot] = useState<StoreSnapshot | null>(null);
   const [settingsView, setSettingsView] = useState<SettingsView | null>(null);
   const [status, setStatus] = useState<ServerStatus | null>(null);
+  // The job the side panel's progress card describes. Tracked here rather than
+  // lifted from QueuePanel: the card lives outside the queue's subtree and
+  // re-rendering the whole queue list once a second to feed it would be the
+  // opposite of cheap.
+  const [activeJob, setActiveJob] = useState<QueuedJob | null>(null);
+  // Updated only when the *identity* of the running job changes. Queue events
+  // fire on every stage; copying the row into state on each one would re-render
+  // the app several times a second for a card that only needs it once.
+  useEffect(() => {
+    let alive = true;
+    const check = async () => {
+      try {
+        const list = await queueApi.list();
+        if (!alive) return;
+        const running = list.find((j) => j.state === "running");
+        setActiveJob((prev) => {
+          if (!running) return prev === null ? prev : null;
+          if (prev && prev.id === running.id) return prev;
+          return running;
+        });
+      } catch {
+        // The queue command failing is transient; the next event retries.
+      }
+    };
+    void check();
+    const un = queueApi.onChanged(() => void check());
+    return () => {
+      alive = false;
+      void un.then((f) => f());
+    };
+  }, []);
   const [port, setPort] = useState<number | null>(null);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [busy, setBusy] = useState(false);
@@ -381,6 +414,7 @@ export function useApp() {
     saveModelsDir,
     saveVaeChunk,
     saveHotStepDir,
+    activeJob,
     saveMaxSeq,
     handleGenerated,
     generateApi,

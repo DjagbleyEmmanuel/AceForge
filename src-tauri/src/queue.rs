@@ -61,6 +61,15 @@ pub struct QueuedJob {
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
     pub audio_secs: f32,
+    /// Byte offset into the engine log at the moment this job started.
+    ///
+    /// Progress is read back out of the lines the engine writes there, so this
+    /// is what keeps the previous render's finished steps from being reported
+    /// as this one's progress. Captured by the runner at the transition, which
+    /// is before `generate` runs, so there is no window where the first step
+    /// lines are already on disk but the mark is past them.
+    #[serde(default)]
+    pub log_mark: u64,
     /// Wall-clock seconds the engine was busy, across any retries of this job.
     pub elapsed_secs: f64,
 }
@@ -229,6 +238,7 @@ pub fn enqueue(params: GenerateParams) -> QueuedJob {
         finished_at: None,
         audio_secs: 0.0,
         elapsed_secs: 0.0,
+        log_mark: 0,
     };
     state().update(|jobs| jobs.push(job.clone()));
     emit_change();
@@ -306,6 +316,7 @@ pub fn retry(job_id: String) -> Result<QueuedJob, String> {
             finished_at: None,
             audio_secs: 0.0,
             elapsed_secs: 0.0,
+            log_mark: 0,
         };
         retried = Some(fresh.clone());
         jobs.push(fresh);
@@ -405,10 +416,14 @@ fn emit_change() {
 }
 
 fn set_running(id: &str) {
+    // Taken before the lock, so the mark is the log as it stood the instant this
+    // job took over -- anything written after this belongs to this render.
+    let mark = crate::server::stderr_mark(&crate::settings::resolve_models_dir(None));
     state().update(|jobs| {
         if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
             job.state = JobState::Running;
             job.started_at = Some(now_secs());
+            job.log_mark = mark;
         }
     });
     emit_change();
@@ -563,6 +578,7 @@ mod tests {
             finished_at: None,
             audio_secs: audio,
             elapsed_secs: elapsed,
+            log_mark: 0,
         }
     }
 
@@ -609,6 +625,56 @@ mod tests {
         );
     }
 
+    /// Point the queue at a scratch directory before anything initialises it.
+    ///
+    /// `state()` is a process-wide `OnceLock` backed by `queue.json` under the
+    /// app data directory, and `paths::app_data_dir` honours this variable. A
+    /// queue test that did not isolate itself wrote its fixture jobs into the
+    /// running user's real queue, where they survived as a column of failed
+    /// rows captioned "retry me" that reappeared on every launch.
+    fn isolate() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("aceforge-queue-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("scratch queue dir");
+            std::env::set_var("ACEFORGE_DATA_DIR", &dir);
+        });
+    }
+
+    /// The regression this guards is not subtle: a queue fixture written into
+    /// the user's real `queue.json` survives as a permanent column of failed
+    /// rows on every launch. Assert on the file the queue is actually reading.
+    #[test]
+    fn queue_tests_never_touch_the_real_app_data() {
+        isolate();
+        let path = queue_path();
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "queue tests are writing to {}",
+            path.display()
+        );
+        // And the fixture must land there, not in the real one.
+        state().update(|jobs| {
+            jobs.push(QueuedJob {
+                id: "q-isolation-probe".into(),
+                params: params_with_caption("isolation probe"),
+                state: JobState::Failed,
+                error: Some("probe".into()),
+                track_ids: Vec::new(),
+                created_at: now_secs(),
+                started_at: Some(now_secs()),
+                finished_at: Some(now_secs()),
+                audio_secs: 0.0,
+                elapsed_secs: 0.0,
+                log_mark: 0,
+            });
+        });
+        let written = std::fs::read_to_string(&path).expect("scratch queue written");
+        assert!(written.contains("isolation probe"), "fixture not in the scratch queue");
+    }
+
     /// `retry` allocated its new id from inside the update closure, and
     /// `next_id` locks the very mutex the closure already held. A `Mutex` is not
     /// reentrant, so the thread parked forever holding the lock and every queue
@@ -618,6 +684,7 @@ mod tests {
     /// deadline: a regression blocks the test instead of hanging the suite.
     #[test]
     fn retry_returns_and_leaves_the_queue_usable() {
+        isolate();
         let inner = state();
         // The queue state is a process-wide singleton, so other tests may have
         // rows in it. Compare against a baseline rather than an exact count.
@@ -634,6 +701,7 @@ mod tests {
                 finished_at: Some(now_secs()),
                 audio_secs: 0.0,
                 elapsed_secs: 1.0,
+                log_mark: 0,
             });
         });
 

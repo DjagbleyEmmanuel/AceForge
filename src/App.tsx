@@ -1,4 +1,5 @@
 import { HotStepPanel } from "./components/HotStepPanel";
+import { ProgressPanel } from "./components/ProgressPanel";
 import { EngineSwitcher } from "./components/EngineSwitcher";
 import { GeneratePanel } from "./components/GeneratePanel";
 import { queue as queueApi, type GenerateParams } from "./lib/api";
@@ -68,6 +69,11 @@ export default function App() {
         </nav>
 
         <div className="mt-auto space-y-2 pt-4">
+          <ProgressPanel
+            active={!!app.activeJob}
+            mark={app.activeJob?.log_mark ?? null}
+            startedAt={app.activeJob?.started_at ?? null}
+          />
           <ThemeChooser theme={theme} onChange={setTheme} />
           <div className="panel p-3">
             <div className="flex items-center justify-between">

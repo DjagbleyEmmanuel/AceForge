@@ -189,6 +189,26 @@
     box-shadow: inset 0 0 0 1px var(--color-ink-700);
   }
 
+  /* Indeterminate sweep for a render whose first progress line has not landed.
+     A CSS animation runs on the compositor, so it costs nothing per frame --
+     the alternative, a requestAnimationFrame loop, does. */
+  @keyframes progress-sweep {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(400%);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chip,
+    .btn,
+    .nav-item {
+      transition-duration: 1ms;
+    }
+  }
+
   .chip {
     display: inline-flex;
     align-items: center;

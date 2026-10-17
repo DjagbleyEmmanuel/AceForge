@@ -410,10 +410,30 @@ pub fn submit_json(port: u16, path: &str, body: serde_json::Value) -> Result<Str
 
 fn submit(port: u16, path: &str, body: serde_json::Value) -> Result<String, String> {
     let url = format!("http://127.0.0.1:{port}{path}");
-    let response = ureq::post(&url)
+    // `send_json` turns any non-2xx into an opaque transport error, which threw
+    // away the one useful thing in the response: the backend explains its own
+    // refusals. A 501 from /lm says "No LM models in registry", which names the
+    // actual problem, and that arrived at the user as "status code 501".
+    let response = match ureq::post(&url)
         .timeout(std::time::Duration::from_secs(60))
         .send_json(body)
-        .map_err(|e| format!("submit {path} failed: {e}"))?;
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let detail = r
+                .into_string()
+                .ok()
+                .and_then(|b| {
+                    serde_json::from_str::<serde_json::Value>(&b)
+                        .ok()
+                        .and_then(|v| v.get("error")?.as_str().map(str::to_string))
+                })
+                .unwrap_or_default();
+            let hint = if detail.is_empty() { String::new() } else { format!(": {detail}") };
+            return Err(format!("{path} refused the request ({code}){hint}"));
+        }
+        Err(e) => return Err(format!("submit {path} failed: {e}")),
+    };
 
     job_id_from(response.into_json().map_err(|e| format!("bad submit response: {e}"))?, path)
 }
@@ -1142,6 +1162,109 @@ pub fn generate(
     Ok(GenerateOutcome { tracks, cancelled: false })
 }
 
+/// Where a render has got to, derived from what the backend actually logged.
+///
+/// The engine's `/job` answers a bare `{"status":"running"}` -- there is no
+/// percentage anywhere in its API. It does, however, write a line per sampler
+/// step (`[DiT] Step 39/50 t=0.240`) and a tile count for the decode, so the
+/// honest source of progress is the log the watchdog already reads.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobProgress {
+    /// 0..=1 across the whole pipeline. `None` before the first progress line
+    /// arrives, which is a real state rather than a failure: planning writes
+    /// nothing until it hands off to the sampler.
+    pub fraction: Option<f32>,
+    /// Which stage the render is in, for the label beside the bar.
+    pub stage: String,
+    /// Sampler step counts, when the backend has reported any.
+    pub step: Option<(u32, u32)>,
+    /// Decoder tiles, when known.
+    pub tiles_done: Option<(u32, u32)>,
+}
+
+/// Stage weights, summing to 1.
+///
+/// Only the sampler's own step count is real; the planner and the decode are
+/// timed rather than counted, so they are given fixed shares sized by how long
+/// they actually take. The planner is short and the decode scales with
+/// duration, which is why the decode gets the larger share.
+const PLAN_SHARE: f32 = 0.10;
+const DIT_SHARE: f32 = 0.75;
+const DECODE_SHARE: f32 = 0.15;
+
+pub fn job_progress(models_dir: &std::path::Path, mark: u64) -> JobProgress {
+    let lines = crate::server::stderr_since(models_dir, mark, 4000);
+    let mut stage = String::new();
+    let mut step: Option<(u32, u32)> = None;
+    let mut tiles: Option<(u32, u32)> = None;
+    let mut saw_dit = false;
+
+    for line in &lines {
+        if let Some((done, total)) = parse_dit_step(line) {
+            step = Some((done, total));
+            saw_dit = true;
+            stage = "sampling".to_string();
+        } else if let Some((total, chunk)) = parse_tiles(line) {
+            tiles = Some((0, total));
+            // The decode logs its plan once, at the start, so this is the
+            // stage handover rather than progress within it.
+            let _ = chunk;
+            stage = "decoding".to_string();
+        } else if line.contains("[VAE]") {
+            stage = "decoding".to_string();
+        }
+    }
+
+    // A finished decode implies the sampler finished, even if its last step line
+    // scrolled past the window.
+    let dit_done = match (step, tiles.is_some()) {
+        (Some((d, t)), _) if t > 0 => (d as f32 / t as f32).min(1.0),
+        (None, true) => 1.0,
+        _ => 0.0,
+    };
+    let saw_dit = saw_dit || tiles.is_some();
+
+    let fraction = if saw_dit {
+        // Planning happens before the first step line, so anything without one
+        // yet is inside that opening band.
+        let planned = if step.is_some() { PLAN_SHARE } else { 0.0 };
+        let done = planned + DIT_SHARE * dit_done + DECODE_SHARE;
+        Some(done.min(0.99))
+    } else if !stage.is_empty() {
+        Some(PLAN_SHARE)
+    } else {
+        None
+    };
+
+    JobProgress {
+        fraction,
+        stage: if stage.is_empty() {
+            "planning".to_string()
+        } else {
+            stage
+        },
+        step,
+        tiles_done: tiles,
+    }
+}
+
+/// `[DiT] Step 39/50 t=0.240`
+fn parse_dit_step(line: &str) -> Option<(u32, u32)> {
+    let rest = line.split("[DiT] Step ").nth(1)?;
+    let mut parts = rest.split_whitespace();
+    let done: u32 = parts.next()?.split('/').next()?.parse().ok()?;
+    let total: u32 = parts.next()?.parse().ok()?;
+    (total > 0).then_some((done, total))
+}
+
+/// `[VAE] Tiled decode: 28 tiles (chunk=256, ...)`
+fn parse_tiles(line: &str) -> Option<(u32, u32)> {
+    let rest = line.split("Tiled decode:").nth(1)?;
+    let total: u32 = rest.split_whitespace().next()?.parse().ok()?;
+    (total > 0).then_some((0, total))
+}
+
 /// Metadata sidecar, `<track>.json` beside the audio file.
 fn metadata_path(track: &Track) -> PathBuf {
     let mut p = PathBuf::from(&track.path);
@@ -1258,6 +1381,27 @@ impl<R: std::io::Read + ?Sized> ReadToEnd for R {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-cleaning temp directory. The progress tests write a real log file,
+    /// so they cannot share the process-wide app data directory the way a
+    /// pure parser test could.
+    struct ScratchDir(PathBuf);
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "aceforge-generate-test-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            ScratchDir(dir)
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Encodes the way `ace-server` does, so the round trip covers the padding
     /// the server actually emits.
@@ -1714,4 +1858,5 @@ mod lrc_sanitise_tests {
         assert_eq!(sanitise_lrc(""), "");
     }
 }
+
 
