@@ -74,6 +74,10 @@ pub struct GenerateParams {
     /// GGUF filename (without `.gguf`) of the DiT.
     #[serde(default)]
     pub synth_model: String,
+    /// Guidance mode, by name. Empty means "whichever the engine lists first".
+    /// Only HOT-Step reads this; its own default is a name no plugin provides.
+    #[serde(default)]
+    pub guidance_mode: String,
     /// Diffusion solver, by name. Empty means "ask the engine", which is
     /// resolved at submit time against the registry the engine actually
     /// publishes -- see `preferred_solver`. The two engines disagree on the
@@ -273,6 +277,7 @@ impl Default for GenerateParams {
             lm_model: String::new(),
             synth_model: String::new(),
             solver: String::new(),
+            guidance_mode: String::new(),
             task_type: default_task_type(),
             repainting_start: 0.0,
             repainting_end: minus_one_f32(),
@@ -349,6 +354,19 @@ impl GenerateParams {
             "lm_model": gguf_name(&self.lm_model),
             "synth_model": gguf_name(&self.synth_model),
             "solver": &self.solver,
+            // The same value under the name HOT-Step reads. The two engines
+            // disagree on the key as well as the vocabulary: acestep.cpp looks
+            // for `solver`, HOT-Step for `infer_method`, and each ignores the
+            // other's. Sending `solver` alone left HOT-Step on its own default,
+            // which is the whole bug -- see `resolve_solver`.
+            "infer_method": &self.solver,
+            // Likewise for guidance. HOT-Step's default here is "apg", which no
+            // shipped plugin provides, and its sampler falls back to looking up
+            // "apg" before dereferencing the result. An empty name makes the
+            // registry hand back the first guidance plugin it does have, so the
+            // choice is made from what exists rather than from a default that
+            // cannot resolve. acestep.cpp ignores this key.
+            "guidance_mode": &self.guidance_mode,
             // These four were declared on the struct and shown in the Sampling
             // panel but never sent, so the panel was decorative: the backend
             // fell back to the turbo model defaults (8 steps, guidance 1.0,
@@ -460,11 +478,43 @@ pub fn engine_solvers(port: u16) -> Option<Vec<String>> {
 /// Preference order rather than "whatever `/plugins` listed first", so the same
 /// engine and plugin set always render the same way.
 pub fn preferred_solver(port: u16) -> String {
-    engine_solvers(port).map(|n| choose_solver(&n)).unwrap_or_default()
+    resolve_solver(port, "")
 }
 
-/// Pick one of `names`. Split from `preferred_solver` so the ordering is
-/// testable without an engine listening.
+/// The solver to actually send, given what was asked for.
+///
+/// Asking for nothing is not the safe option it looks like. HOT-Step's own
+/// default is `euler` (`sf->solver_name = "euler"` in hot-step-server.cpp),
+/// overridden only when the request carries a non-empty solver, and no shipped
+/// plugin provides that name -- its sampler logs "unknown solver 'euler',
+/// falling back to euler", the fallback re-asks for the same missing name, and
+/// the next line dereferences the null. Every render dies mid-flight.
+///
+/// Checking only for emptiness is not enough either. A preset saved by an older
+/// build carries `solver: "euler"` in its recorded parameters, and applying it
+/// is how that name reaches the engine: not as a default, but as a remembered
+/// choice. So the name is validated against the registry whatever it is, and an
+/// engine with no registry is left to sort itself out -- that is the bundled
+/// one, which wants `euler` and offers no list.
+pub fn resolve_solver(port: u16, requested: &str) -> String {
+    match engine_solvers(port) {
+        Some(names) => decide_solver(&names, requested),
+        // No registry: leave the choice entirely to the engine.
+        None => requested.to_string(),
+    }
+}
+
+/// The decision itself, without the engine round trip.
+fn decide_solver(names: &[String], requested: &str) -> String {
+    let asked = requested.trim();
+    if !asked.is_empty() && names.iter().any(|n| n == asked) {
+        return asked.to_string();
+    }
+    choose_solver(names)
+}
+
+/// Pick one of `names`. Split out so the ordering is testable without an engine
+/// listening.
 fn choose_solver(names: &[String]) -> String {
     for want in ["md_confluence_v4", "storm", "md_storm_V4"] {
         if names.iter().any(|n| n == want) {
@@ -1090,9 +1140,7 @@ pub fn generate(
     // Only the solver needs the engine's own vocabulary, and asking is cheaper
     // than guessing: an unrecognised name is a hard crash on HOT-Step.
     let mut lm_params = params.clone();
-    if lm_params.solver.trim().is_empty() {
-        lm_params.solver = preferred_solver(port);
-    }
+    lm_params.solver = resolve_solver(port, &lm_params.solver);
     let lm_id = submit(port, "/lm", lm_params.to_lm_json())?;
     on_job(&lm_id);
     let lm_state = wait_for_job(port, &lm_id, lm_mark, &mut |_| on_stage("lm", "planning lyrics"))?;
@@ -1797,6 +1845,79 @@ mod tests {
     fn an_unfamiliar_plugin_set_still_yields_a_registered_solver() {
         let names = vec!["mine_v1".to_string(), "other_v2".to_string()];
         assert_eq!(choose_solver(&names), "mine_v1");
+    }
+
+    /// The keys the two engines actually read. Everything before this was
+    /// sent under one name and silently dropped by the other: acestep.cpp reads
+    /// `solver`, HOT-Step reads `infer_method`, and each ignores the key it does
+    /// not know. So the app could name a registered solver and HOT-Step would
+    /// still run its own default and crash on it.
+    #[test]
+    fn the_solver_is_sent_under_the_name_each_engine_reads() {
+        let p = GenerateParams {
+            caption: "test".to_string(),
+            solver: "md_confluence_v4".to_string(),
+            ..Default::default()
+        };
+        let v = p.to_lm_json();
+        assert_eq!(v["solver"], "md_confluence_v4", "acestep.cpp reads this");
+        assert_eq!(v["infer_method"], "md_confluence_v4", "HOT-Step reads this");
+    }
+
+    /// `guidance_mode` is the same trap one step later. HOT-Step defaults it to
+    /// "apg", which no plugin provides; its sampler looks "apg" up again as the
+    /// fallback and then dereferences whatever came back. Empty makes the
+    /// registry choose from the guidance plugins that do exist.
+    #[test]
+    fn guidance_defaults_to_the_registry_rather_than_the_engines_default() {
+        let p = GenerateParams {
+            caption: "test".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(p.guidance_mode, "");
+        assert_eq!(p.to_lm_json()["guidance_mode"], "");
+    }
+
+    /// The regression behind the live failure. Presets saved by an older build
+    /// carry `solver: "euler"` in their recorded parameters, so applying one
+    /// sends `euler` as a deliberate choice rather than as a default. Checking
+    /// only for emptiness let that straight through to the sampler, which
+    /// dereferences null on the next line and takes the render down.
+    #[test]
+    fn a_stale_preset_solver_is_replaced_rather_than_trusted() {
+        let names = hotstep_solvers();
+        assert!(
+            !names.iter().any(|n| n == "euler"),
+            "precondition: the engine has no euler"
+        );
+        let chosen = decide_solver(&names, "euler");
+        assert_ne!(chosen, "euler", "a name with no plugin must not be sent");
+        assert!(names.contains(&chosen), "the replacement must be registered");
+    }
+
+    /// A name the engine does have is still the user's choice and is respected.
+    /// Overriding a working choice would be its own bug.
+    #[test]
+    fn a_solver_the_engine_has_is_left_alone() {
+        let names = hotstep_solvers();
+        assert_eq!(decide_solver(&names, "storm"), "storm");
+        assert_eq!(decide_solver(&names, "md_vortex_v1"), "md_vortex_v1");
+        assert_eq!(decide_solver(&names, "  storm  "), "storm", "trimmed");
+    }
+
+    /// Anything else -- a typo, a preset from a different engine, a name a
+    /// plugin was renamed away from -- lands on something registered instead of
+    /// crashing the render.
+    #[test]
+    fn an_unknown_solver_lands_on_a_registered_one() {
+        let names = hotstep_solvers();
+        for bad in ["euler", "rk4", "heun", "dpm", "md_confluence_v3"] {
+            let chosen = decide_solver(&names, bad);
+            assert!(
+                names.contains(&chosen),
+                "{bad:?} resolved to {chosen:?}, which is not registered"
+            );
+        }
     }
 
     /// Ordering is stable: the same registry always renders the same way.
