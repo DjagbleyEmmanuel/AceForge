@@ -1,5 +1,4 @@
 pub mod annotations;
-pub mod audiocpp;
 pub mod covers;
 pub mod downloads;
 pub mod engines;
@@ -14,6 +13,7 @@ pub mod server;
 pub mod settings;
 pub mod user_presets;
 pub mod wav;
+pub mod yue2;
 pub mod wildcards;
 pub mod store;
 
@@ -35,10 +35,9 @@ struct StoreView {
 
 #[derive(Serialize)]
 struct SettingsView {
-    audiocpp_models_dir: String,
-    audiocpp_backend: String,
-    audiocpp_device: u32,
-    audiocpp_threads: u32,
+    hotstep_models_dir: String,
+    hotstep_adapters_dir: String,
+    hotstep_backend: String,
     vae_chunk: i32,
     max_seq: i32,
     models_dir: String,
@@ -59,10 +58,9 @@ fn get_settings() -> SettingsView {
         .filter(|v| !v.trim().is_empty());
 
     SettingsView {
-        audiocpp_models_dir: saved.audiocpp_models_dir,
-        audiocpp_backend: saved.audiocpp_backend,
-        audiocpp_device: saved.audiocpp_device,
-        audiocpp_threads: saved.audiocpp_threads,
+        hotstep_models_dir: saved.hotstep_models_dir,
+        hotstep_adapters_dir: saved.hotstep_adapters_dir,
+        hotstep_backend: saved.hotstep_backend,
         vae_chunk: saved.vae_chunk,
         max_seq: saved.max_seq,
         resolved_models_dir: settings::resolve_models_dir(None).display().to_string(),
@@ -256,23 +254,54 @@ fn reinstall_bundled_engine(app: tauri::AppHandle) -> Result<bool, String> {
     engines::reinstall_from(&bundled).map(|_| true)
 }
 
-/// Adopt the audio.cpp server shipped inside the app bundle. Unlike the
-/// ace-step runtime this one is large and optional, so an engine the user
-/// already installed is never overwritten.
+/// Adopt the HOT-Step CPP runtime shipped inside the app bundle.
+///
+/// It is a distinct engine from the bundled ace-step one even though both are
+/// called `ace-server`: different ggml (0.25.x against 0.26.x), different
+/// plugin system, forty more request fields. They get separate directories so
+/// neither can be loaded with the other's libraries.
 #[tauri::command]
-fn adopt_bundled_audiocpp(app: tauri::AppHandle) -> Result<bool, String> {
+fn adopt_bundled_hotstep(app: tauri::AppHandle) -> Result<bool, String> {
     use tauri::Manager;
     let Some(resource_dir) = app.path().resource_dir().ok() else {
         return Ok(false);
     };
-    if engines::binary_path(engines::EngineId::AudioCpp).is_some() {
+    if engines::binary_path(engines::EngineId::HotStep).is_some() {
         return Ok(false);
     }
-    let bundled = resource_dir.join("audiocpp");
-    if !bundled.join("audiocpp_server").is_file() {
+    let bundled = resource_dir.join("hotstep-runtime");
+    if !bundled.join("ace-server").is_file() {
         return Ok(false);
     }
-    engines::adopt_from(engines::EngineId::AudioCpp, &bundled).map(|_| true)
+    engines::adopt_from(engines::EngineId::HotStep, &bundled).map(|_| true)
+}
+
+/// What the YuE2 pipeline can currently do. The UI reads this to decide
+/// whether to show the YuE2 form at all: submitting without the weights is a
+/// 400 that says less than "download these two files".
+#[tauri::command]
+fn yue2_props(port: Option<u16>) -> Result<yue2::Yue2Props, String> {
+    let port = crate::server::running_port().ok_or_else(|| {
+        "the engine is not running, so YuE2 cannot report what it has".to_string()
+    })?;
+    yue2::props(port)
+}
+
+/// Compose or render through YuE2.
+///
+/// Async because it blocks on the job: a synchronous command holds the main
+/// thread, which freezes the window instead of showing progress.
+#[tauri::command]
+async fn yue2_render(
+    port: Option<u16>,
+    params: yue2::Yue2Params,
+) -> Result<yue2::Yue2Outcome, String> {
+    let port = crate::server::running_port().ok_or_else(|| {
+        "the engine is not running, so YuE2 has nothing to compose with".to_string()
+    })?;
+    tokio::task::spawn_blocking(move || yue2::render(port, &params, &mut |_, _| {}))
+        .await
+        .map_err(|e| format!("YuE2 worker stopped: {e}"))?
 }
 
 /// Validate an engine directory the user has extracted somewhere.
@@ -299,86 +328,9 @@ fn engines_dir() -> String {
     engines::install_dir().display().to_string()
 }
 
-/// Start audio.cpp against one or more model directories.
-/// Start audio.cpp. Must be async: `start` waits on `/health` for up to 90s,
-/// and a synchronous command blocks the main thread, which freezes the webview
-/// instead of showing a spinner.
-#[tauri::command]
-async fn audiocpp_start(
-    models: Vec<audiocpp::ModelEntry>,
-) -> Result<audiocpp::RuntimeStatus, String> {
-    tokio::task::spawn_blocking(move || audiocpp::start(&models))
-        .await
-        .map_err(|e| format!("start task failed: {e}"))?
-}
-
-/// What audio.cpp can currently see. Proves a directory was picked up.
-#[tauri::command]
-fn audiocpp_models() -> Result<Vec<audiocpp::ModelEntry>, String> {
-    audiocpp::list_models()
-}
-
-#[tauri::command]
-fn audiocpp_stop() {
-    audiocpp::stop();
-}
-
-/// Render on audio.cpp. Blocks for as long as the model takes, which on CPU is
-/// measured in minutes for a 3B model.
-#[tauri::command]
-async fn audiocpp_render(
-    app: tauri::AppHandle,
-    model: String,
-    params: audiocpp::YuE2Params,
-) -> Result<audiocpp::Rendered, String> {
-    use tauri::Emitter;
-    audiocpp::reset_cancel();
-    let progress = app.clone();
-    tokio::task::spawn_blocking(move || {
-        let _ = progress.emit("ac://stage", ("rendering", "this can take minutes on CPU"));
-        audiocpp::render(&model, &params)
-    })
-    .await
-    .map_err(|e| format!("render task failed: {e}"))?
-}
-
-/// The only way to stop a run: audio.cpp cannot be interrupted mid-render.
-#[tauri::command]
-fn audiocpp_cancel() {
-    audiocpp::cancel();
-}
-
-/// Identify a directory as an audio.cpp model, if it looks like one.
-#[tauri::command]
-fn audiocpp_probe(path: String) -> Vec<audiocpp::ModelEntry> {
-    audiocpp::probe_dir(std::path::Path::new(&path))
-}
 
 /// Everything a directory offers, without starting the runtime. This is what
 /// the picker renders from, so assigning a folder is enough to populate it.
-#[tauri::command]
-fn audiocpp_scan(path: String) -> audiocpp::ScanResult {
-    audiocpp::scan(std::path::Path::new(&path))
-}
-
-/// Backend, device and CPU thread count for the audio.cpp runtime.
-#[tauri::command]
-fn set_audiocpp_runtime(
-    backend: String,
-    device: u32,
-    threads: u32,
-) -> Result<SettingsView, String> {
-    let allowed = ["cpu", "cuda", "vulkan", "metal", "hip"];
-    if !allowed.contains(&backend.as_str()) {
-        return Err(format!("unknown backend {backend}"));
-    }
-    let mut current = settings::load();
-    current.audiocpp_backend = backend;
-    current.audiocpp_device = device;
-    current.audiocpp_threads = threads;
-    settings::save(&current)?;
-    Ok(get_settings())
-}
 
 /// Keys, tempos, languages and sampling presets for the Studio pickers.
 #[tauri::command]
@@ -542,9 +494,23 @@ fn preset_download_script(preset_id: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn start_server(app: tauri::AppHandle) -> Result<server::ServerStatus, String> {
+fn start_server(
+    app: tauri::AppHandle,
+    engine: Option<String>,
+) -> Result<server::ServerStatus, String> {
     let resource_dir = app.path().resource_dir().ok();
-    server::start(&settings::resolve_models_dir(None), resource_dir.as_deref())
+    let id = engine
+        .as_deref()
+        .and_then(engines::EngineId::parse)
+        .unwrap_or(engines::EngineId::AceStep);
+    // The two engines keep separate weight folders. See
+    // `resolve_hotstep_models_dir`.
+    let models = if id == engines::EngineId::HotStep {
+        settings::resolve_hotstep_models_dir()
+    } else {
+        settings::resolve_models_dir(None)
+    };
+    server::start(id, &models, resource_dir.as_deref())
 }
 
 /// Tile size the sidecar is launched with. Changing it needs a restart to
@@ -558,23 +524,6 @@ fn set_vae_chunk(chunk: i32) -> Result<SettingsView, String> {
 }
 
 /// LM KV cache size the sidecar launches with.
-/// Point audio.cpp at its own model directory.
-#[tauri::command]
-fn set_audiocpp_models_dir(path: String) -> Result<SettingsView, String> {
-    let mut current = settings::load();
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        current.audiocpp_models_dir = String::new();
-    } else {
-        let resolved = settings::normalize(trimmed)?;
-        std::fs::create_dir_all(&resolved)
-            .map_err(|e| format!("cannot create {}: {e}", resolved.display()))?;
-        current.audiocpp_models_dir = resolved.display().to_string();
-    }
-    settings::save(&current)?;
-    Ok(get_settings())
-}
-
 #[tauri::command]
 fn set_max_seq(value: i32) -> Result<SettingsView, String> {
     let mut current = settings::load();
@@ -841,6 +790,16 @@ fn list_covers() -> Vec<covers::CoverEntry> {
 /// only names `$APPDATA/**`, so a folder anywhere else is refused and renders
 /// as a broken thumbnail. Grant it at the moment it is chosen rather than
 /// waiting for a restart, or saving the setting appears to do nothing.
+/// Point the HOT-Step engine at a folder of weights. Empty clears the
+/// override, which returns it to the ACE-Step folder.
+#[tauri::command]
+fn set_hotstep_models_dir(path: String) -> Result<SettingsView, String> {
+    let mut current = settings::load();
+    current.hotstep_models_dir = path.trim().to_string();
+    settings::save(&current)?;
+    Ok(get_settings())
+}
+
 #[tauri::command]
 fn set_covers_dir(app: tauri::AppHandle, path: String) -> Result<SettingsView, String> {
     let trimmed = path.trim();
@@ -1223,23 +1182,16 @@ pub fn run() {
             set_models_dir,
             set_vae_chunk,
             set_max_seq,
-            set_audiocpp_models_dir,
             store_snapshot,
             music_reference,
             apply_sampling_preset,
-            audiocpp_start,
-            audiocpp_models,
-            audiocpp_stop,
-            audiocpp_render,
-            audiocpp_cancel,
-            audiocpp_probe,
-            audiocpp_scan,
-            set_audiocpp_runtime,
             list_engines,
             list_adapters,
             adopt_bundled_engine,
+            adopt_bundled_hotstep,
+            yue2_props,
+            yue2_render,
             reinstall_bundled_engine,
-            adopt_bundled_audiocpp,
             inspect_engine,
             install_engine,
             remove_engine,
@@ -1281,6 +1233,7 @@ pub fn run() {
             lyric_sync_cancel,
             list_covers,
             set_covers_dir,
+            set_hotstep_models_dir,
             lyric_timings,
             save_lyric_timings,
             track_notes,

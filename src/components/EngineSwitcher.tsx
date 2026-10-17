@@ -25,7 +25,7 @@ export function EngineSwitcher({ selected, onSelect, engines: list }: Props) {
   if (list.length === 0) {
     return (
       <div className="flex gap-2" aria-busy="true">
-        {["ACE-Step (acestep.cpp)", "audio.cpp"].map((name) => (
+        {["ACE-Step (acestep.cpp)", "HOT-Step CPP"].map((name) => (
           <div
             key={name}
             className="flex-1 animate-pulse rounded-xl border border-ink-800 bg-ink-900/40 px-3 py-2.5"

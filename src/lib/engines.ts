@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type EngineId = "acestep" | "audiocpp";
+export type EngineId = "acestep" | "hotstep";
 export type EngineKind = "asyncJobs" | "blockingRequest";
 
 export interface EngineFile {
@@ -32,7 +32,7 @@ export interface EngineInspection {
 export const engines = {
   list: () => invoke<Engine[]> ("list_engines"),
   adoptBundled: () => invoke<boolean>("adopt_bundled_engine"),
-  adoptBundledAudioCpp: () => invoke<boolean>("adopt_bundled_audiocpp"),
+  adoptBundledHotStep: () => invoke<boolean>("adopt_bundled_hotstep"),
   inspect: (path: string) => invoke<EngineInspection>("inspect_engine", { path }),
   install: (path: string) => invoke<string>("install_engine", { path }),
   remove: (id: string) => invoke<null>("remove_engine", { id }),
@@ -57,8 +57,8 @@ export function formatBytes(bytes: number | undefined | null): string {
   return `${value.toFixed(d)} ${units[unit]}`;
 }
 
-/** Engines differ in a way the UI has to respect rather than hide: one can be
- *  cancelled and polled, the other blocks for the whole render. */
+/** How an engine reports a run. Both bundled engines poll and can be
+ *  cancelled; a hand-installed third-party engine may not. */
 export function engineCapability(kind: EngineKind): string {
   return kind === "asyncJobs"
     ? "polls progress and can be cancelled"

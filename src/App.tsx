@@ -1,4 +1,4 @@
-import { AudioCppPanel } from "./components/AudioCppPanel";
+import { HotStepPanel } from "./components/HotStepPanel";
 import { EngineSwitcher } from "./components/EngineSwitcher";
 import { GeneratePanel } from "./components/GeneratePanel";
 import { queue as queueApi, type GenerateParams } from "./lib/api";
@@ -192,13 +192,44 @@ export default function App() {
               />
             )}
 
-            {app.engine === "audiocpp" && (
-              <AudioCppPanel
-                modelDir={app.settingsView?.audiocpp_models_dir ?? ""}
-                busy={app.busy}
-                onSaveDir={app.saveAudioCppDir}
-                onRendered={() => app.refreshLibrary()}
-              />
+            {app.engine === "hotstep" && (
+              <HotStepPanel
+                port={app.port}
+                running={running}
+                params={app.params}
+                setParams={app.setParams}
+                modelsDir={app.settingsView?.hotstep_models_dir ?? ""}
+                onSaveDir={app.saveHotStepDir}
+                onGenerated={() => app.refreshLibrary()}
+              >
+                <GeneratePanel
+                  port={app.port}
+                  running={running}
+                  catalog={app.snapshot?.files ?? []}
+                  params={app.params}
+                  setParams={app.setParams}
+                  onBrowseModels={() => app.setView("models")}
+                  tracks={app.tracks}
+                  onStemLayer={(stem, sourcePath) => {
+                    app.setParams((p: GenerateParams) => ({
+                      ...p,
+                      taskType: "lego",
+                      track: stem,
+                      sourceAudio: sourcePath,
+                    }));
+                  }}
+                  onBuildSection={(o) => {
+                    void queueApi.add({
+                      ...app.params,
+                      taskType: "repaint",
+                      sourceAudio: o.sourcePath,
+                      repaintingStart: o.startSecs,
+                      repaintingEnd: o.startSecs + o.lengthSecs,
+                      seed: o.seed,
+                    });
+                  }}
+                />
+              </HotStepPanel>
             )}
 
             {/* The queue is shared by both engines, so it sits outside the

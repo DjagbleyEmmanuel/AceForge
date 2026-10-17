@@ -50,15 +50,25 @@ fn reap_finished() {
 
 /// Locate the bundled sidecar. The `resource_dir` is handed in by the command
 /// layer because Tauri v2 has no ambient app handle to query here.
-pub fn bundled_server_path(resource_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+pub fn bundled_server_path(
+    resource_dir: Option<&std::path::Path>,
+    hot: bool,
+) -> Option<PathBuf> {
     let dir = resource_dir?;
-    let bundled = dir.join("aceforge-runtime").join("ace-server");
+    // Two runtimes are bundled, both shipping a file called `ace-server`. Picking
+    // the wrong one loads the wrong ggml against the wrong libraries.
+    let name = if hot {
+        "hotstep-runtime"
+    } else {
+        "aceforge-runtime"
+    };
+    let bundled = dir.join(name).join("ace-server");
     bundled.is_file().then_some(bundled)
 }
 
 /// Dev fallback: look for an `ace-server*` near the executable or in a build
 /// tree. Ignored once the app is packaged.
-fn dev_server_path() -> Option<PathBuf> {
+fn dev_server_path(_hot: bool) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut dir = exe.parent()?.to_path_buf();
     for _ in 0..3 {
@@ -104,22 +114,31 @@ fn free_port() -> u16 {
         .unwrap_or(8085)
 }
 
-/// Start the server against `models_dir`, returning once `/health` answers.
+/// Start `engine` against `models_dir`, returning once `/health` answers.
+///
+/// The two engines share a binary name and an HTTP surface, so which one is
+/// being launched is the only thing that distinguishes a run. Getting it wrong
+/// shows up as unknown request fields being ignored, which looks like the
+/// parameter having no effect rather than like the wrong engine.
 pub fn start(
+    engine: crate::engines::EngineId,
     models_dir: &std::path::Path,
     resource_dir: Option<&std::path::Path>,
 ) -> Result<ServerStatus, String> {
     reap_finished();
+    let hot = engine == crate::engines::EngineId::HotStep;
 
-    // Resolution order: explicit override, then the engine registry (which is
-    // where an installed engine lives), then the bundled resource, then a dev
-    // build tree.
-    let program = std::env::var(SERVER_ENV)
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| crate::engines::binary_path(crate::engines::EngineId::AceStep))
-        .or_else(|| bundled_server_path(resource_dir))
-        .or_else(dev_server_path)
+    // Resolution order: explicit override (the ACE-Step engine only, since it
+    // is the one a developer is likely to have built by hand), then the engine
+    // registry, then the bundled resource, then a dev build tree.
+    let program = if hot {
+        None
+    } else {
+        std::env::var(SERVER_ENV).map(PathBuf::from).ok()
+    }
+        .or_else(|| crate::engines::binary_path(engine))
+        .or_else(|| bundled_server_path(resource_dir, hot))
+        .or_else(|| dev_server_path(hot))
         .ok_or_else(|| {
             format!("ace-server not found. Set {SERVER_ENV}=/path/to/ace-server")
         })?;
@@ -164,7 +183,7 @@ pub fn start(
         // missing directory on every start. Layout matches `registry_scan_adapters`:
         // `*.safetensors` files, or subdirectories holding
         // `adapter_model.safetensors`.
-        .args(adapter_args(models_dir))
+        .args(adapter_args(models_dir, hot))
         .stdout(Stdio::null())
         // Keep the diagnostics. The backend explains model-not-found and OOM
         // failures on stderr, and discarding them turns every failure into an
@@ -216,8 +235,15 @@ pub fn adapters_dir(models_dir: &Path) -> PathBuf {
 }
 
 /// `--adapters <dir>`, but only when there is something in it.
-fn adapter_args(models_dir: &Path) -> Vec<std::ffi::OsString> {
-    let dir = adapters_dir(models_dir);
+fn adapter_args(models_dir: &Path, hot: bool) -> Vec<std::ffi::OsString> {
+    // HOT-Step keeps adapters in its own setting, because it also accepts
+    // rank-suffixed LoKr files the ACE-Step layout does not describe.
+    let dir = if hot {
+        crate::settings::resolve_hotstep_adapters_dir()
+            .unwrap_or_else(|| adapters_dir(models_dir))
+    } else {
+        adapters_dir(models_dir)
+    };
     let has_entries = std::fs::read_dir(&dir)
         .map(|mut e| e.any(|entry| {
             entry

@@ -53,6 +53,18 @@ export const GENERATE_DEFAULTS: GenerateParams = {
   adapter: "",
   adapterScale: 1.0,
   track: "",
+  // HOT-Step CPP extras. Left at their neutral values so a render on the
+  // bundled engine is byte-identical to one from before they existed.
+  negativePrompt: "",
+  vae: "",
+  ppVaeReencode: false,
+  lmAdapter: "",
+  lmAdapterScale: 1.0,
+  postprocessPlugin: "",
+  lmCfgCutoffRatio: 1.0,
+  customTimesteps: "",
+  mp3Bitrate: 128,
+  ditSlidingWindow: -1,
 };
 
 export function useApp() {
@@ -127,9 +139,9 @@ export function useApp() {
       }
       try {
         await enginesApi.adoptBundled();
-        // audio.cpp ships in the bundle too; adopting it is a no-op once the
-        // user has their own copy installed.
-        await enginesApi.adoptBundledAudioCpp();
+        // HOT-Step ships in the bundle too. Adopting is a no-op once the user
+        // has their own copy of that engine installed.
+        await enginesApi.adoptBundledHotStep();
       } catch {
         // Adoption failing must not block the app: the engine list below still
         // reports whatever is installed.
@@ -194,10 +206,13 @@ export function useApp() {
   }, [settingsView]);
 
   const startServer = useCallback(async () => {
+    // The engine is passed explicitly: both engines ship a binary called
+    // `ace-server`, so starting "the server" without saying which one picks
+    // whichever is resolved first.
     setBusy(true);
     setError(null);
     try {
-      const next = await serverApi.start();
+      const next = await serverApi.start(engine);
       setStatus(next);
       setPort(await serverApi.port());
       if (!next.ready) {
@@ -209,7 +224,7 @@ export function useApp() {
     } finally {
       setBusy(false);
     }
-  }, [reload]);
+  }, [engine, reload]);
 
   const stopServer = useCallback(async () => {
     setBusy(true);
@@ -238,12 +253,12 @@ export function useApp() {
     }
   }, []);
 
-  const saveAudioCppDir = useCallback(async (path: string) => {
+  const saveHotStepDir = useCallback(async (path: string) => {
     setBusy(true);
     setError(null);
     try {
-      setSettingsView(await settings.setAudioCppModelsDir(path));
-      setToast("audio.cpp models folder saved");
+      setSettingsView(await settings.setHotStepModelsDir(path));
+      setToast("HOT-Step models folder saved");
     } catch (e) {
       setError(String(e));
       throw e;
@@ -365,7 +380,7 @@ export function useApp() {
     stopServer,
     saveModelsDir,
     saveVaeChunk,
-    saveAudioCppDir,
+    saveHotStepDir,
     saveMaxSeq,
     handleGenerated,
     generateApi,

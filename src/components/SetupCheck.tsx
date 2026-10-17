@@ -48,7 +48,7 @@ export function SetupCheck({ engines, running, snapshot, modelsDir }: Props) {
     const out: Check[] = [];
 
     const acestep = engines.find((e) => e.id === "acestep");
-    const audioCpp = engines.find((e) => e.id === "audiocpp");
+    const hotstep = engines.find((e) => e.id === "hotstep");
 
     out.push(
       acestep?.installed
@@ -62,16 +62,16 @@ export function SetupCheck({ engines, running, snapshot, modelsDir }: Props) {
     );
 
     out.push(
-      audioCpp?.installed
+      hotstep?.installed
         ? {
-            label: "audio.cpp engine",
+            label: "HOT-Step CPP engine",
             detail: "installed",
             state: "ok",
             blocks: false,
           }
         : {
-            label: "audio.cpp engine",
-            detail: "not installed — optional, for YuE2",
+            label: "HOT-Step CPP engine",
+            detail: "not installed — it ships with the app",
             state: "info",
             blocks: false,
           },

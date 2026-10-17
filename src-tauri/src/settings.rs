@@ -22,18 +22,23 @@ pub struct Settings {
     /// buffer on a 4 GB card at 8192 and the server dies with OOM.
     #[serde(default = "default_max_seq")]
     pub max_seq: i32,
-    /// audio.cpp models live somewhere else entirely: one fused GGUF per
-    /// family plus sidecar configs, which acestep.cpp's four-file layout is not.
+    /// Weights for the HOT-Step CPP engine.
+    ///
+    /// Deliberately separate from `models_dir`: the two engines do not agree on
+    /// a file layout, and sharing one folder means each engine loads the other's
+    /// weights and fails in a way that looks like a broken model rather than a
+    /// wrong folder. Empty means the default location, which reuses the ACE-Step
+    /// folder when it exists so a single set of weights serves both.
     #[serde(default)]
-    pub audiocpp_models_dir: String,
-    /// audio.cpp backend: cpu, cuda, vulkan, metal, hip.
-    #[serde(default = "default_ac_backend")]
-    pub audiocpp_backend: String,
+    pub hotstep_models_dir: String,
+    /// LoRA/LoKr adapters for the HOT-Step engine, scanned at start-up.
     #[serde(default)]
-    pub audiocpp_device: u32,
-    /// CPU threads. 0 means let audio.cpp decide.
-    #[serde(default)]
-    pub audiocpp_threads: u32,
+    pub hotstep_adapters_dir: String,
+    /// Which HOT-Step backend to drive. The engine picks the pipeline from the
+    /// weights present, so this is a preference about which to load first, not
+    /// a switch that enables something.
+    #[serde(default = "default_hotstep_backend")]
+    pub hotstep_backend: String,
     /// Where finished songs and imported audio live. Empty means the default
     /// app-data library.
     ///
@@ -49,10 +54,11 @@ pub struct Settings {
     pub covers_dir: String,
 }
 
-fn default_ac_backend() -> String {
-    // CUDA initialises fine here but a 3B model does not fit in 4 GB, and a
-    // failed allocation is worse than a slow render.
-    "cpu".to_string()
+fn default_hotstep_backend() -> String {
+    // HOT-Step picks the pipeline from the weights it finds. ACE-Step is the
+    // one whose weights are already on this machine, so it is the useful
+    // default; the others light up once their models are downloaded.
+    "acestep".to_string()
 }
 
 fn default_max_seq() -> i32 {
@@ -72,10 +78,9 @@ impl Default for Settings {
             autostart_server: false,
             vae_chunk: default_vae_chunk(),
             max_seq: default_max_seq(),
-            audiocpp_models_dir: String::new(),
-            audiocpp_backend: default_ac_backend(),
-            audiocpp_device: 0,
-            audiocpp_threads: 0,
+            hotstep_models_dir: String::new(),
+            hotstep_adapters_dir: String::new(),
+            hotstep_backend: default_hotstep_backend(),
             library_dir: String::new(),
             covers_dir: String::new(),
         }
@@ -110,6 +115,37 @@ pub fn save(settings: &Settings) -> Result<(), String> {
 ///    pointed at a scratch dir without editing config.
 /// 2. The saved setting, if the user picked one.
 /// 3. The default under the user's data dir.
+/// Weights folder for the HOT-Step engine.
+///
+/// Falls back to the ACE-Step folder rather than a directory of its own: both
+/// engines read the same `acestep-*` GGUFs for the ACE-Step backend, and
+/// asking someone to point a second setting at the folder they already filled
+/// in would only invite the two to disagree.
+pub fn resolve_hotstep_models_dir() -> PathBuf {
+    let saved = load().hotstep_models_dir;
+    if !saved.trim().is_empty() {
+        return PathBuf::from(saved);
+    }
+    std::env::var("ACEFORGE_HOTSTEP_MODELS_DIR")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resolve_models_dir(None))
+}
+
+/// Adapters for the HOT-Step engine, which ships Lua solver, scheduler,
+/// guidance and postprocess plugins alongside the weights.
+pub fn resolve_hotstep_adapters_dir() -> Option<PathBuf> {
+    let saved = load().hotstep_adapters_dir;
+    if !saved.trim().is_empty() {
+        return Some(PathBuf::from(saved));
+    }
+    // Only passed when it exists: the engine scans the directory eagerly and
+    // logs a miss on every start otherwise.
+    let guess = resolve_hotstep_models_dir().join("adapters");
+    guess.is_dir().then_some(guess)
+}
+
 pub fn resolve_models_dir(override_dir: Option<String>) -> PathBuf {
     override_dir
         .filter(|d| !d.trim().is_empty())

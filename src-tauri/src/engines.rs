@@ -4,10 +4,14 @@
 //!
 //! * `acestep` — `ace-server`. Async job queue: submit returns an id, the
 //!   client polls, and a job can be cancelled.
-//! * `audiocpp` — `audiocpp_server`. `POST /v1/tasks/run` blocks for the whole
-//!   render and there is no cancellation: a wedged GPU call cannot be
-//!   interrupted from userspace. Upstream documents music generation as taking
-//!   minutes, so its busy timeout has to be raised well past the 5 minute
+//! * `hotstep` — `ace-server`, from HOT-Step CPP. A further-developed fork of
+//!   the same codebase: same binary name, same HTTP surface, a different ggml
+//!   and forty more request fields. Kept in its own directory for that reason.
+//!
+//! A third-party engine that blocks for the whole render has no cancellation: a
+//! wedged GPU call cannot be interrupted from userspace. Upstream documents
+//! music generation as taking minutes, so its busy timeout has to be raised well
+//! past the 5 minute
 //!   default.
 //!
 //! Engines are installed as directories under `engines/<id>/`, each with a
@@ -20,27 +24,27 @@ use std::path::{Path, PathBuf};
 
 /// Serde names are explicit, and deliberately match `as_str()` and the
 /// TypeScript union. Deriving camelCase produced "aceStep"/"audioCpp", which
-/// silently failed every frontend comparison against "acestep"/"audiocpp".
+/// silently failed every frontend comparison against "acestep"/"hotstep".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EngineId {
     #[serde(rename = "acestep")]
     AceStep,
-    #[serde(rename = "audiocpp")]
-    AudioCpp,
+    #[serde(rename = "hotstep")]
+    HotStep,
 }
 
 impl EngineId {
     pub fn as_str(self) -> &'static str {
         match self {
             EngineId::AceStep => "acestep",
-            EngineId::AudioCpp => "audiocpp",
+            EngineId::HotStep => "hotstep",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "acestep" => Some(EngineId::AceStep),
-            "audiocpp" => Some(EngineId::AudioCpp),
+            "hotstep" => Some(EngineId::HotStep),
             _ => None,
         }
     }
@@ -131,7 +135,7 @@ fn describe(id: EngineId, binary_name: &str, families: &[&str], notes: &str) -> 
             "ACE-Step (acestep.cpp)",
             EngineKind::AsyncJobs,
         ),
-        EngineId::AudioCpp => ("audio.cpp", EngineKind::BlockingRequest),
+        EngineId::HotStep => ("HOT-Step CPP", EngineKind::AsyncJobs),
     };
     let dir = engines_dir().join(id.as_str());
     let manifest: Option<Manifest> = std::fs::read_to_string(dir.join("manifest.json"))
@@ -183,16 +187,17 @@ pub fn list() -> Vec<Engine> {
              Supports text2music only in this app so far.",
         ),
         describe(
-            EngineId::AudioCpp,
-            "audiocpp_server",
+            EngineId::HotStep,
+            "ace-server",
             &[
-                "YuE2 (optional ABC score conditioning)",
-                "HeartMuLa",
-                "Stable Audio 3",
-                "MiDashengLM-Gen",
+                "ACE-Step 1.5 (turbo, SFT, XL, plus PP-VAE and ScragVAE decoders)",
+                "MiniMax-Music3",
+                "YuE2 (AR composer plus NAR renderer, own adapter slots)",
             ],
-            "One blocking request per render, so there is no progress to show \
-             and no cancel. Reaches music families ACE-Step does not cover.",
+            "A further-developed acestep.cpp. Same HTTP surface as the bundled \
+             engine, so progress and cancel work exactly as they do there, but \
+             it carries extra solvers, schedulers, guidance modes, adapters and \
+             about forty more request fields. Needs its own models folder.",
         ),
     ]
 }
@@ -249,7 +254,7 @@ pub fn inspect(candidate: &Path) -> Inspection {
     let id = EngineId::parse(&manifest.id);
     if id.is_none() {
         problems.push(format!(
-            "unknown engine id {:?}: expected \"acestep\" or \"audiocpp\"",
+            "unknown engine id {:?}: expected \"acestep\" or \"hotstep\"",
             manifest.id
         ));
     }
@@ -371,7 +376,10 @@ fn should_refresh(id: EngineId, source: &Path) -> bool {
     let Some(installed) = manifest.source_hash else {
         return false;
     };
-    let Some(bundled) = hash_binary(&source.join("ace-server")) else {
+    let binary_name = match id {
+        EngineId::AceStep | EngineId::HotStep => "ace-server",
+    };
+    let Some(bundled) = hash_binary(&source.join(binary_name)) else {
         return false;
     };
     if installed == bundled {
@@ -428,7 +436,10 @@ pub fn adopt_from(id: EngineId, source: &Path) -> Result<(), String> {
     // another.
     let (binary_name, label) = match id {
         EngineId::AceStep => ("ace-server", "ACE-Step (acestep.cpp)"),
-        EngineId::AudioCpp => ("audiocpp_server", "audio.cpp"),
+        // Same binary name as the other engine on purpose: HOT-Step ships an
+        // `ace-server` too, and the manifest plus the destination directory are
+        // what keep the two apart.
+        EngineId::HotStep => ("ace-server", "HOT-Step CPP"),
     };
     let manifest = serde_json::json!({
         "id": id.as_str(),
@@ -541,7 +552,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Left at the default 0644.
         std::fs::write(dir.join("server"), b"x").unwrap();
-        std::fs::write(dir.join("manifest.json"), manifest("audiocpp", "server", &[])).unwrap();
+        std::fs::write(dir.join("manifest.json"), manifest("hotstep", "server", &[])).unwrap();
         let report = inspect(&dir);
         assert!(!report.ok);
         assert!(
@@ -558,7 +569,7 @@ mod tests {
         std::fs::write(dir.join("server"), b"x").unwrap();
         std::fs::write(
             dir.join("manifest.json"),
-            manifest("audiocpp", "server", &["libggml-cuda.so"]),
+            manifest("hotstep", "server", &["libggml-cuda.so"]),
         )
         .unwrap();
         let report = inspect(&dir);
@@ -583,7 +594,7 @@ mod tests {
         }
         std::fs::write(
             dir.join("manifest.json"),
-            manifest("audiocpp", "server", &["model_specs"]),
+            manifest("hotstep", "server", &["model_specs"]),
         )
         .unwrap();
         let report = inspect(&dir);

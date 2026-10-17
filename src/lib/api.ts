@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { EngineId } from "./engines";
 import { listen } from "@tauri-apps/api/event";
 import type {
   Layer,
@@ -66,14 +67,15 @@ export const settings = {
     invoke<SettingsView>("set_vae_chunk", { chunk }),
   setMaxSeq: (value: number) =>
     invoke<SettingsView>("set_max_seq", { value }),
-  setAudioCppModelsDir: (path: string) =>
-    invoke<SettingsView>("set_audiocpp_models_dir", { path }),
+  setHotStepModelsDir: (path: string) =>
+    invoke<SettingsView>("set_hotstep_models_dir", { path }),
   setLibraryDir: (path: string) =>
     invoke<SettingsView>("set_library_dir", { path }),
 };
 
 export const server = {
-  start: () => invoke<ServerStatus>("start_server"),
+  start: (engine?: EngineId) =>
+    invoke<ServerStatus>("start_server", { engine: engine ?? null }),
   stop: () => invoke<number>("stop_server"),
   port: () => invoke<number | null>("server_port"),
   /** Whole log, oldest first. */
@@ -88,7 +90,9 @@ export const server = {
 /** camelCase: Rust's SettingsView uses rename_all = "camelCase". A mismatched
  *  key deserialises as undefined rather than erroring. */
 export interface SettingsView {
-  audiocpp_models_dir: string;
+  hotstep_models_dir: string;
+  hotstep_adapters_dir: string;
+  hotstep_backend: string;
   vae_chunk: number;
   max_seq: number;
   models_dir: string;
@@ -156,6 +160,27 @@ export interface GenerateParams {
   /** Which stem to generate, for lego / extract / complete. Becomes the DiT
    *  instruction: "Generate the {track} track based on the audio context:". */
   track: string;
+  // ---- HOT-Step CPP only -------------------------------------------------
+  // Ignored by the bundled engine, which reads request fields one at a time.
+  /** Encoded as the unconditional branch: how to steer away from a sound. */
+  negativePrompt: string;
+  /** Which VAE decodes the latents. Empty keeps the loaded one. HOT-Step also
+   *  ships a fine-tuned ScragVAE and an optional PP-VAE cleanup pass. */
+  vae: string;
+  /** Second autoencoder pass over the finished audio, to take fizz off. */
+  ppVaeReencode: boolean;
+  /** The planner LM's own adapter slot, separate from the DiT one. */
+  lmAdapter: string;
+  lmAdapterScale: number;
+  /** One of HOT-Step's shipped Lua postprocess plugins, by name. */
+  postprocessPlugin: string;
+  /** Fraction of the sequence CFG applies to. 1 = all of it. */
+  lmCfgCutoffRatio: number;
+  /** Comma separated timestep schedule, replacing the solver's own. */
+  customTimesteps: string;
+  mp3Bitrate: number;
+  /** -1 keeps the model's own window length. */
+  ditSlidingWindow: number;
 }
 
 export interface Track {

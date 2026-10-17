@@ -150,6 +150,45 @@ pub struct GenerateParams {
     /// Ignored by text2music, cover and repaint.
     #[serde(default)]
     pub track: String,
+
+    // ---- HOT-Step CPP only --------------------------------------------
+    // The bundled acestep.cpp build ignores request fields it does not know,
+    // so these are always safe to send. They reach the sampler only when
+    // HOT-Step is the running engine, which is what makes them worth carrying
+    // on one struct rather than maintaining a second parameter set.
+
+    /// Encoded as the unconditional branch when set, which is how the planner is
+    /// steered away from a sound rather than merely given a caption.
+    #[serde(default)]
+    pub negative_prompt: String,
+    /// Which VAE decodes the latents: empty keeps the loaded one. HOT-Step also
+    /// ships a fine-tuned ScragVAE and a PP-VAE cleanup pass.
+    #[serde(default)]
+    pub vae: String,
+    /// Run a second autoencoder pass over the audio to take the fizz off.
+    #[serde(default)]
+    pub pp_vae_reencode: bool,
+    /// One of HOT-Step's shipped Lua postprocess plugins, by name.
+    #[serde(default)]
+    pub postprocess_plugin: String,
+    /// Fraction of the sequence CFG applies to. 1.0 is all of it.
+    #[serde(default = "one_f32")]
+    pub lm_cfg_cutoff_ratio: f32,
+    /// A comma separated timestep schedule, replacing the solver's own.
+    #[serde(default)]
+    pub custom_timesteps: String,
+    #[serde(default = "default_mp3_bitrate")]
+    pub mp3_bitrate: i32,
+    /// -1 keeps the model's own window length.
+    #[serde(default = "minus_one_i32")]
+    pub dit_sliding_window: i32,
+    /// A second adapter slot for the planner LM, separate from the DiT one.
+    /// HOT-Step keeps the two apart because they are applied at different
+    /// depths of a different model.
+    #[serde(default)]
+    pub lm_adapter: String,
+    #[serde(default = "one_f32")]
+    pub lm_adapter_scale: f32,
 }
 
 fn default_lm_temperature() -> f32 {
@@ -168,11 +207,17 @@ fn yes() -> bool {
 fn default_solver() -> String {
     "euler".to_string()
 }
+fn default_mp3_bitrate() -> i32 {
+    128
+}
 fn default_task_type() -> String {
     "text2music".to_string()
 }
 fn minus_one_f32() -> f32 {
     -1.0
+}
+fn minus_one_i32() -> i32 {
+    -1
 }
 fn one_f32() -> f32 {
     1.0
@@ -232,6 +277,16 @@ impl Default for GenerateParams {
             adapter: String::new(),
             adapter_scale: one_f32(),
             track: String::new(),
+            negative_prompt: String::new(),
+            vae: String::new(),
+            pp_vae_reencode: false,
+            lm_adapter: String::new(),
+            lm_adapter_scale: one_f32(),
+            postprocess_plugin: String::new(),
+            lm_cfg_cutoff_ratio: one_f32(),
+            custom_timesteps: String::new(),
+            mp3_bitrate: default_mp3_bitrate(),
+            dit_sliding_window: minus_one_i32(),
         }
     }
 }
@@ -296,6 +351,14 @@ impl GenerateParams {
             "repainting_start": self.repainting_start,
             "repainting_end": self.repainting_end,
             "audio_cover_strength": self.audio_cover_strength,
+            // HOT-Step CPP planner-side extras. The bundled engine reads request
+            // fields one at a time and ignores what it lacks, so these are inert
+            // there rather than an error. `adapter` is deliberately absent: it
+            // belongs to the DiT and rides in the synth payload below.
+            "negative_prompt": self.negative_prompt,
+            "lm_cfg_cutoff_ratio": self.lm_cfg_cutoff_ratio,
+            "lm_adapter": self.lm_adapter,
+            "lm_adapter_scale": self.lm_adapter_scale,
         })
     }
 }
@@ -329,7 +392,7 @@ pub struct GenerateOutcome {
 
 use crate::paths::library_dir;
 
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -337,6 +400,14 @@ fn now_secs() -> u64 {
 }
 
 /// POST and read back the job id.
+/// Submit a JSON body to any engine path and return the job id.
+///
+/// Public because the YuE2 route lives on the same server but is not part of the
+/// two-stage ACE-Step flow.
+pub fn submit_json(port: u16, path: &str, body: serde_json::Value) -> Result<String, String> {
+    submit(port, path, body)
+}
+
 fn submit(port: u16, path: &str, body: serde_json::Value) -> Result<String, String> {
     let url = format!("http://127.0.0.1:{port}{path}");
     let response = ureq::post(&url)
@@ -900,7 +971,20 @@ pub fn generate(
     let adapter = params.adapter.trim();
     let track = params.track.trim();
     let codes = params.audio_codes.trim();
-    let requests = if codes.is_empty() && adapter.is_empty() && track.is_empty() {
+    // HOT-Step's decoder and solver extras are DiT-side, so they belong here for
+    // the same reason `adapter` does: the planner has no use for them.
+    let vae = params.vae.trim();
+    let postprocess = params.postprocess_plugin.trim();
+    let timesteps = params.custom_timesteps.trim();
+    let needs_dit_extras =
+        params.pp_vae_reencode || !vae.is_empty() || !postprocess.is_empty()
+            || !timesteps.is_empty() || params.mp3_bitrate != default_mp3_bitrate()
+            || params.dit_sliding_window != minus_one_i32();
+    let requests = if codes.is_empty()
+        && adapter.is_empty()
+        && track.is_empty()
+        && !needs_dit_extras
+    {
         requests
     } else {
         let mut out = Vec::with_capacity(requests.len());
@@ -917,6 +1001,27 @@ pub fn generate(
                 }
                 if !track.is_empty() {
                     obj.insert("track".into(), track.into());
+                }
+                if !vae.is_empty() {
+                    obj.insert("vae".into(), vae.into());
+                }
+                if params.pp_vae_reencode {
+                    obj.insert("pp_vae_reencode".into(), true.into());
+                }
+                if !postprocess.is_empty() {
+                    obj.insert("postprocess_plugin".into(), postprocess.into());
+                }
+                if !timesteps.is_empty() {
+                    obj.insert("custom_timesteps".into(), timesteps.into());
+                }
+                if params.mp3_bitrate != default_mp3_bitrate() {
+                    obj.insert("mp3_bitrate".into(), params.mp3_bitrate.into());
+                }
+                if params.dit_sliding_window != minus_one_i32() {
+                    obj.insert(
+                        "dit_sliding_window".into(),
+                        params.dit_sliding_window.into(),
+                    );
                 }
             }
             out.push(r);
@@ -1044,7 +1149,8 @@ fn metadata_path(track: &Track) -> PathBuf {
     p
 }
 
-fn write_metadata(track: &Track) {
+/// Also used by the YuE2 path, which writes its own tracks into the same library.
+pub fn write_metadata(track: &Track) {
     if let Ok(text) = serde_json::to_string_pretty(track) {
         let _ = std::fs::write(metadata_path(track), text);
     }
@@ -1341,6 +1447,28 @@ mod tests {
         let v = p.to_lm_json();
         assert!(v.get("adapter").is_none(), "adapter is a DiT setting: {v}");
         assert!(v.get("adapter_scale").is_none(), "{v}");
+    }
+
+    /// The HOT-Step extras are split across the two payloads by which model
+    /// they configure. Sending the decoder choice to the planner would be
+    /// ignored, which reads as "the VAE selector does nothing".
+    #[test]
+    fn hotstep_extras_land_on_the_side_that_uses_them() {
+        let p = GenerateParams {
+            caption: "test".to_string(),
+            negative_prompt: "no drums".to_string(),
+            vae: "scragvae".to_string(),
+            lm_adapter: "planner-lora".to_string(),
+            postprocess_plugin: "declick".to_string(),
+            ..Default::default()
+        };
+        let lm = p.to_lm_json();
+        for planner_side in ["negative_prompt", "lm_adapter", "lm_adapter_scale", "lm_cfg_cutoff_ratio"] {
+            assert!(lm.get(planner_side).is_some(), "{planner_side} is a planner field");
+        }
+        for dit_side in ["vae", "pp_vae_reencode", "postprocess_plugin", "custom_timesteps", "mp3_bitrate"] {
+            assert!(lm.get(dit_side).is_none(), "{dit_side} must not ride in the planner payload");
+        }
     }
 
     /// `track` is the stem name and drives the DiT instruction for lego,
