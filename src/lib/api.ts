@@ -85,6 +85,11 @@ export const server = {
   /** Only what was written since `cursor`. Empty when idle. */
   logsSince: (cursor: number, limit?: number) =>
     invoke<string[]>("server_logs_since", { cursor, limit }),
+  /** Empty the log. Answers with the new cursor, which is always 0. */
+  clearLogs: () => invoke<number>("server_clear_logs"),
+  /** Solver names the engine will accept. Empty unless it serves `/plugins`,
+   *  which is the bundled engine's way of saying it only wants `euler`. */
+  solvers: (port: number | null) => invoke<string[]>("engine_solvers", { port }),
 };
 
 /** camelCase: Rust's SettingsView uses rename_all = "camelCase". A mismatched
@@ -315,6 +320,7 @@ export const queue = {
   retry: (jobId: string) => invoke<QueuedJob>("queue_retry", { jobId }),
   discard: (jobId: string) => invoke<null>("queue_discard", { jobId }),
   clearDone: () => invoke<null>("queue_clear_done"),
+  clearFailed: () => invoke<null>("queue_clear_failed"),
   reset: () => invoke<null>("queue_reset"),
   onChanged: (handler: () => void) =>
     listen("queue://changed", () => handler()),

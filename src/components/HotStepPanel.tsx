@@ -1,7 +1,9 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { GenerateParams } from "../lib/api";
+import { server } from "../lib/api";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useYue2Props, YUE2_DEFAULTS, type Yue2Params } from "../lib/yue2";
+import { Select } from "./Select";
 import { Yue2Panel } from "./Yue2Panel";
 
 interface Props {
@@ -46,6 +48,31 @@ export function HotStepPanel({
   // opened, rather than after someone has filled the style box in.
   const { props: yue2Props } = useYue2Props(port, true);
   const yue2Ready = !!yue2Props?.available;
+
+  /** Solvers this engine will actually run, asked of the engine rather than
+   *  hardcoded. HOT-Step resolves the name out of its Lua plugin registry, and
+   *  a name it does not have is fatal: it logs "unknown solver", falls back to
+   *  `euler`, misses again, and dereferences the null. Its own default is that
+   *  same missing name, which is why the list is shown instead of trusted. */
+  const [solvers, setSolvers] = useState<string[]>([]);
+  useEffect(() => {
+    let alive = true;
+    if (!port) {
+      setSolvers([]);
+      return;
+    }
+    void server
+      .solvers(port)
+      .then((names) => {
+        if (alive) setSolvers(names);
+      })
+      .catch(() => {
+        /* The engine may be mid-restart; the next mount asks again. */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [port]);
 
   const browse = useCallback(async () => {
     setBusy(true);
@@ -245,17 +272,38 @@ export function HotStepPanel({
               </div>
             </div>
 
-            <div>
-              <label className="label" htmlFor="hs-timesteps">
-                Custom timesteps
-              </label>
-              <input
-                id="hs-timesteps"
-                value={params.customTimesteps}
-                onChange={(e) => set("customTimesteps", e.target.value)}
-                placeholder="solver default"
-                className="field"
-              />
+            <div className="grid gap-3 sm:grid-cols-2">
+              {solvers.length > 0 && (
+                <div>
+                  <Select
+                    label="Solver"
+                    value={params.solver}
+                    onChange={(v) => set("solver", v)}
+                    options={[
+                      { value: "", label: "engine default" },
+                      ...solvers.map((s) => ({ value: s, label: s })),
+                    ]}
+                    note={
+                      params.solver
+                        ? undefined
+                        : "Empty asks the engine, which is resolved against this list when the job is submitted."
+                    }
+                  />
+                </div>
+              )}
+
+              <div>
+                <label className="label" htmlFor="hs-timesteps">
+                  Custom timesteps
+                </label>
+                <input
+                  id="hs-timesteps"
+                  value={params.customTimesteps}
+                  onChange={(e) => set("customTimesteps", e.target.value)}
+                  placeholder="solver default"
+                  className="field"
+                />
+              </div>
             </div>
           </div>
         </details>

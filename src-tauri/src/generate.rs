@@ -74,17 +74,17 @@ pub struct GenerateParams {
     /// GGUF filename (without `.gguf`) of the DiT.
     #[serde(default)]
     pub synth_model: String,
-    /// Diffusion solver, by name. Empty means "whatever this engine defaults
-    /// to", which is the only safe default: the two engines disagree on the
-    /// vocabulary entirely. The bundled acestep.cpp wants `euler`; HOT-Step
-    /// ships only Lua plugins named md_confluence_v4, md_storm_V4, storm and
-    /// the like, and its sampler resolves the name from a plugin registry.
+    /// Diffusion solver, by name. Empty means "ask the engine", which is
+    /// resolved at submit time against the registry the engine actually
+    /// publishes -- see `preferred_solver`. The two engines disagree on the
+    /// vocabulary entirely: the bundled acestep.cpp wants `euler` and offers no
+    /// list, HOT-Step ships only Lua plugins named md_confluence_v4,
+    /// md_storm_V4, storm and the like.
     ///
     /// Sending a name the running engine does not have is not a soft failure.
     /// HOT-Step logs "unknown solver 'euler', falling back to euler", the
     /// fallback lookup misses too, and it dereferences the null result on the
     /// next line -- the process dies mid-render and the HTTP connection resets.
-    /// So the field is omitted unless someone actually chose a solver.
     #[serde(default)]
     pub solver: String,
     /// text2music, cover, repaint, lego, extract, complete.
@@ -420,6 +420,58 @@ pub fn now_secs() -> u64 {
 /// two-stage ACE-Step flow.
 pub fn submit_json(port: u16, path: &str, body: serde_json::Value) -> Result<String, String> {
     submit(port, path, body)
+}
+
+/// Solver names the running engine will accept, or `None` when it publishes no
+/// registry.
+///
+/// HOT-Step resolves its sampler out of a Lua plugin registry and serves it at
+/// `GET /plugins`. The bundled acestep.cpp has no such route, so a miss here is
+/// the signal to leave that engine alone -- it wants `euler` and nothing else
+/// will do.
+pub fn engine_solvers(port: u16) -> Option<Vec<String>> {
+    let url = format!("http://127.0.0.1:{port}/plugins");
+    let response = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+        .ok()?;
+    let body = response.into_reader().read_to_end_bytes().ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let solvers = json.get("solvers")?.as_array()?;
+    let names: Vec<String> = solvers
+        .iter()
+        .filter_map(|s| s.get("name").and_then(|n| n.as_str()))
+        .map(|s| s.to_string())
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
+/// A solver name this engine can actually run, or an empty string to leave the
+/// choice to it.
+///
+/// Sending nothing is NOT the safe option it looks like. HOT-Step's own default
+/// is `euler` (`sf->solver_name = "euler"` in hot-step-server.cpp) and it
+/// overrides that only when the request carries a non-empty `solver` -- so an
+/// omitted field leaves it on `euler`, which no shipped plugin provides. Its
+/// sampler then logs `unknown solver 'euler', falling back to euler`, the
+/// fallback re-looks-up the same missing name, and the next line dereferences
+/// the null result. Every render dies mid-flight.
+///
+/// Preference order rather than "whatever `/plugins` listed first", so the same
+/// engine and plugin set always render the same way.
+pub fn preferred_solver(port: u16) -> String {
+    engine_solvers(port).map(|n| choose_solver(&n)).unwrap_or_default()
+}
+
+/// Pick one of `names`. Split from `preferred_solver` so the ordering is
+/// testable without an engine listening.
+fn choose_solver(names: &[String]) -> String {
+    for want in ["md_confluence_v4", "storm", "md_storm_V4"] {
+        if names.iter().any(|n| n == want) {
+            return want.to_string();
+        }
+    }
+    names.first().cloned().unwrap_or_default()
 }
 
 fn submit(port: u16, path: &str, body: serde_json::Value) -> Result<String, String> {
@@ -1019,7 +1071,13 @@ pub fn generate(
     on_stage("lm", "planning lyrics");
     let models_dir = crate::settings::resolve_models_dir(None);
     let lm_mark = crate::server::stderr_mark(&models_dir);
-    let lm_id = submit(port, "/lm", params.to_lm_json())?;
+    // Only the solver needs the engine's own vocabulary, and asking is cheaper
+    // than guessing: an unrecognised name is a hard crash on HOT-Step.
+    let mut lm_params = params.clone();
+    if lm_params.solver.trim().is_empty() {
+        lm_params.solver = preferred_solver(port);
+    }
+    let lm_id = submit(port, "/lm", lm_params.to_lm_json())?;
     on_job(&lm_id);
     let lm_state = wait_for_job(port, &lm_id, lm_mark, &mut |_| on_stage("lm", "planning lyrics"))?;
 
@@ -1658,17 +1716,79 @@ mod tests {
         assert!(v.get("adapter_scale").is_none(), "{v}");
     }
 
-    /// A solver name the running engine does not have is fatal on HOT-Step, and
-    /// the bundled engine has a different vocabulary again. Sending nothing lets
-    /// each engine pick its own default instead of guessing wrong.
+    /// The struct must not invent a solver name. Which names exist is the
+    /// running engine's business, and the two disagree; the field stays empty
+    /// and `preferred_solver` asks the engine at submit time.
     #[test]
-    fn no_solver_is_sent_unless_one_was_chosen() {
+    fn the_params_struct_does_not_invent_a_solver() {
         let p = GenerateParams {
             caption: "test".to_string(),
             ..Default::default()
         };
         assert_eq!(p.solver, "", "the default must not invent a solver name");
         assert_eq!(p.to_lm_json()["solver"], "");
+    }
+
+    /// The shipped HOT-Step plugin set. Captured verbatim from `GET /plugins`
+    /// against the bundled runtime -- note there is no `euler` in it, which is
+    /// the whole reason the engine's own default is fatal.
+    fn hotstep_solvers() -> Vec<String> {
+        [
+            "md_confluence_v4",
+            "md_dual_time_v2",
+            "md_eigenflow_v1",
+            "md_hamiltonian_v2",
+            "md_omni_relational_V3",
+            "md_pingpong_simple",
+            "md_storm_V4",
+            "md_trajectory_anchor",
+            "md_trajectory_anchor_V3",
+            "md_trajectory_anchor_V5",
+            "md_vortex_v1",
+            "md_wasserstein_yue2",
+            "storm",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// Regression: this must never come back empty for HOT-Step, because empty
+    /// makes the engine fall back to its own `euler` default, which has no
+    /// plugin, and the sampler dereferences the null it gets back.
+    #[test]
+    fn hotstep_gets_a_solver_that_is_actually_registered() {
+        let names = hotstep_solvers();
+        let chosen = choose_solver(&names);
+        assert!(
+            names.contains(&chosen),
+            "chose {chosen:?}, which is not one of the registered solvers"
+        );
+        assert_ne!(chosen, "euler", "no plugin provides euler");
+    }
+
+    /// The bundled engine publishes no registry, so nothing is chosen and the
+    /// field stays empty for it to default to `euler`.
+    #[test]
+    fn an_engine_without_a_registry_gets_no_solver() {
+        assert_eq!(choose_solver(&[]), "");
+    }
+
+    /// A plugin set with none of the preferred names still gets a real one
+    /// rather than nothing, so a user-supplied plugin cannot reintroduce the
+    /// crash.
+    #[test]
+    fn an_unfamiliar_plugin_set_still_yields_a_registered_solver() {
+        let names = vec!["mine_v1".to_string(), "other_v2".to_string()];
+        assert_eq!(choose_solver(&names), "mine_v1");
+    }
+
+    /// Ordering is stable: the same registry always renders the same way.
+    #[test]
+    fn solver_choice_does_not_depend_on_registry_order() {
+        let mut reversed = hotstep_solvers();
+        reversed.reverse();
+        assert_eq!(choose_solver(&hotstep_solvers()), choose_solver(&reversed));
     }
 
     /// The HOT-Step extras are split across the two payloads by which model

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { server } from "../lib/api";
 import { readFlag, writeFlag } from "../lib/prefs";
+import { CATEGORIES, categorise, type LogCategory } from "../lib/logcat";
 
 /** How often to ask for new lines while following. */
 const POLL_MS = 1000;
@@ -12,11 +13,11 @@ interface Props {
 }
 
 /**
- * The sidecar's stderr, in the app.
+ * The sidecar's stderr, in the app, dressed as a terminal.
  *
  * This log is the only place the backend explains itself. A failed job record
- * carries no error at all -- `Job` in `ace-server.cpp` has nowhere to put one
- * -- so before this, the only way to find out why a render died was to open a
+ * carries no error at all -- `Job` in `ace-server.cpp` has nowhere to put one --
+ * so before this, the only way to find out why a render died was to open a
  * terminal and tail a file in the models directory.
  *
  * Polling resumes from a byte cursor rather than re-reading the file, so a
@@ -25,21 +26,35 @@ interface Props {
 export function LogViewer({ running }: Props) {
   const [lines, setLines] = useState<string[]>([]);
   const [follow, setFollowRaw] = useState(() => readFlag("log.follow", true));
+  const [collapsed, setCollapsed] = useState(() => readFlag("log.collapsed", false));
+  const [busy, setBusy] = useState(false);
+  const [clearNote, setClearNote] = useState("");
+
   const setFollow = useCallback((v: boolean) => {
     setFollowRaw(v);
     writeFlag("log.follow", v);
   }, []);
+  const setCollapsedFlag = useCallback((v: boolean) => {
+    setCollapsed(v);
+    writeFlag("log.collapsed", v);
+  }, []);
+
   const [filter, setFilter] = useState("");
-  const [cursor, setCursor] = useState(0);
+  const [category, setCategory] = useState<LogCategory | "all">("all");
+
+  /**
+   * The byte offset lives in a ref, not in state. It advances on every tick,
+   * and as state it was a dependency of the polling effect -- so the interval
+   * was torn down and rebuilt once a second, forever. The value is read by the
+   * timer and written by the timer; nothing renders it.
+   */
+  const cursor = useRef(0);
 
   const refresh = useCallback(async () => {
     try {
-      const [fresh, end] = await Promise.all([
-        server.logs(MAX_LINES),
-        server.cursor(),
-      ]);
+      const [fresh, end] = await Promise.all([server.logs(MAX_LINES), server.cursor()]);
+      cursor.current = end;
       setLines(fresh);
-      setCursor(end);
     } catch {
       // The server may not have started yet; the next tick will pick it up.
     }
@@ -52,22 +67,22 @@ export function LogViewer({ running }: Props) {
   }, [refresh, running]);
 
   useEffect(() => {
-    if (!running || !follow) return;
+    if (!running || !follow || collapsed) return;
     let alive = true;
     const tick = async () => {
       try {
         const at = await server.cursor();
         if (!alive) return;
-        if (at < cursor) {
+        if (at < cursor.current) {
           // The log shrank: it was replaced, so start over rather than
           // resuming from a cursor that no longer means anything.
           await refresh();
           return;
         }
-        if (at === cursor) return;
-        const added = await server.logsSince(cursor, MAX_LINES);
+        if (at === cursor.current) return;
+        const added = await server.logsSince(cursor.current, MAX_LINES);
         if (!alive || added.length === 0) return;
-        setCursor(at);
+        cursor.current = at;
         setLines((prev) => {
           const next = [...prev, ...added];
           return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
@@ -81,85 +96,234 @@ export function LogViewer({ running }: Props) {
       alive = false;
       window.clearInterval(id);
     };
-  }, [running, follow, cursor, refresh]);
+  }, [running, follow, collapsed, refresh]);
+
+  const clearAll = useCallback(async () => {
+    setBusy(true);
+    try {
+      const at = await server.clearLogs();
+      cursor.current = at;
+      setLines([]);
+      setClearNote("cleared");
+      window.setTimeout(() => setClearNote(""), 1500);
+    } catch {
+      setClearNote("could not clear");
+    } finally {
+      setBusy(false);
+    }
+  }, []);
 
   const boxRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!follow) return;
+    if (!follow || collapsed) return;
     const el = boxRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [lines, follow]);
+  }, [lines, follow, collapsed]);
 
   const needle = filter.trim().toLowerCase();
-  const shown = needle ? lines.filter((l) => l.toLowerCase().includes(needle)) : lines;
+  /**
+   * Filtered and classified in one pass. Recomputing per render is what this
+   * avoids: with 2000 lines in view and a poll every second, two separate
+   * `filter` walks were the difference between a panel that keeps up and one
+   * that stutters while something else renders.
+   */
+  const shown = useMemo(() => {
+    const out: { line: string; kind: LogCategory }[] = [];
+    for (const line of lines) {
+      const kind = categorise(line);
+      if (category !== "all" && kind !== category) continue;
+      if (needle && !line.toLowerCase().includes(needle)) continue;
+      out.push({ line, kind });
+    }
+    return out;
+  }, [lines, category, needle]);
+
+  /** How many lines each bucket holds, for the picker. */
+  const counts = useMemo(() => {
+    const tally: Partial<Record<LogCategory, number>> = {};
+    for (const line of lines) {
+      const kind = categorise(line);
+      tally[kind] = (tally[kind] ?? 0) + 1;
+    }
+    return tally;
+  }, [lines]);
+
+  const summary =
+    category === "all" && !needle
+      ? `${lines.length} lines`
+      : `${shown.length} of ${lines.length}`;
 
   return (
-    <section className="panel space-y-3 p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-sm font-medium text-ink-200">Backend log</h3>
-        <div className="flex items-center gap-2">
-          <input
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="filter"
-            className="w-28 rounded border border-ink-700 bg-ink-900 px-2 py-1 text-[11px] text-ink-200 outline-none focus:border-glow-500/60"
-          />
-          <button
-            onClick={() => setFollow(!follow)}
-            className={`chip ${
-              follow
-                ? "bg-glow-500/15 text-glow-300 ring-1 ring-glow-500/40"
-                : "bg-ink-800 text-ink-400 ring-1 ring-ink-700"
-            }`}
-          >
-            {follow ? "following" : "paused"}
-          </button>
-          <button onClick={() => void refresh()} className="btn btn-ghost px-2 py-1 text-[10px]">
-            reload
-          </button>
-        </div>
-      </div>
+    <section className="panel overflow-hidden">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5">
+        <button
+          onClick={() => setCollapsedFlag(!collapsed)}
+          className="flex items-center gap-2 text-left"
+          aria-expanded={!collapsed}
+        >
+          <Caret open={!collapsed} />
+          <span className="text-sm font-medium text-ink-200">Logs</span>
+          <span className="text-[11px] text-ink-500">{collapsed ? summary : "backend stderr"}</span>
+        </button>
 
-      <div
-        ref={boxRef}
-        className="max-h-80 overflow-y-auto overscroll-contain rounded-lg bg-ink-950 p-2.5 font-mono text-[11px] leading-relaxed"
-        onScroll={(e) => {
-          // Scrolling up is an implicit pause: yanking the view back to the
-          // bottom while someone is reading a stack trace is infuriating.
-          const el = e.currentTarget;
-          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-          if (!atBottom && follow) setFollow(false);
-        }}
-      >
-        {shown.length === 0 ? (
-          <p className="text-ink-600">
-            {lines.length === 0
-              ? "Nothing logged yet. Start the server to see backend output."
-              : `No lines match “${filter}”.`}
-          </p>
-        ) : (
-          shown.map((line, i) => (
-            <div
-              key={`${i}-${line.slice(0, 24)}`}
-              className={
-                /FATAL|ERROR/i.test(line)
-                  ? "text-rose-300"
-                  : /WARNING/i.test(line)
-                    ? "text-amber-300"
-                    : "text-ink-400"
-              }
+        {!collapsed && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <input
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="filter"
+              className="w-24 rounded border border-ink-700 bg-ink-900 px-2 py-1 font-mono text-[11px] text-ink-200 outline-none focus:border-glow-500/60"
+            />
+            <button
+              onClick={() => setFollow(!follow)}
+              className={`chip px-2 py-1 text-[10px] ${
+                follow
+                  ? "bg-glow-500/15 text-glow-300 ring-1 ring-glow-500/40"
+                  : "bg-ink-800 text-ink-400 ring-1 ring-ink-700"
+              }`}
             >
-              {line}
-            </div>
-          ))
+              {follow ? "following" : "paused"}
+            </button>
+            <button onClick={() => void refresh()} className="chip px-2 py-1 text-[10px]">
+              reload
+            </button>
+            <button
+              onClick={() => void clearAll()}
+              disabled={busy || lines.length === 0}
+              className="chip px-2 py-1 text-[10px] disabled:opacity-40"
+              title="Empty the backend log. The file is truncated in place, so the server keeps writing to it."
+            >
+              clear
+            </button>
+          </div>
         )}
       </div>
 
-      <p className="text-[10px] text-ink-500">
-        {shown.length} of {lines.length} lines
-        {needle && " (filtered)"}
-      </p>
+      {!collapsed && (
+        <>
+          {/* Category picker. "all" is the default and the counts are what make
+              it worth having: the error bucket on a real log is five lines in
+              two thousand, and it is all five that matter. */}
+          <div className="flex flex-wrap items-center gap-1 border-t border-ink-800 px-4 py-2">
+            <CategoryChip
+              label="all"
+              count={lines.length}
+              active={category === "all"}
+              onClick={() => setCategory("all")}
+            />
+            {CATEGORIES.map(({ id, label }) => {
+              const n = counts[id] ?? 0;
+              return (
+                <CategoryChip
+                  key={id}
+                  label={label}
+                  count={n}
+                  active={category === id}
+                  empty={n === 0}
+                  onClick={() => setCategory(id)}
+                />
+              );
+            })}
+          </div>
+
+          <div
+            ref={boxRef}
+            className="term-scroll max-h-96 overflow-y-auto overscroll-contain border-t border-ink-800 bg-ink-950 px-3 py-2 font-mono text-[11px] leading-[1.55]"
+            onScroll={(e) => {
+              // Scrolling up is an implicit pause: yanking the view back to the
+              // bottom while someone is reading a stack trace is infuriating.
+              const el = e.currentTarget;
+              const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+              if (!atBottom && follow) setFollow(false);
+            }}
+          >
+            {shown.length === 0 ? (
+              <p className="text-ink-600">
+                {lines.length === 0
+                  ? clearNote === "cleared"
+                    ? "Log cleared. New backend output appears here."
+                    : "Nothing logged yet. Start the server to see backend output."
+                  : `No lines in ${category === "all" ? "this log" : category}.`}
+              </p>
+            ) : (
+              shown.map(({ line, kind }, i) => (
+                <div
+                  key={`${i}-${line.slice(0, 24)}`}
+                  className={`term-line ${TERM_STYLE[kind] ?? TERM_STYLE.other}`}
+                >
+                  {line || " "}
+                </div>
+              ))
+            )}
+          </div>
+
+          <p className="flex items-center gap-2 px-4 py-2 text-[10px] text-ink-500">
+            <span>
+              {summary}
+              {needle && " (filtered)"}
+            </span>
+            {clearNote && <span className="text-mint-400">{clearNote}</span>}
+          </p>
+        </>
+      )}
     </section>
+  );
+}
+
+const TERM_STYLE: Record<LogCategory, string> = {
+  error: "term-err",
+  warn: "term-warn",
+  memory: "term-mem",
+  backend: "term-backend",
+  audio: "term-audio",
+  models: "term-models",
+  generate: "term-gen",
+  other: "text-ink-500",
+};
+
+function CategoryChip({
+  label,
+  count,
+  active,
+  empty,
+  onClick,
+}: {
+  label: string;
+  count: number;
+  active: boolean;
+  empty?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      data-active={active}
+      disabled={empty && !active}
+      className={`chip px-2 py-0.5 font-mono text-[10px] disabled:opacity-30 ${
+        active ? "bg-glow-500/15 text-glow-300 ring-1 ring-glow-500/40" : "text-ink-400"
+      }`}
+    >
+      {label}
+      <span className="ml-1 text-ink-600">{count}</span>
+    </button>
+  );
+}
+
+function Caret({ open }: { open: boolean }) {
+  return (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 10 10"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`shrink-0 text-ink-500 transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+    >
+      <path d="M3.5 1.5 7 5l-3.5 3.5" />
+    </svg>
   );
 }

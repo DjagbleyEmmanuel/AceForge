@@ -240,8 +240,15 @@ export default function App() {
 
             {/* The queue is shared by both engines, so it sits outside the
                 per-engine branches. It stays mounted while the panels above it
-                unmount, which is what keeps running-job rows visible. */}
+                unmount, which is what keeps running-job rows visible.
+
+                The log sits directly under it: both answer "what is happening
+                right now", and reading a row's state against the backend's own
+                account of it is the point. It used to live under the Library,
+                where it was neither next to the thing it explains nor anywhere
+                you would look while a render was in flight. */}
             <QueuePanel onGenerated={app.refreshLibrary} />
+            <LogViewer running={running} />
           </div>
 
           <div hidden={app.view !== "library"} className="space-y-5">
@@ -250,7 +257,6 @@ export default function App() {
               onChanged={app.refreshLibrary}
               running={running}
             />
-            <LogViewer running={running} />
           </div>
 
           {app.snapshot && (

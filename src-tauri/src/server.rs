@@ -337,6 +337,21 @@ pub fn stderr_len(models_dir: &Path) -> u64 {
     stderr_mark(models_dir)
 }
 
+/// Empty the log.
+///
+/// Truncated in place rather than unlinked. The sidecar was handed this path as
+/// its stderr when it was spawned, so it holds an open appending descriptor:
+/// replacing the file would leave it writing into an unlinked inode and the log
+/// would silently stop growing. `set_len(0)` keeps the same inode, so the
+/// engine carries on appending to a file the app can still see.
+pub fn stderr_clear(models_dir: &Path) -> std::io::Result<()> {
+    let path = stderr_log_path(models_dir);
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::OpenOptions::new().write(true).open(&path)?.set_len(0)
+}
+
 /// Read the stderr log from `mark` to the end.
 ///
 /// `mark` of 0 means "the whole file". Split out so the log viewer (which reads
@@ -466,5 +481,44 @@ mod tests {
         let dir = Scratch::new("absent");
         assert_eq!(stderr_mark(&dir.0), 0);
         assert!(stderr_since(&dir.0, 0, 80).is_empty());
+    }
+
+    /// Clearing has to empty the log and report a zero cursor, or the viewer's
+    /// next incremental poll resumes from an offset past the end and the panel
+    /// sits empty.
+    #[test]
+    fn clearing_empties_the_log() {
+        let dir = Scratch::new("clear");
+        dir.write("[Server] a\n[Server] b\n");
+        assert!(!stderr_tail(&dir.0, 80).is_empty());
+        stderr_clear(&dir.0).expect("clear succeeds");
+        assert_eq!(stderr_len(&dir.0), 0);
+        assert!(stderr_tail(&dir.0, 80).is_empty());
+    }
+
+    /// The reason this truncates instead of unlinking. The sidecar holds this
+    /// path open as its stderr, so replacing the file would leave it appending
+    /// to an unlinked inode: the log would stop growing and the viewer would go
+    /// permanently blank with no error anywhere. Same inode in, same inode out.
+    #[test]
+    fn clearing_keeps_the_inode_the_engine_writes_to() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let dir = Scratch::new("inode");
+            dir.write("before\n");
+            let before = std::fs::metadata(stderr_log_path(&dir.0)).unwrap().ino();
+            stderr_clear(&dir.0).expect("clear succeeds");
+            let after = std::fs::metadata(stderr_log_path(&dir.0)).unwrap().ino();
+            assert_eq!(before, after, "the engine's open descriptor now writes nowhere");
+        }
+    }
+
+    /// Clearing a log that was never created is a no-op, not an error: the
+    /// button is in the UI from the moment the app opens.
+    #[test]
+    fn clearing_a_missing_log_is_not_an_error() {
+        let dir = Scratch::new("clear-absent");
+        stderr_clear(&dir.0).expect("nothing to clear is still success");
     }
 }

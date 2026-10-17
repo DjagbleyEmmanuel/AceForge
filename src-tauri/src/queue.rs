@@ -331,6 +331,17 @@ pub fn clear_done() {
     emit_change();
 }
 
+/// Clear only the jobs that failed.
+///
+/// `Failed` is part of `is_finished`, so `clear_done` would take these too --
+/// but it is also the only button there was, and it is disabled unless a
+/// *successful* render is on the list. A queue of nothing but failures
+/// therefore had no way to be emptied at all.
+pub fn clear_failed() {
+    state().update(|jobs| jobs.retain(|j| j.state != JobState::Failed));
+    emit_change();
+}
+
 /// Cancel everything: queued jobs drop out and the running one is asked to stop.
 pub fn reset() {
     let ids: Vec<String> = state()
@@ -729,5 +740,55 @@ mod tests {
             "the original stays for history, the retry is added"
         );
         assert_ne!(retried.id, "q-retry-src", "a retry is a new row, not a reuse");
+    }
+
+    /// The gap this closes: `clear_done` is disabled unless a successful render
+    /// is on the list, so a queue holding nothing but failures had no way to be
+    /// emptied. Clearing the failures must also leave everything else alone --
+    /// a `done` row is the record of a render the user actually got.
+    #[test]
+    fn clear_failed_removes_failures_and_keeps_the_rest() {
+        isolate();
+        let inner = state();
+        let keep_done = "q-keep-done";
+        let keep_queued = "q-keep-queued";
+        inner.update(|jobs| {
+            jobs.push(QueuedJob {
+                id: "q-clear-me".into(),
+                params: params_with_caption("clear me"),
+                state: JobState::Failed,
+                error: Some("boom".into()),
+                ..job(JobState::Failed, 0.0, 1.0)
+            });
+            jobs.push(QueuedJob {
+                id: keep_done.into(),
+                params: params_with_caption("keep done"),
+                ..job(JobState::Done, 30.0, 40.0)
+            });
+            jobs.push(QueuedJob {
+                id: keep_queued.into(),
+                params: params_with_caption("keep queued"),
+                ..job(JobState::Queued, 0.0, 0.0)
+            });
+        });
+
+        clear_failed();
+
+        let jobs = inner.jobs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            !jobs.iter().any(|j| j.id == "q-clear-me"),
+            "the failed row is gone"
+        );
+        assert!(
+            jobs.iter().any(|j| j.id == keep_done),
+            "a successful render is history, not junk"
+        );
+        assert!(
+            jobs.iter().any(|j| j.id == keep_queued),
+            "pending work must not be swept away"
+        );
+
+        // Tidy up after ourselves: the state is a process-wide singleton.
+        inner.update(|jobs| jobs.retain(|j| j.id != keep_done && j.id != keep_queued));
     }
 }

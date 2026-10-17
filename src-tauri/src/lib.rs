@@ -582,6 +582,22 @@ fn server_logs_since(cursor: u64, limit: Option<usize>) -> Vec<String> {
     server::stderr_since(&dir, cursor, limit.unwrap_or(2000).min(20_000))
 }
 
+/// Empty the log. The viewer resets its cursor from this, because truncation
+/// drops the byte offset every incremental poll resumes from.
+#[tauri::command]
+fn server_clear_logs() -> Result<u64, String> {
+    let dir = settings::resolve_models_dir(None);
+    server::stderr_clear(&dir).map_err(|e| format!("cannot clear the log: {e}"))?;
+    Ok(0)
+}
+
+/// Solver names the running engine will accept. Empty for an engine that
+/// publishes no registry, which is how the UI knows to leave the choice alone.
+#[tauri::command]
+fn engine_solvers(port: Option<u16>) -> Vec<String> {
+    port.and_then(generate::engine_solvers).unwrap_or_default()
+}
+
 /// The port the sidecar came up on. The UI needs it for every /job call, and
 /// it is only known once the handshake completes.
 #[tauri::command]
@@ -1001,6 +1017,12 @@ fn queue_clear_done() {
     queue::clear_done()
 }
 
+/// Drop the failed renders without touching the successful ones.
+#[tauri::command]
+fn queue_clear_failed() {
+    queue::clear_failed()
+}
+
 #[tauri::command]
 fn queue_reset() {
     queue::reset()
@@ -1273,6 +1295,8 @@ pub fn run() {
             stop_server,
             server_logs,
             server_log_cursor,
+            engine_solvers,
+            server_clear_logs,
             server_logs_since,
             server_port,
             server_props,
@@ -1319,6 +1343,7 @@ pub fn run() {
             queue_retry,
             queue_discard,
             queue_clear_done,
+            queue_clear_failed,
             queue_reset,
         ])
         .setup(|app| {
