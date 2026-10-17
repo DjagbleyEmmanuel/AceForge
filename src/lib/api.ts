@@ -90,6 +90,9 @@ export const server = {
   /** Solver names the engine will accept. Empty unless it serves `/plugins`,
    *  which is the bundled engine's way of saying it only wants `euler`. */
   solvers: (port: number | null) => invoke<string[]>("engine_solvers", { port }),
+  /** The port, but only while an engine is still listening on it. Null once it
+   *  has died, which is how the UI stops claiming a dead runtime is live. */
+  liveness: () => invoke<number | null>("engine_liveness"),
 };
 
 /** camelCase: Rust's SettingsView uses rename_all = "camelCase". A mismatched

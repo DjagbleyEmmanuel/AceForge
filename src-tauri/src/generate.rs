@@ -498,7 +498,23 @@ fn submit(port: u16, path: &str, body: serde_json::Value) -> Result<String, Stri
             let hint = if detail.is_empty() { String::new() } else { format!(": {detail}") };
             return Err(format!("{path} refused the request ({code}){hint}"));
         }
-        Err(e) => return Err(format!("submit {path} failed: {e}")),
+        Err(ureq::Error::Transport(t)) => {
+            // A refused connection means nothing is listening, and on this side
+            // that is nearly always an engine that died rather than one that
+            // was never started -- HOT-Step segfaults mid-render when its solver
+            // lookup misses, and the port outlives the process. Saying "the
+            // engine is not running, its log has the reason" points at the log;
+            // "connection refused (os error 111)" points at nothing.
+            let refused = t.to_string().contains("Connection refused")
+                || t.to_string().contains("os error 111");
+            if refused {
+                return Err(format!(
+                    "the engine is no longer running, so {path} could not be sent. \
+                     Its own log has the reason it stopped."
+                ));
+            }
+            return Err(format!("submit {path} failed: {t}"));
+        }
     };
 
     job_id_from(response.into_json().map_err(|e| format!("bad submit response: {e}"))?, path)

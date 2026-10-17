@@ -26,8 +26,36 @@ static SPAWNED: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 /// only known once the readiness handshake has picked a free port.
 static RUNNING_PORT: Mutex<Option<u16>> = Mutex::new(None);
 
+/// Which child owns `RUNNING_PORT`. A port outlives the process that was
+/// listening on it, and a stale port turns every later request into a bare
+/// "connection refused" that names nothing.
+static RUNNING_PID: Mutex<Option<u32>> = Mutex::new(None);
+
 pub fn running_port() -> Option<u16> {
     *RUNNING_PORT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Reap anything that has exited and report the port only while the engine
+/// behind it is still alive.
+///
+/// `SPAWNED` was only swept during the startup handshake, so an engine that
+/// died mid-session stayed an unreaped zombie and its port stayed on display.
+/// The UI is told the runtime is live until it is stopped by hand, and the
+/// first symptom is a connect error against a port nothing is listening on.
+pub fn poll_liveness() -> Option<u16> {
+    reap_finished();
+    let pid = *RUNNING_PID.lock().unwrap_or_else(|e| e.into_inner());
+    let port = running_port();
+    let (Some(pid), Some(port)) = (pid, port) else {
+        return port;
+    };
+    let alive = lock_children().iter().any(|c| c.id() == pid);
+    if alive {
+        return Some(port);
+    }
+    *RUNNING_PORT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *RUNNING_PID.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    None
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,6 +247,7 @@ pub fn start(
         reap_finished();
         if http_get(port, "/health").is_some() {
             *RUNNING_PORT.lock().unwrap_or_else(|e| e.into_inner()) = Some(port);
+            *RUNNING_PID.lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
             return Ok(ServerStatus {
                 running: true,
                 pid: Some(pid),
@@ -397,6 +426,7 @@ pub fn stop() -> Result<usize, String> {
     }
     children.clear();
     *RUNNING_PORT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *RUNNING_PID.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(killed)
 }
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   generate as generateApi,
   library,
@@ -74,6 +74,9 @@ export function useApp() {
   const [snapshot, setSnapshot] = useState<StoreSnapshot | null>(null);
   const [settingsView, setSettingsView] = useState<SettingsView | null>(null);
   const [status, setStatus] = useState<ServerStatus | null>(null);
+  /** Whether an engine was behind the port at the last check. The liveness poll
+   *  compares against this so it only writes on an actual transition. */
+  const liveRef = useRef<boolean | null>(null);
   // The job the side panel's progress card describes. Tracked here rather than
   // lifted from QueuePanel: the card lives outside the queue's subtree and
   // re-rendering the whole queue list once a second to feed it would be the
@@ -247,6 +250,7 @@ export function useApp() {
     try {
       const next = await serverApi.start(engine);
       setStatus(next);
+      liveRef.current = next.ready;
       setPort(await serverApi.port());
       if (!next.ready) {
         setError("server started but never became ready");
@@ -259,10 +263,40 @@ export function useApp() {
     }
   }, [engine, reload]);
 
+  // Ask the backend whether an engine is still behind the port, once a second.
+  // Status used to be frozen at whatever `start` returned, so an engine that
+  // died on its own stayed "live" until someone pressed Stop, and the only
+  // symptom was a connection error against a port nothing held.
+  //
+  // Only a change of state writes anything. Re-setting the same status every
+  // second would re-render the whole app on a timer, which is the lag this app
+  // is supposed to avoid.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      void serverApi
+        .liveness()
+        .then((live) => {
+          const nowLive = live !== null;
+          if (liveRef.current === nowLive) return;
+          liveRef.current = nowLive;
+          if (live !== null) setPort(live);
+          else {
+            setStatus(null);
+            setPort(null);
+          }
+        })
+        .catch(() => {
+          /* Transient; the next tick retries. */
+        });
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
   const stopServer = useCallback(async () => {
     setBusy(true);
     try {
       await serverApi.stop();
+      liveRef.current = false;
       setStatus(null);
       setPort(null);
     } catch (e) {

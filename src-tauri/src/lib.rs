@@ -226,9 +226,6 @@ fn adopt_bundled_engine(app: tauri::AppHandle) -> Result<bool, String> {
         return Ok(false);
     };
     let bundled = resource_dir.join("aceforge-runtime");
-    if engines::binary_path(engines::EngineId::AceStep).is_some() {
-        return Ok(false);
-    }
     if !bundled.join("ace-server").is_file() {
         return Ok(false);
     }
@@ -266,13 +263,16 @@ fn adopt_bundled_hotstep(app: tauri::AppHandle) -> Result<bool, String> {
     let Some(resource_dir) = app.path().resource_dir().ok() else {
         return Ok(false);
     };
-    if engines::binary_path(engines::EngineId::HotStep).is_some() {
-        return Ok(false);
-    }
     let bundled = resource_dir.join("hotstep-runtime");
     if !bundled.join("ace-server").is_file() {
         return Ok(false);
     }
+    // Deliberately no "already installed, do nothing" short-circuit here.
+    // `adopt_from` decides that, and it has to be the one deciding: a refresh
+    // is what installs assets that arrived in a later release than the binary
+    // they belong to. HOT-Step's Lua plugins are exactly that case, so checking
+    // for the binary first meant the plugins were never copied onto any engine
+    // that already existed, and the engine started with no solvers at all.
     engines::adopt_from(engines::EngineId::HotStep, &bundled).map(|_| true)
 }
 
@@ -589,6 +589,15 @@ fn server_clear_logs() -> Result<u64, String> {
     let dir = settings::resolve_models_dir(None);
     server::stderr_clear(&dir).map_err(|e| format!("cannot clear the log: {e}"))?;
     Ok(0)
+}
+
+/// The port, but only while an engine is still behind it.
+///
+/// Polled by the UI so a runtime that died on its own is reported as stopped
+/// instead of continuing to claim to be live until someone presses Stop.
+#[tauri::command]
+fn engine_liveness() -> Option<u16> {
+    server::poll_liveness()
 }
 
 /// Solver names the running engine will accept. Empty for an engine that
@@ -1296,6 +1305,7 @@ pub fn run() {
             server_logs,
             server_log_cursor,
             engine_solvers,
+            engine_liveness,
             server_clear_logs,
             server_logs_since,
             server_port,
