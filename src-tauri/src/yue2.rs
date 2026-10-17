@@ -318,7 +318,7 @@ pub fn props(port: u16) -> Result<Yue2Props, String> {
         .map_err(|e| format!("yue2 props failed: {e}"))?
         .into_string()
         .map_err(|e| format!("bad yue2 props: {e}"))?;
-    let mut value: serde_json::Value =
+    let value: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("bad yue2 props: {e}"))?;
     let available = value.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
     let g = |k: &str| value.get(k).and_then(|v| v.as_i64()).unwrap_or(0) as i32;

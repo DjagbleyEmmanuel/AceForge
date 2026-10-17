@@ -280,7 +280,7 @@ fn adopt_bundled_hotstep(app: tauri::AppHandle) -> Result<bool, String> {
 /// whether to show the YuE2 form at all: submitting without the weights is a
 /// 400 that says less than "download these two files".
 #[tauri::command]
-fn yue2_props(port: Option<u16>) -> Result<yue2::Yue2Props, String> {
+fn yue2_props(_port: Option<u16>) -> Result<yue2::Yue2Props, String> {
     let port = crate::server::running_port().ok_or_else(|| {
         "the engine is not running, so YuE2 cannot report what it has".to_string()
     })?;
@@ -293,7 +293,7 @@ fn yue2_props(port: Option<u16>) -> Result<yue2::Yue2Props, String> {
 /// thread, which freezes the window instead of showing progress.
 #[tauri::command]
 async fn yue2_render(
-    port: Option<u16>,
+    _port: Option<u16>,
     params: yue2::Yue2Params,
 ) -> Result<yue2::Yue2Outcome, String> {
     let port = crate::server::running_port().ok_or_else(|| {

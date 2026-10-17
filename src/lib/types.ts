@@ -1,10 +1,27 @@
 import type { GenerateParams } from "./api";
 
-export type Role = "Planner" | "TextEncoder" | "Dit" | "Vae";
+export type Family = "acestep" | "yue2" | "minimax";
+
+export type Role =
+  | "Planner"
+  | "TextEncoder"
+  | "Dit"
+  | "Vae"
+  /** YuE2's autoregressive composer: a different pipeline from `Planner`, not
+   *  a variant of it, and loaded by its own backend. */
+  | "Composer"
+  | "DecoderAdapter"
+  | "DepthDecoder"
+  | "ConditionEncoder";
 
 export interface WeightFile {
   filename: string;
   url: string;
+  /** Which pipeline this weight belongs to. */
+  family: Family;
+  /** Subdirectory under the models folder it has to land in, "" for the top
+   *  level. Each backend looks in its own directory. */
+  subdir: string;
   size_bytes: number;
   role: Role;
   present: boolean;
@@ -48,6 +65,9 @@ export interface ServerStatus {
   port: number | null;
   ready: boolean;
   log_tail: string[];
+  /** Weight files present when the engine started. The backend scans once and
+   *  never rescans, so anything newer is on disk but not yet usable. */
+  loadedWeights: string[];
 }
 
 const ROLE_LABEL: Record<Role, string> = {
@@ -55,7 +75,21 @@ const ROLE_LABEL: Record<Role, string> = {
   TextEncoder: "Text encoder",
   Dit: "DiT",
   Vae: "VAE",
+  Composer: "Composer (AR)",
+  DecoderAdapter: "Decoder adapter",
+  DepthDecoder: "Depth decoder",
+  ConditionEncoder: "Condition encoder",
 };
+
+export const FAMILY_LABEL: Record<Family, string> = {
+  acestep: "ACE-Step 1.5",
+  yue2: "YuE2",
+  minimax: "MiniMax-Music3",
+};
+
+export function familyLabel(family: Family): string {
+  return FAMILY_LABEL[family] ?? family;
+}
 
 export function roleLabel(role: Role): string {
   return ROLE_LABEL[role];

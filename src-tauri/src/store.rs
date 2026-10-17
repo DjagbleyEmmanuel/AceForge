@@ -7,8 +7,78 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const REPO: &str = "Serveurperso/ACE-Step-1.5-GGUF";
-const TREE_URL: &str =
-    "https://huggingface.co/api/models/Serveurperso/ACE-Step-1.5-GGUF/tree/main";
+
+/// A model family the store can fetch.
+///
+/// Each one has its own HuggingFace repo and its own place on disk. The layout
+/// is not cosmetic: the engine's registry for ACE-Step walks only the top level
+/// and deliberately skips anything named `yue2-`/`mm3-`, while each of those
+/// backends looks in its own subdirectory first. Dropping a YuE2 file at the top
+/// level would leave the ACE-Step registry logging it as a stranger and YuE2
+/// finding it only by luck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Family {
+    AceStep,
+    Yue2,
+    MiniMax,
+}
+
+impl Family {
+    pub fn repo(self) -> &'static str {
+        match self {
+            Family::AceStep => "Serveurperso/ACE-Step-1.5-GGUF",
+            Family::Yue2 => "scragnog/YuE2-GGUF",
+            Family::MiniMax => "scragnog/MiniMax-Music3-GGUF",
+        }
+    }
+
+    /// Subdirectory under the models folder, or "" for the top level.
+    pub fn subdir(self) -> &'static str {
+        match self {
+            Family::AceStep => "",
+            Family::Yue2 => "yue2",
+            Family::MiniMax => "mm3",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Family::AceStep => "ACE-Step 1.5",
+            Family::Yue2 => "YuE2",
+            Family::MiniMax => "MiniMax-Music3",
+        }
+    }
+
+    pub fn all() -> [Family; 3] {
+        [Family::AceStep, Family::Yue2, Family::MiniMax]
+    }
+}
+
+fn tree_url(family: Family) -> String {
+    format!(
+        "https://huggingface.co/api/models/{}/tree/main",
+        family.repo()
+    )
+}
+
+fn resolve_url(family: Family, filename: &str) -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        family.repo(),
+        filename
+    )
+}
+
+/// Where a family's weights belong inside the models folder.
+pub fn family_dir(base: &Path, family: Family) -> PathBuf {
+    let sub = family.subdir();
+    if sub.is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(sub)
+    }
+}
 
 
 /// Which pipeline stage a weight file feeds.
@@ -22,12 +92,43 @@ pub enum Role {
     Dit,
     /// Oobleck VAE decoder. Always BF16.
     Vae,
+    /// YuE2's autoregressive composer. A different pipeline from the planner
+    /// above: it writes a lead sheet and a codec stream, not lyrics and codes,
+    /// and it is loaded by a separate backend with its own KV cache.
+    Composer,
+    /// YuE2's tokenizer companion decoder adapter, as opposed to a DiT LoRA.
+    DecoderAdapter,
+    /// MiniMax-Music3 depth decoder.
+    DepthDecoder,
+    /// MiniMax-Music3 condition encoder.
+    ConditionEncoder,
+}
+
+/// A LoRA/LoKr for one pipeline stage. Separate from `Role` because an adapter
+/// is not a pipeline stage: it modifies one, and there is more than one per
+/// engine (YuE2 alone has a composer slot and a renderer slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdapterKind {
+    /// Applied to the diffusion transformer.
+    Dit,
+    /// Applied to the planner LM.
+    Planner,
+    /// YuE2's NAR renderer.
+    Renderer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeightFile {
     pub filename: String,
     pub url: String,
+    /// Which pipeline this file belongs to.
+    pub family: Family,
+    /// Subdirectory under the models folder it has to land in, "" for the
+    /// top level. Carried on the file so the downloader does not have to
+    /// re-derive it and cannot put a YuE2 weight where the engine will not
+    /// look for it.
+    pub subdir: String,
     pub size_bytes: u64,
     pub role: Role,
     pub present: bool,
@@ -85,18 +186,89 @@ fn variant_of(stem: &str) -> String {
         .to_string()
 }
 
-fn classify(filename: &str) -> Option<Role> {
-    if filename.starts_with("vae-") {
-        Some(Role::Vae)
-    } else if filename.starts_with("Qwen3-Embedding-") {
-        Some(Role::TextEncoder)
-    } else if filename.starts_with("acestep-5Hz-lm-") {
-        Some(Role::Planner)
-    } else if filename.starts_with("acestep-v15-") {
-        Some(Role::Dit)
+/// Which family a filename belongs to, judged by name.
+///
+/// The prefixes are the same ones the engine uses to route a file, so this
+/// cannot disagree with what the backend will accept.
+pub fn family_of(filename: &str) -> Option<Family> {
+    let lower = filename.to_ascii_lowercase();
+    if lower.starts_with("yue2-") || lower.starts_with("nar_lora") || lower.starts_with("ar_lora") {
+        Some(Family::Yue2)
+    } else if lower.starts_with("mm3-") {
+        Some(Family::MiniMax)
+    } else if lower.starts_with("vae-")
+        || lower.starts_with("scragvae-")
+        || lower.starts_with("pp-vae-")
+        || lower.starts_with("qwen3-embedding-")
+        || lower.starts_with("acestep-")
+    {
+        Some(Family::AceStep)
     } else {
         None
     }
+}
+
+fn classify_in(family: Family, filename: &str) -> Option<Role> {
+    let lower = filename.to_ascii_lowercase();
+    match family {
+        Family::AceStep => {
+            if lower.starts_with("vae-") || lower.starts_with("scragvae-") {
+                Some(Role::Vae)
+            } else if lower.starts_with("pp-vae-") {
+                Some(Role::Vae)
+            } else if lower.starts_with("qwen3-embedding-") {
+                Some(Role::TextEncoder)
+            } else if lower.starts_with("acestep-5hz-lm-") {
+                Some(Role::Planner)
+            } else if lower.starts_with("acestep-v15-") {
+                Some(Role::Dit)
+            } else {
+                None
+            }
+        }
+        Family::Yue2 => {
+            if lower.starts_with("yue2-lm-") {
+                Some(Role::Composer)
+            } else if lower.starts_with("yue2-vae-") {
+                Some(Role::Vae)
+            } else if lower.starts_with("yue2-tok-") {
+                Some(Role::Vae)
+            } else {
+                None
+            }
+        }
+        Family::MiniMax => {
+            if lower.starts_with("mm3-dit-") {
+                Some(Role::Dit)
+            } else if lower.starts_with("mm3-depth-") {
+                Some(Role::DepthDecoder)
+            } else if lower.starts_with("mm3-cond-") {
+                Some(Role::ConditionEncoder)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Adapters are not GGUFs and carry no architecture, so they are recognised by
+/// name alone.
+fn classify_adapter(filename: &str) -> Option<AdapterKind> {
+    let lower = filename.to_ascii_lowercase();
+    if lower.starts_with("nar_lora") || lower.starts_with("nar-") {
+        Some(AdapterKind::Renderer)
+    } else if lower.starts_with("ar_lora") || lower.starts_with("ar-") {
+        Some(AdapterKind::Planner)
+    } else if lower.starts_with("dit_lora") || lower.starts_with("dit-") {
+        Some(AdapterKind::Dit)
+    } else {
+        None
+    }
+}
+
+fn classify(filename: &str) -> Option<Role> {
+    let family = family_of(filename)?;
+    classify_in(family, filename)
 }
 
 fn file_size(entry: &serde_json::Value) -> u64 {
@@ -114,8 +286,39 @@ fn file_size(entry: &serde_json::Value) -> u64 {
 
 /// Fetch the file listing for the repo. Parses the Hub tree endpoint directly
 /// rather than depending on the `hf` CLI, so nothing needs to be installed.
+/// Fetch every family's file listing.
+///
+/// One family failing does not fail the store: the Hub is reachable per-repo,
+/// and a store that empties itself because one of three repos timed out is worse
+/// than one missing a tab. Whatever did answer is returned.
 pub fn list_remote_weights() -> Result<Vec<WeightFile>, String> {
-    let response = ureq::get(TREE_URL)
+    let mut out: Vec<WeightFile> = Vec::new();
+    let mut last_error: Option<String> = None;
+
+    for family in Family::all() {
+        match fetch_family(family) {
+            Ok(mut files) => out.append(&mut files),
+            Err(e) => {
+                eprintln!("[store] {family:?} catalogue unavailable: {e}");
+                last_error = Some(e);
+            }
+        }
+    }
+
+    if out.is_empty() {
+        return Err(last_error.unwrap_or_else(|| "no catalogues available".to_string()));
+    }
+    out.sort_by(|a: &WeightFile, b: &WeightFile| {
+        a.family
+            .cmp(&b.family)
+            .then_with(|| a.role.cmp(&b.role))
+            .then_with(|| a.filename.cmp(&b.filename))
+    });
+    Ok(out)
+}
+
+fn fetch_family(family: Family) -> Result<Vec<WeightFile>, String> {
+    let response = ureq::get(&tree_url(family))
         .call()
         .map_err(|e| format!("hub unreachable: {e}"))?;
 
@@ -127,12 +330,18 @@ pub fn list_remote_weights() -> Result<Vec<WeightFile>, String> {
         .iter()
         .filter_map(|entry: &serde_json::Value| {
             let filename = entry.get("path")?.as_str()?.to_string();
+            // The Hub tree carries directories too; they are not weights.
+            if entry.get("type").and_then(|t| t.as_str()) == Some("directory") {
+                return None;
+            }
             let role = classify(&filename)?;
             let (quant, variant) = split_name(&filename);
             Some(WeightFile {
-                url: format!("https://huggingface.co/{REPO}/resolve/main/{filename}"),
+                url: resolve_url(family, &filename),
                 size_bytes: file_size(entry),
                 role,
+                family,
+                subdir: family.subdir().to_string(),
                 present: false,
                 quant,
                 variant,
@@ -145,9 +354,7 @@ pub fn list_remote_weights() -> Result<Vec<WeightFile>, String> {
         .collect();
 
     files.sort_by(|a: &WeightFile, b: &WeightFile| {
-        a.role
-            .cmp(&b.role)
-            .then_with(|| a.filename.cmp(&b.filename))
+        a.role.cmp(&b.role).then_with(|| a.filename.cmp(&b.filename))
     });
     Ok(files)
 }
@@ -213,26 +420,30 @@ fn scan_local_against(
 ) -> Vec<WeightFile> {
     let mut out: Vec<WeightFile> = Vec::new();
 
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
-            continue;
-        }
-        let Some(filename) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
+    // Recursive, because the engines do not agree on a layout: YuE2's weights
+    // live in a `yue2/` subdirectory and MiniMax's in `mm3/`, and a flat walk
+    // showed the Models list as empty for a folder holding gigabytes of
+    // perfectly good weights.
+    for path in walk_weight_files(dir) {
+        let Some(filename) = path.file_name().and_then(|n| n.to_str()).map(String::from)
+        else {
             continue;
         };
-        let Some(role) = classify(&filename) else { continue };
+        let Some(family) = family_of(&filename) else { continue };
+        // Adapters carry no architecture and classify as no role at all.
+        let role = match classify(&filename) {
+            Some(role) => role,
+            None => continue,
+        };
+        let _ = classify_adapter(&filename);
 
         // Prefer the cached catalogue for the published size; fall back to the
         // real file size so an uncatalogued file still shows something sane.
         let cached = published.iter().find(|f| f.filename == filename);
         let expected = cached.map(|f| f.size_bytes).filter(|s| *s > 0).unwrap_or(0);
+        let on_disk = path.metadata().map(|m| m.len()).unwrap_or(0);
         let size = match expected {
-            0 => entry.metadata().map(|m| m.len()).unwrap_or(0),
+            0 => on_disk,
             n => n,
         };
         let (quant, variant) = split_name(&filename);
@@ -240,14 +451,15 @@ fn scan_local_against(
         // Compare against the published size when we know it. Only a real
         // catalogue entry counts: without one, `size` is just this file's own
         // length and the comparison would be vacuously true.
-        let on_disk = entry.metadata().map(|m| m.len()).unwrap_or(0);
         let size_mismatch = expected > 0 && on_disk != expected;
 
         out.push(WeightFile {
             url: cached
                 .map(|f| f.url.clone())
-                .unwrap_or_else(|| format!("https://huggingface.co/{REPO}/resolve/main/{filename}")),
+                .unwrap_or_else(|| resolve_url(family, &filename)),
             size_bytes: size,
+            family,
+            subdir: family.subdir().to_string(),
             role,
             // A short file is not an installed model. Leaving `present` true
             // is what let a truncated text encoder reach a model picker and
@@ -265,46 +477,58 @@ fn scan_local_against(
         });
     }
 
-    // Offer published-but-absent weights too, so the store is still browsable.
-    for file in published {
-        if out.iter().any(|f| f.filename == file.filename) {
-            continue;
-        }
-        let present = dir.join(&file.filename).is_file();
-        out.push(WeightFile {
-            present,
-            partial_bytes: if present {
-                0
-            } else {
-                segment_bytes(dir, &file.filename, file.size_bytes)
-            },
-            // Nothing on disk at all, so there is no size to be wrong about.
-            // Set explicitly rather than inherited: the cached catalogue must
-            // never leak a stale flag into a live scan.
-            size_mismatch: false,
-            backend_supported: match supported {
-                Some(list) => list.iter().any(|s| s == &file.filename),
-                None => true,
-            },
-            ..file.clone()
-        });
-    }
-
     out.sort_by(|a: &WeightFile, b: &WeightFile| {
-        // Installed first, then by role and name: the list you can actually use
-        // should not be buried under 50 weights you have not downloaded.
-        b.present
-            .cmp(&a.present)
+        a.family
+            .cmp(&b.family)
             .then_with(|| a.role.cmp(&b.role))
             .then_with(|| a.filename.cmp(&b.filename))
     });
     out
 }
 
-/// Refresh the published catalogue from the Hub and cache it.
+/// Every weight file under `dir`, a couple of levels deep.
 ///
-/// Explicit and non-blocking from the caller's perspective: the UI renders from
-/// the local scan first and calls this in the background.
+/// Bounded on purpose. A models folder is sometimes a symlink farm (AceForge's
+/// own import views are), and an unbounded walk of one would not terminate in
+/// a useful time.
+fn walk_weight_files(dir: &Path) -> Vec<PathBuf> {
+    const MAX_DEPTH: usize = 2;
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        // Read the whole directory first: descending into one while iterating
+        // another is fine, but sorting keeps the listing stable between runs,
+        // and the UI keys rows by filename.
+        let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            let Ok(meta) = path.metadata() else { continue };
+            // symlink_metadata, so a symlinked view is followed as a file
+            // rather than mistaken for a directory to descend into forever.
+            if meta.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if name.starts_with('.') || name == "adapters" || name == "tmp" {
+                    continue;
+                }
+                walk(&path, depth + 1, out);
+            } else if meta.is_file()
+                && path.extension().and_then(|e| e.to_str()) == Some("gguf")
+            {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, 0, &mut out);
+    out
+}
+
+
 pub fn refresh_catalogue() -> Result<Vec<WeightFile>, String> {
     let files = list_remote_weights()?;
     save_catalogue(&files);
@@ -548,10 +772,100 @@ mod tests {
         }
     }
 
+    /// YuE2 and MiniMax are looked for in their own subdirectories. The
+    /// scanner used to walk only the top level, so a folder holding a complete
+    /// YuE2 install listed as if it held nothing at all.
+    #[test]
+    fn scans_family_subdirectories() {
+        let dir = Scratch::new("subdirs");
+        std::fs::create_dir_all(dir.0.join("yue2")).unwrap();
+        std::fs::create_dir_all(dir.0.join("mm3")).unwrap();
+        for name in [
+            "acestep-v15-turbo-Q4_K_M.gguf",
+            "yue2/yue2-lm-q8_0.gguf",
+            "yue2/yue2-vae-standard-f32.gguf",
+            "mm3/mm3-dit-q8_0.gguf",
+        ] {
+            std::fs::write(dir.0.join(name), b"x").unwrap();
+        }
+        let found = scan_local(&dir.0);
+        let names: Vec<&str> = found.iter().map(|f| f.filename.as_str()).collect();
+        assert!(names.contains(&"acestep-v15-turbo-Q4_K_M.gguf"), "{names:?}");
+        assert!(names.contains(&"yue2-lm-q8_0.gguf"), "{names:?}");
+        assert!(names.contains(&"yue2-vae-standard-f32.gguf"), "{names:?}");
+        assert!(names.contains(&"mm3-dit-q8_0.gguf"), "{names:?}");
+
+        let yue = found.iter().find(|f| f.filename == "yue2-lm-q8_0.gguf").unwrap();
+        assert_eq!(yue.family, Family::Yue2);
+        assert_eq!(yue.role, Role::Composer);
+        assert_eq!(yue.subdir, "yue2", "it must land where YuE2 looks");
+
+        let dit = found.iter().find(|f| f.filename.starts_with("acestep-v15")).unwrap();
+        assert_eq!(dit.subdir, "", "ACE-Step weights belong at the top level");
+    }
+
+    /// A folder the user never navigates into, or a symlink farm, must not turn
+    /// the scan into an unbounded walk.
+    #[test]
+    fn skips_dot_directories_and_adapters() {
+        let dir = Scratch::new("skips");
+        for sub in [".cache/acestep", "adapters", "tmp"] {
+            std::fs::create_dir_all(dir.0.join(sub)).unwrap();
+            std::fs::write(dir.0.join(sub).join("acestep-v15-turbo-Q4_K_M.gguf"), b"x").unwrap();
+        }
+        assert!(
+            scan_local(&dir.0).is_empty(),
+            "nested weights under these are not part of the models folder"
+        );
+    }
+
+    /// The store must not empty itself because one of three repos is
+    /// unreachable.
+    /// Proves the fix against the real folder rather than a fixture: this is
+    /// the layout the user's YuE2 install actually has.
+    #[test]
+    fn finds_the_installed_yue2_weights() {
+        let dir = std::env::var("ACEFORGE_TEST_MODELS").unwrap_or_default();
+        if dir.trim().is_empty() {
+            return; // no folder configured in this environment
+        }
+        let found = scan_local(std::path::Path::new(&dir));
+        let yue: Vec<&str> = found
+            .iter()
+            .filter(|f| f.family == Family::Yue2)
+            .map(|f| f.filename.as_str())
+            .collect();
+        println!("  {} weights, {} YuE2: {yue:?}", found.len(), yue.len());
+        assert!(
+            yue.iter().any(|n| n.contains("yue2-lm")),
+            "the YuE2 composer is not being listed"
+        );
+    }
+
+    #[test]
+    fn families_are_routed_by_the_same_prefixes_the_engine_uses() {
+        assert_eq!(family_of("yue2-lm-q8_0.gguf"), Some(Family::Yue2));
+        assert_eq!(family_of("YUE2-VAE-standard-f32.gguf"), Some(Family::Yue2));
+        assert_eq!(family_of("mm3-dit-f16.gguf"), Some(Family::MiniMax));
+        assert_eq!(family_of("acestep-v15-turbo-Q8_0.gguf"), Some(Family::AceStep));
+        assert_eq!(family_of("scragvae-BF16.gguf"), Some(Family::AceStep));
+        assert_eq!(family_of("notes.txt"), None);
+    }
+
+    #[test]
+    fn the_yue2_composer_is_not_a_planner() {
+        // They are different models behind different backends. Filing one under
+        // the other's role puts a YuE2 checkpoint in an ACE-Step picker.
+        assert_eq!(classify("yue2-lm-q8_0.gguf"), Some(Role::Composer));
+        assert_ne!(classify("yue2-lm-q8_0.gguf"), classify("acestep-5Hz-lm-1.7B-Q8_0.gguf"));
+    }
+
     fn catalogue_entry(filename: &str, size: u64) -> WeightFile {
         WeightFile {
             filename: filename.to_string(),
             url: format!("https://huggingface.co/{REPO}/resolve/main/{filename}"),
+            family: Family::AceStep,
+            subdir: Family::AceStep.subdir().to_string(),
             size_bytes: size,
             role: Role::TextEncoder,
             present: false,

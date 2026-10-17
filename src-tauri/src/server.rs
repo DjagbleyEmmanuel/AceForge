@@ -37,6 +37,16 @@ pub struct ServerStatus {
     pub port: Option<u16>,
     pub ready: bool,
     pub log_tail: Vec<String>,
+    /// Weight files the engine had when it started.
+    ///
+    /// The backend scans its models folder once, in `main`, and exposes no
+    /// rescan. So a weight that arrives later is on disk and visible to this
+    /// app, and invisible to the running engine, until it is restarted. The
+    /// UI compares this against the folder to say so, because "my model is
+    /// there and the app lists it but rendering still uses the old one" has no
+    /// other explanation on screen.
+    #[serde(default)]
+    pub loaded_weights: Vec<String>,
 }
 
 fn lock_children() -> std::sync::MutexGuard<'static, Vec<Child>> {
@@ -215,6 +225,7 @@ pub fn start(
                 port: Some(port),
                 ready: true,
                 log_tail: tail_log(&log_path),
+                loaded_weights: record_loaded_weights(&models_dir),
             });
         }
         std::thread::sleep(POLL);
@@ -226,7 +237,20 @@ pub fn start(
         port: Some(port),
         ready: false,
         log_tail: tail_log(&log_path),
+        loaded_weights: record_loaded_weights(&models_dir),
     })
+}
+
+/// What was on disk at the moment the engine was started.
+///
+/// Read from the folder rather than from the engine, because the point is to
+/// compare it against the folder *now* and report what has appeared since.
+fn record_loaded_weights(models_dir: &Path) -> Vec<String> {
+    crate::store::scan_local(models_dir)
+        .into_iter()
+        .filter(|f| f.present)
+        .map(|f| f.filename)
+        .collect()
 }
 
 /// Where LoRA adapters live, by convention under the models directory.

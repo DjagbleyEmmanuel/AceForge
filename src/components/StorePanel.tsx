@@ -14,9 +14,13 @@ type RoleFilter = "all" | "Planner" | "TextEncoder" | "Dit" | "Vae";
 interface Props {
   snapshot: StoreSnapshot;
   onChanged: () => void;
+  /** Weight files the running engine saw when it started. Empty when the
+   *  engine is stopped, which is the one case where nothing needs restarting. */
+  loadedWeights: string[];
+  onRestart: () => void;
 }
 
-export function StorePanel({ snapshot, onChanged }: Props) {
+export function StorePanel({ snapshot, onChanged, loadedWeights, onRestart }: Props) {
   // Re-reads the directory once a transfer finishes.
   const [query, setQuery] = useState("");
   const [role, setRole] = useState<RoleFilter>("all");
@@ -31,6 +35,17 @@ export function StorePanel({ snapshot, onChanged }: Props) {
   const liveRef = useRef<string | null>(null);
 
   useEffect(() => setScript(null), [snapshot.models_dir]);
+
+  // The backend scans its models folder once, in `main`, and offers no rescan.
+  // A weight that arrived since is on disk and listed right here, but the
+  // running engine has never heard of it -- which looks exactly like the model
+  // being ignored. Naming the gap is the whole fix.
+  const engineRunning = loadedWeights.length > 0;
+  const unclaimed = engineRunning
+    ? snapshot.files.filter(
+        (f) => f.present && !f.size_mismatch && !loadedWeights.includes(f.filename),
+      )
+    : [];
 
   useEffect(() => {
     void store.freeSpace().then(setFree).catch(() => setFree(null));
@@ -148,6 +163,27 @@ export function StorePanel({ snapshot, onChanged }: Props) {
         <p className="rounded-lg bg-rose-500/10 px-3 py-2 text-xs text-rose-300 ring-1 ring-rose-500/25">
           {error}
         </p>
+      )}
+
+      {unclaimed.length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-200 ring-1 ring-amber-500/30">
+          <span className="leading-relaxed">
+            {unclaimed.length} weight{unclaimed.length === 1 ? "" : "s"} arrived after
+            the engine started:{" "}
+            <span className="font-mono text-amber-100/90">
+              {unclaimed
+                .slice(0, 3)
+                .map((f) => f.filename)
+                .join(", ")}
+              {unclaimed.length > 3 ? ` +${unclaimed.length - 3} more` : ""}
+            </span>
+            . The engine reads its folder once at start-up and never rescans, so
+            they will not be picked up until it restarts.
+          </span>
+          <button onClick={onRestart} className="chip px-2.5 py-1 text-[11px]">
+            restart the engine
+          </button>
+        </div>
       )}
 
       {/* Search + filters */}

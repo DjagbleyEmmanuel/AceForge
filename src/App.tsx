@@ -261,7 +261,14 @@ export default function App() {
                   onChanged={app.reload}
                 />
               )}
-              <StorePanel snapshot={app.snapshot} onChanged={app.reload} />
+              <StorePanel
+                snapshot={app.snapshot}
+                onChanged={app.reload}
+                loadedWeights={app.status?.loadedWeights ?? []}
+                onRestart={() => {
+                  void app.stopServer().then(() => app.startServer());
+                }}
+              />
             </div>
           </div>
           )}
