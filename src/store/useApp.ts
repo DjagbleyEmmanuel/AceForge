@@ -34,7 +34,7 @@ export const GENERATE_DEFAULTS: GenerateParams = {
   synthBatchSize: 1,
   lmModel: "",
   synthModel: "",
-  solver: "euler",
+  solver: "", // empty = whichever engine is running picks its own default
   taskType: "text2music",
   repaintingStart: 0,
   // -1 is the backend's "to the end of the source" sentinel, not a value the

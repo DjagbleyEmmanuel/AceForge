@@ -74,8 +74,18 @@ pub struct GenerateParams {
     /// GGUF filename (without `.gguf`) of the DiT.
     #[serde(default)]
     pub synth_model: String,
-    /// Diffusion solver: euler, sde, dpm3m, stork4.
-    #[serde(default = "default_solver")]
+    /// Diffusion solver, by name. Empty means "whatever this engine defaults
+    /// to", which is the only safe default: the two engines disagree on the
+    /// vocabulary entirely. The bundled acestep.cpp wants `euler`; HOT-Step
+    /// ships only Lua plugins named md_confluence_v4, md_storm_V4, storm and
+    /// the like, and its sampler resolves the name from a plugin registry.
+    ///
+    /// Sending a name the running engine does not have is not a soft failure.
+    /// HOT-Step logs "unknown solver 'euler', falling back to euler", the
+    /// fallback lookup misses too, and it dereferences the null result on the
+    /// next line -- the process dies mid-render and the HTTP connection resets.
+    /// So the field is omitted unless someone actually chose a solver.
+    #[serde(default)]
     pub solver: String,
     /// text2music, cover, repaint, lego, extract, complete.
     #[serde(default = "default_task_type")]
@@ -211,9 +221,6 @@ fn yes() -> bool {
     true
 }
 
-fn default_solver() -> String {
-    "euler".to_string()
-}
 fn default_mp3_bitrate() -> i32 {
     128
 }
@@ -265,7 +272,7 @@ impl Default for GenerateParams {
             synth_batch_size: 1,
             lm_model: String::new(),
             synth_model: String::new(),
-            solver: default_solver(),
+            solver: String::new(),
             task_type: default_task_type(),
             repainting_start: 0.0,
             repainting_end: minus_one_f32(),
@@ -341,7 +348,7 @@ impl GenerateParams {
             // resident, or falls to the first registry entry.
             "lm_model": gguf_name(&self.lm_model),
             "synth_model": gguf_name(&self.synth_model),
-            "solver": self.solver,
+            "solver": &self.solver,
             // These four were declared on the struct and shown in the Sampling
             // panel but never sent, so the panel was decorative: the backend
             // fell back to the turbo model defaults (8 steps, guidance 1.0,
@@ -1649,6 +1656,19 @@ mod tests {
         let v = p.to_lm_json();
         assert!(v.get("adapter").is_none(), "adapter is a DiT setting: {v}");
         assert!(v.get("adapter_scale").is_none(), "{v}");
+    }
+
+    /// A solver name the running engine does not have is fatal on HOT-Step, and
+    /// the bundled engine has a different vocabulary again. Sending nothing lets
+    /// each engine pick its own default instead of guessing wrong.
+    #[test]
+    fn no_solver_is_sent_unless_one_was_chosen() {
+        let p = GenerateParams {
+            caption: "test".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(p.solver, "", "the default must not invent a solver name");
+        assert_eq!(p.to_lm_json()["solver"], "");
     }
 
     /// The HOT-Step extras are split across the two payloads by which model
