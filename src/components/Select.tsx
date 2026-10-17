@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 
 export interface SelectOption<T extends string> {
   value: T;
@@ -43,8 +44,14 @@ interface Props<T extends string> {
  * reachable from CSS -- `appearance: none` hides the arrow and nothing else --
  * so the control is built from a button and a listbox instead.
  *
- * The list is portalled-free but flipped when there is no room below, because a
- * clipped menu in a scrollable panel is worse than an awkward one.
+ * The list is portalled to the document body rather than positioned inside the
+ * trigger's wrapper. `.panel` carries `backdrop-filter`, which establishes a
+ * stacking context, so an absolutely positioned list inside it cannot rise
+ * above a sibling panel that comes later in the document -- the model pickers
+ * sit above the Song Builder, and its menu was painted underneath it. Portalling
+ * also escapes any ancestor that clips, which is the other way a dropdown in a
+ * scrollable panel gets cut off. It is positioned from the trigger's viewport
+ * rectangle and re-measured while open, so it tracks scrolling.
  */
 export function Select<T extends string>({
   value,
@@ -60,6 +67,10 @@ export function Select<T extends string>({
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const [flip, setFlip] = useState(false);
+  /** Viewport rectangle the portalled list is drawn at. */
+  const [anchor, setAnchor] = useState<{ top: number; left: number; width: number } | null>(
+    null,
+  );
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -76,7 +87,12 @@ export function Select<T extends string>({
   useEffect(() => {
     if (!open) return;
     const onPointer = (e: PointerEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) close();
+      const target = e.target as Node;
+      // The list lives outside the trigger's DOM now, so containment alone
+      // would treat a click on an option as an outside click and close the menu
+      // before the option could register.
+      if (rootRef.current?.contains(target) || listRef.current?.contains(target)) return;
+      close();
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -101,15 +117,40 @@ export function Select<T extends string>({
     item?.scrollIntoView({ block: "nearest" });
   }, [open, activeIndex]);
 
-  // Measure before opening: if the menu would run past the bottom of the
-  // viewport, open it upwards instead.
+  // Position the portalled list against the trigger, in viewport coordinates,
+  // flipping upwards when there is no room below. Re-measured on scroll and
+  // resize because the anchor moves while the menu is open.
   useLayoutEffect(() => {
     if (!open) return;
-    const rect = rootRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const needed = Math.min(options.length, 8) * 34 + 12;
-    setFlip(window.innerHeight - rect.bottom < needed && rect.top > needed);
+    const measure = () => {
+      const rect = triggerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const needed = Math.min(options.length, 8) * 34 + 12;
+      const below = window.innerHeight - rect.bottom;
+      const goUp = below < needed && rect.top > needed;
+      setFlip(goUp);
+      setAnchor({
+        top: goUp ? rect.top - 6 : rect.bottom + 6,
+        left: rect.left,
+        width: rect.width,
+      });
+    };
+    measure();
+    window.addEventListener("scroll", measure, true);
+    window.addEventListener("resize", measure);
+    return () => {
+      window.removeEventListener("scroll", measure, true);
+      window.removeEventListener("resize", measure);
+    };
   }, [open, options.length]);
+
+  // Drop the measured rectangle once closed, so reopening re-measures rather
+  // than reusing a stale one from a scroll position that has since changed.
+  // Only on close: doing it on every change would clear the anchor the layout
+  // effect has just set, and the list would never mount.
+  useEffect(() => {
+    if (!open) setAnchor(null);
+  }, [open]);
 
   function openMenu() {
     const i = options.findIndex((o) => o.value === value);
@@ -224,15 +265,28 @@ export function Select<T extends string>({
         </svg>
       </button>
 
-      {open && (
-        <div
-          ref={listRef}
-          id={listId}
-          role="listbox"
-          className={`absolute left-0 right-0 z-50 max-h-72 overflow-y-auto overflow-x-hidden rounded-xl border border-ink-700 bg-ink-850 p-1 shadow-2xl shadow-black/60 ${
-            flip ? "bottom-full mb-1.5" : "top-full mt-1.5"
-          }`}
-        >
+      {/* Portalled: see the note at the top of the file. `fixed` plus a z-index
+          high enough to clear any stacking context is what lets the menu paint
+          above sibling panels. */}
+      {open &&
+        anchor &&
+        createPortal(
+          <div
+            ref={listRef}
+            id={listId}
+            role="listbox"
+            style={{
+              position: "fixed",
+              top: anchor.top,
+              left: anchor.left,
+              width: anchor.width,
+              zIndex: 9999,
+              // Opened upwards, the list is anchored at the trigger's top edge
+              // and pulled up by its own height, which puts its bottom there.
+              transform: flip ? "translateY(-100%)" : undefined,
+            }}
+            className="max-h-72 overflow-y-auto overflow-x-hidden rounded-xl border border-ink-700 bg-ink-850 p-1 shadow-2xl shadow-black/60"
+          >
           {options.map((option, i) => {
             const active = option.value === value;
             return (
@@ -297,8 +351,9 @@ export function Select<T extends string>({
           {options.length === 0 && (
             <p className="px-2.5 py-2 text-[11px] text-ink-500">nothing here yet</p>
           )}
-        </div>
-      )}
+          </div>,
+          document.body,
+        )}
 
       {note && !selected?.note && (
         <p className="mt-1 text-[10px] leading-relaxed text-ink-500">{note}</p>
