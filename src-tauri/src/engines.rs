@@ -204,7 +204,12 @@ fn describe(id: EngineId, binary_name: &str, families: &[&str], notes: &str) -> 
     if let Some(m) = &manifest {
         let binary = dir.join(&m.binary);
         let binary_ok = binary.is_file();
-        let deps_ok = m.files.iter().all(|f| dir.join(f).is_file());
+        // Presence, not file-ness. An entry naming a directory is satisfied by
+        // the directory: HOT-Step's manifest lists `plugins`, and requiring a
+        // directory to be a file is how an engine with all of its payload
+        // present came to be reported as "not installed". A manifest written by
+        // an older build still reads correctly this way.
+        let deps_ok = m.files.iter().all(|f| dir.join(f).exists());
         // Only count as installed when the binary *and* every declared
         // dependency is present.
         installed = binary_ok && deps_ok;
@@ -492,11 +497,16 @@ fn adopt_into(root: &Path, id: EngineId, source: &Path) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     copy_tree(source, &destination)?;
 
-    // Only the backends actually shipped get listed: a model of the runtime
-    // would be rebuilt from whatever is on disk and could disagree.
+    // Only regular files get listed, and only the backends actually shipped: a
+    // model of the runtime would be rebuilt from whatever is on disk and could
+    // disagree. Directories are structure rather than dependencies -- HOT-Step
+    // ships a `plugins/` tree, and listing it here made every install report
+    // itself broken, because the check below was asking whether a directory was
+    // a file.
     let mut files: Vec<String> = std::fs::read_dir(&destination)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n != "ace-server")
         .collect();
@@ -816,6 +826,59 @@ mod adopt_tests {
             read.source_hash.is_some(),
             "the fingerprint must survive the round trip"
         );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// The manifest must describe files, not structure. HOT-Step ships a
+    /// `plugins/` tree, and listing that directory among the required files is
+    /// what made the engine report "not installed" while sitting on a complete,
+    /// working copy of itself.
+    #[test]
+    fn the_manifest_does_not_list_directories_as_required_files() {
+        let data = scratch("dirs");
+        let src = bundle(&data, "engine one");
+        let root = data.join("engines");
+        adopt_into(&root, EngineId::HotStep, &src).expect("adopt");
+
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("hotstep/manifest.json")).unwrap(),
+        )
+        .expect("manifest parses");
+        let listed: Vec<String> = written["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !listed.iter().any(|f| f.contains('/') || f == "plugins"),
+            "directories must not be listed as dependencies: {listed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// And a manifest that lists one anyway -- every install from before this
+    /// fix has exactly that -- must still count as installed. The dependency
+    /// check asks whether the path is present, so a directory satisfies it and
+    /// those installs recover without needing another re-adopt.
+    #[test]
+    fn a_manifest_naming_a_directory_still_counts_as_installed() {
+        let data = scratch("legacy");
+        let src = bundle(&data, "engine one");
+        let root = data.join("engines");
+        adopt_into(&root, EngineId::HotStep, &src).expect("adopt");
+        let manifest_path = root.join("hotstep/manifest.json");
+
+        let mut written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        written["files"].as_array_mut().unwrap().push(serde_json::json!("plugins"));
+        std::fs::write(&manifest_path, written.to_string()).unwrap();
+
+        let read: Manifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let dir = root.join("hotstep");
+        let deps_ok = read.files.iter().all(|f| dir.join(f).exists());
+        assert!(deps_ok, "a directory entry must not read as a missing file");
         let _ = std::fs::remove_dir_all(&data);
     }
 
