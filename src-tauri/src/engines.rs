@@ -112,21 +112,72 @@ struct Manifest {
     source_hash: Option<String>,
 }
 
-/// FNV-1a over the binary. Not a security hash -- it only has to notice that
-/// the engine we shipped is not the one that got installed, which is why it can
-/// be cheap and dependency-free.
-fn hash_binary(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+fn engines_dir() -> PathBuf {
+    crate::paths::app_data_dir().join("engines")
+}
+
+/// Files bigger than this are fingerprinted by name and length rather than by
+/// content. The 113 MB CUDA library would otherwise be read in full on every
+/// launch to learn nothing, and a change to it is not what this hash is for.
+const FINGERPRINT_MAX_READ: u64 = 8 * 1024 * 1024;
+
+fn fnv(hash: u64, bytes: &[u8]) -> u64 {
+    let mut hash = hash;
     for b in bytes {
-        hash ^= b as u64;
+        hash ^= *b as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Fingerprint a whole engine directory, not just its binary.
+///
+/// HOT-Step resolves its sampler out of the Lua plugins sitting beside
+/// `ace-server`, and those started shipping in a release *after* the binary
+/// they belong to. Hashing the binary alone therefore reported "unchanged" on
+/// every install that already had one, `should_refresh` declined to refresh, the
+/// plugins were never copied, and the engine logged "Loaded 0 solvers" with
+/// nothing anywhere saying why.
+///
+/// Relative paths are folded in, so a file that moves counts as a change even
+/// when its bytes do not, and entries are visited in sorted order so the result
+/// never depends on the order the filesystem happens to hand back.
+fn hash_runtime(dir: &Path) -> Option<String> {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    collect_files(dir, dir, &mut files).ok()?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (rel, path) in &files {
+        hash = fnv(hash, rel.as_bytes());
+        hash = fnv(hash, b"\0");
+        let meta = std::fs::metadata(path).ok()?;
+        if meta.len() > FINGERPRINT_MAX_READ {
+            hash = fnv(hash, &meta.len().to_le_bytes());
+        } else {
+            hash = fnv(hash, &std::fs::read(path).ok()?);
+        }
+        hash = fnv(hash, b"\0");
     }
     Some(format!("{hash:016x}"))
 }
 
-fn engines_dir() -> PathBuf {
-    crate::paths::app_data_dir().join("engines")
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_files(root, &path, out)?;
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            out.push((rel, path));
+        }
+    }
+    Ok(())
 }
 
 fn describe(id: EngineId, binary_name: &str, families: &[&str], notes: &str) -> Engine {
@@ -376,10 +427,7 @@ fn should_refresh(id: EngineId, source: &Path) -> bool {
     let Some(installed) = manifest.source_hash else {
         return false;
     };
-    let binary_name = match id {
-        EngineId::AceStep | EngineId::HotStep => "ace-server",
-    };
-    let Some(bundled) = hash_binary(&source.join(binary_name)) else {
+    let Some(bundled) = hash_runtime(source) else {
         return false;
     };
     if installed == bundled {
@@ -446,7 +494,7 @@ pub fn adopt_from(id: EngineId, source: &Path) -> Result<(), String> {
         "label": label,
         "binary": binary_name,
         "files": files,
-        "sourceHash": hash_binary(&destination.join(binary_name)),
+        "sourceHash": hash_runtime(&destination),
     });
     std::fs::write(
         destination.join("manifest.json"),
@@ -605,27 +653,93 @@ mod tests {
 mod refresh_tests {
     use super::*;
 
-    /// The decision that matters most: an engine the user installed must never
-    /// be replaced by a bundled one, however old it is.
+    /// A missing runtime fingerprints to nothing rather than panicking, so a
+    /// half-copied bundle reads as "do not refresh" instead of taking the app
+    /// down on launch.
     #[test]
-    fn hashing_is_stable_and_distinguishes_content() {
-        let dir = std::env::temp_dir().join("aceforge-hash-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let a = dir.join("a.bin");
-        let b = dir.join("b.bin");
-        std::fs::write(&a, b"engine version one").unwrap();
-        std::fs::write(&b, b"engine version two!").unwrap();
+    fn a_missing_runtime_hashes_to_nothing_rather_than_panicking() {
+        assert!(hash_runtime(std::path::Path::new("/nonexistent/ace-server")).is_none());
+    }
 
-        let ha = hash_binary(&a).expect("hashes");
-        let hb = hash_binary(&b).expect("hashes");
-        assert_eq!(ha, hash_binary(&a).unwrap(), "hashing must be stable");
-        assert_ne!(ha, hb, "different content must hash differently");
-        assert_eq!(ha.len(), 16);
+    /// A scratch runtime. The label is part of the path: these tests run in
+    /// parallel and a shared directory would have them delete each other's
+    /// fixtures mid-run, which fails as an intermittent nonsense assertion.
+    fn runtime_with_binary(label: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("aceforge-runtime-hash-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("plugins/solvers")).unwrap();
+        std::fs::write(dir.join("ace-server"), body).unwrap();
+        dir
+    }
+
+    /// The regression. HOT-Step's plugins shipped in a release whose
+    /// `ace-server` was byte-identical to the one before it, so a binary-only
+    /// fingerprint called every existing install unchanged, the refresh was
+    /// skipped, and the engine started up with no solvers and no explanation.
+    /// Adding a plugin has to register as a change in the bundled runtime.
+    #[test]
+    fn adding_a_plugin_file_changes_the_runtime_fingerprint() {
+        let dir = runtime_with_binary("added", "same binary both times");
+        let before = hash_runtime(&dir).expect("hashes");
+
+        std::fs::create_dir_all(dir.join("plugins/solvers")).unwrap();
+        std::fs::write(dir.join("plugins/solvers/md_confluence_v4.lua"), "return {}").unwrap();
+        let after = hash_runtime(&dir).expect("hashes");
+
+        assert_ne!(before, after, "a new plugin must force a refresh");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The mirror image, and the one that keeps a refresh from happening on
+    /// every launch: an unchanged tree must hash to the same value, however
+    /// the filesystem orders its directory entries.
     #[test]
-    fn a_missing_binary_hashes_to_nothing_rather_than_panicking() {
-        assert!(hash_binary(std::path::Path::new("/nonexistent/ace-server")).is_none());
+    fn an_unchanged_runtime_is_stable() {
+        let dir = runtime_with_binary("stable-order", "stable");
+        std::fs::write(dir.join("plugins/solvers/a.lua"), "a").unwrap();
+        std::fs::write(dir.join("plugins/solvers/b.lua"), "bb").unwrap();
+        let first = hash_runtime(&dir).expect("hashes");
+        assert_eq!(first, hash_runtime(&dir).expect("hashes"));
+        assert_eq!(first.len(), 16);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Editing a plugin's contents counts too, not just its arrival.
+    #[test]
+    fn editing_a_plugin_changes_the_fingerprint() {
+        let dir = runtime_with_binary("stable-edit", "stable");
+        let path = dir.join("plugins/solvers/a.lua");
+        std::fs::write(&path, "version one").unwrap();
+        let before = hash_runtime(&dir).expect("hashes");
+        std::fs::write(&path, "version two").unwrap();
+        assert_ne!(before, hash_runtime(&dir).expect("hashes"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Large files are fingerprinted by name and length. Otherwise every launch
+    /// would read 113 MB of CUDA library to reach the same answer.
+    #[test]
+    fn a_large_file_is_fingerprinted_without_reading_it() {
+        let dir = std::env::temp_dir().join("aceforge-runtime-hash-large");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("libggml-cuda.so");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(FINGERPRINT_MAX_READ + 1).unwrap();
+        drop(file);
+
+        let by_length = hash_runtime(&dir).expect("hashes");
+        assert_eq!(by_length.len(), 16);
+        // Truncating it changes the length, which is all this path reads.
+        assert_ne!(by_length, hash_runtime_after_truncate(&dir, &big));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn hash_runtime_after_truncate(dir: &Path, file: &Path) -> String {
+        let f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        f.set_len(FINGERPRINT_MAX_READ / 2).unwrap();
+        drop(f);
+        hash_runtime(dir).expect("hashes")
     }
 }
