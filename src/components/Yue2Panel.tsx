@@ -9,6 +9,7 @@ import {
   type Yue2Params,
 } from "../lib/yue2";
 import { formatBytes } from "../lib/engines";
+import { Select } from "./Select";
 
 interface Props {
   port: number | null;
@@ -104,7 +105,7 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
   const [score, setScore] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const { props, error: propsError } = useYue2Props(port, true);
+  const { props, error: propsError } = useYue2Props(port, true, busy);
   const weights = useMemo(() => (props ? readWeights(props) : null), [props]);
 
   const ready = !!props?.available && !!weights?.lm && !!weights?.vae;
@@ -236,21 +237,21 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
 
         <div className="grid gap-3 sm:grid-cols-3">
           <div>
-            <label className="label" htmlFor="yue-cot">
-              Chain of thought
-            </label>
-            <select
-              id="yue-cot"
+            {/* The app's own Select, not a native <select>: WebKitGTK draws
+                those with the platform widget style, and `appearance: none`
+                only removes the arrow -- the control and its popup stay in the
+                desktop's colours however the page is styled. That is why every
+                other picker in this app is built from a button and a listbox. */}
+            <Select<CotMode>
+              label="Chain of thought"
               value={params.cot}
-              onChange={(e) =>
-                setParams((p) => ({ ...p, cot: e.target.value as CotMode }))
-              }
-              className="field"
-            >
-              <option value="full">Full lead sheet</option>
-              <option value="melody">Melody only</option>
-              <option value="off">Off (slowest)</option>
-            </select>
+              onChange={(v) => setParams((p) => ({ ...p, cot: v }))}
+              options={[
+                { value: "full", label: "Full lead sheet" },
+                { value: "melody", label: "Melody only" },
+                { value: "off", label: "Off (slowest)" },
+              ]}
+            />
           </div>
           <div>
             <label className="label" htmlFor="yue-steps">

@@ -171,7 +171,15 @@ export function readWeights(props: Yue2Props): Yue2Weights {
  *  appear while the window is already up, so this is a poll rather than a
  *  one-shot read. Slow, because nothing changes often.
  */
-export function useYue2Props(port: number | null, engineIsHotStep: boolean) {
+export function useYue2Props(
+  port: number | null,
+  engineIsHotStep: boolean,
+  /** While a render is running the engine's worker is saturated, so this poll
+   *  queues behind it and answers only when the render is over -- several
+   *  times over, one every eight seconds, none of it useful. Props do not
+   *  change during a render, so the poll simply pauses and resumes after. */
+  paused = false,
+) {
   const [props, setProps] = useState<Yue2Props | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -190,10 +198,10 @@ export function useYue2Props(port: number | null, engineIsHotStep: boolean) {
 
   useEffect(() => {
     void load();
-    if (port === null || !engineIsHotStep) return;
+    if (port === null || !engineIsHotStep || paused) return;
     const id = window.setInterval(() => void load(), 8000);
     return () => window.clearInterval(id);
-  }, [load, port, engineIsHotStep]);
+  }, [load, port, engineIsHotStep, paused]);
 
   return { props, error, reload: load };
 }

@@ -890,6 +890,35 @@ pub fn wait_for_job(
     mark: u64,
     on_stage: &mut dyn FnMut(&str),
 ) -> Result<JobState, String> {
+    wait_job(port, id, mark, on_stage, Some(STALL_TIMEOUT))
+}
+
+/// Wait for a job on an engine that is allowed to go quiet.
+///
+/// The silence watchdog assumes the sidecar logs continuously, which is true of
+/// ACE-Step and false of YuE2: its semantic and NAR stages go minutes on end
+/// without writing a line, and one measured render spent 1270 seconds in NAR
+/// alone. The watchdog therefore declared a healthy render wedged and told the
+/// user to restart a runtime that was seconds from finishing on its own.
+///
+/// Nothing is lost by dropping it. A dead engine is still caught: the poll loop
+/// counts consecutive failures and gives up, and JOB_TIMEOUT stays as a backstop.
+pub fn wait_for_job_quiet(
+    port: u16,
+    id: &str,
+    mark: u64,
+    on_stage: &mut dyn FnMut(&str),
+) -> Result<JobState, String> {
+    wait_job(port, id, mark, on_stage, None)
+}
+
+fn wait_job(
+    port: u16,
+    id: &str,
+    mark: u64,
+    on_stage: &mut dyn FnMut(&str),
+    stall_timeout: Option<std::time::Duration>,
+) -> Result<JobState, String> {
     let deadline = std::time::Instant::now() + JOB_TIMEOUT;
     let mut last_report = std::time::Instant::now();
     let models_dir = crate::settings::resolve_models_dir(None);
@@ -906,11 +935,11 @@ pub fn wait_for_job(
         if len != seen_len {
             seen_len = len;
             last_progress = std::time::Instant::now();
-        } else if last_progress.elapsed() > STALL_TIMEOUT {
+} else if stall_timeout.is_some_and(|limit| last_progress.elapsed() > limit) {
             return Err(format!(
-                "job {id} stalled — the backend stopped writing to its log for {}s. \\
+                "job {id} stalled — the backend stopped writing to its log for {}s. \
                  The runtime is probably wedged; restart it from the sidebar.",
-                STALL_TIMEOUT.as_secs()
+                stall_timeout.unwrap_or_default().as_secs()
             ));
         }
 

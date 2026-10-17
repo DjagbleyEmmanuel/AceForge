@@ -294,15 +294,25 @@ fn current_log_mark() -> u64 {
     server::stderr_mark(&settings::resolve_models_dir(None))
 }
 
-/// What the YuE2 pipeline can currently do. The UI reads this to decide
-/// whether to show the YuE2 form at all: submitting without the weights is a
-/// 400 that says less than "download these two files".
+/// What YuE2 can currently do.
+///
+/// The UI reads this to decide whether to show the YuE2 form at all: submitting
+/// without the weights is a 400 that says less than "download these two files".
+///
+/// Async for the same reason `yue2_render` is: this reaches the engine over
+/// HTTP with a 30 second timeout, and the engine's worker is busy for the whole
+/// of a render, so the request queues behind it. As a synchronous command that
+/// wait sits on the main thread and the window stops responding for as long as
+/// it lasts -- which, polled every eight seconds, meant the UI was frozen
+/// essentially continuously for the duration of every render.
 #[tauri::command]
-fn yue2_props(_port: Option<u16>) -> Result<yue2::Yue2Props, String> {
+async fn yue2_props(_port: Option<u16>) -> Result<yue2::Yue2Props, String> {
     let port = crate::server::running_port().ok_or_else(|| {
         "the engine is not running, so YuE2 cannot report what it has".to_string()
     })?;
-    yue2::props(port)
+    tokio::task::spawn_blocking(move || yue2::props(port))
+        .await
+        .map_err(|e| format!("YuE2 props worker stopped: {e}"))?
 }
 
 /// Compose or render through YuE2.

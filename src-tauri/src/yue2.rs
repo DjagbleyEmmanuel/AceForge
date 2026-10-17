@@ -426,7 +426,7 @@ pub fn render(
     on_stage("yue2", "composing");
     let id = generate::submit_json(port, "/yue2/synth", params.to_json())?;
 
-    let state = generate::wait_for_job(port, &id, mark, &mut |_| on_stage("yue2", "rendering"))?;
+    let state = generate::wait_for_job_quiet(port, &id, mark, &mut |_| on_stage("yue2", "rendering"))?;
     if state == generate::JobState::Cancelled {
         return Ok(Yue2Outcome {
             tracks: Vec::new(),
