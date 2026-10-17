@@ -1,6 +1,6 @@
 [package]
 name = "AceForge"
-version = "0.5.4"
+version = "0.5.5"
 description = "Local ACE-Step music generation"
 authors = ["ghost"]
 edition = "2021"

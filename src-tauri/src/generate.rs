@@ -27,6 +27,13 @@ const JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60)
 /// on this machine so a slow render cannot trip it.
 const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Consecutive failed status polls tolerated before a render is abandoned.
+///
+/// At a 400 ms interval this is a little over half a minute of continuous
+/// failure, which is far longer than a stale keep-alive socket lives and far
+/// shorter than a render the user would think had hung.
+const MAX_POLL_FAILURES: u32 = 80;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateParams {
@@ -704,6 +711,7 @@ pub fn wait_for_job(
     let models_dir = crate::settings::resolve_models_dir(None);
     let mut last_progress = std::time::Instant::now();
     let mut seen_len = crate::server::stderr_len(&models_dir);
+    let mut consecutive_poll_failures: u32 = 0;
 
     while std::time::Instant::now() < deadline {
         // Watchdog. The sidecar logs continuously through loads, sampling and
@@ -722,16 +730,63 @@ pub fn wait_for_job(
             ));
         }
 
+        // A poll is not a point of failure. The engine holds the connection
+        // open and this loop talks to it once a second, so the server's
+        // keep-alive timeout can expire between two polls and the next request
+        // lands on a socket the peer has already closed -- a connection reset
+        // that has nothing to do with the render. Failing the job on that threw
+        // away a render that was going fine.
+        //
+        // The agent is built per poll so a pooled socket is never reused, which
+        // is what removes the race rather than merely surviving it. Transient
+        // failures are tolerated; the stall watchdog above is what actually
+        // decides the engine has gone.
         let url = format!("http://127.0.0.1:{port}/job?id={id}");
-        let body = ureq::get(&url)
-            .timeout(std::time::Duration::from_secs(10))
+        let poll: Result<String, String> = match ureq::builder()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout_read(std::time::Duration::from_secs(10))
+            .build()
+            .get(&url)
             .call()
-            .map_err(|e| format!("poll failed: {e}"))?
-            .into_string()
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(response) => response.into_string().map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
 
-        let value: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| format!("bad poll body: {e}"))?;
+        let body = match poll {
+            Ok(b) => {
+                consecutive_poll_failures = 0;
+                b
+            }
+            Err(e) => {
+                consecutive_poll_failures += 1;
+                if consecutive_poll_failures > MAX_POLL_FAILURES {
+                    return Err(format!(
+                        "lost contact with the backend after {MAX_POLL_FAILURES} \
+                         attempts ({e}). It probably exited mid-render."
+                    ));
+                }
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+        };
+
+        let value: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                // A body that is not the status JSON means we reached something
+                // that is not this server. Treat it as a lost connection rather
+                // than failing the render on a parse error.
+                consecutive_poll_failures += 1;
+                if consecutive_poll_failures > MAX_POLL_FAILURES {
+                    return Err(format!(
+                        "the backend on port {port} stopped answering /job properly"
+                    ));
+                }
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+        };
         let state = JobState::parse(value.get("status").and_then(|v| v.as_str()).unwrap_or("running"));
 
         match state {
@@ -1252,9 +1307,12 @@ pub fn job_progress(models_dir: &std::path::Path, mark: u64) -> JobProgress {
 /// `[DiT] Step 39/50 t=0.240`
 fn parse_dit_step(line: &str) -> Option<(u32, u32)> {
     let rest = line.split("[DiT] Step ").nth(1)?;
-    let mut parts = rest.split_whitespace();
-    let done: u32 = parts.next()?.split('/').next()?.parse().ok()?;
-    let total: u32 = parts.next()?.parse().ok()?;
+    // `39/50` is a single whitespace-delimited token, so both halves come from
+    // splitting that token. Reading the total from the *next* token picked up
+    // the trailing `t=0.240` instead and every line failed to parse, which left
+    // the progress bar permanently on its indeterminate sweep.
+    let (done, total) = rest.split_whitespace().next()?.split_once('/')?;
+    let (done, total) = (done.parse::<u32>().ok()?, total.parse::<u32>().ok()?);
     (total > 0).then_some((done, total))
 }
 
@@ -1816,6 +1874,119 @@ mod tests {
         assert!(out.len() < 220, "len was {}", out.len());
         assert!(out.ends_with("..."), "got: {out}");
     }
+
+    /// The log format the progress parser depends on. If upstream renames the
+    /// line, progress silently reads as absent, so the shape is pinned here
+    /// rather than left to whatever a future build happens to print.
+    #[test]
+    fn reads_progress_out_of_the_engines_own_log_lines() {
+        assert_eq!(
+            parse_dit_step("[DiT] Step 39/50 t=0.240"),
+            Some((39, 50))
+        );
+        assert_eq!(parse_dit_step("[DiT] Step 50/50 t=0.020"), Some((50, 50)));
+        assert_eq!(parse_dit_step("[GGUF] something else"), None);
+        assert_eq!(parse_dit_step("[DiT] Step x/y"), None);
+        assert_eq!(
+            parse_tiles("[VAE] Tiled decode: 28 tiles (chunk=256, overlap=64, stride=128)"),
+            Some((0, 28))
+        );
+        assert_eq!(parse_tiles("[VAE] Tiled decode: notanumber tiles"), None);
+    }
+
+    #[test]
+    fn progress_advances_and_stays_under_one_until_the_end() {
+        let dir = ScratchDir::new("progress");
+        let models = dir.0.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let log = models.join("ace-server.stderr.log");
+        std::fs::write(&log, "").unwrap();
+
+        // Nothing logged yet: planning, and no number to show.
+        let p = super::job_progress(&models, 0);
+        assert!(p.fraction.is_none(), "{p:?}");
+        assert_eq!(p.stage, "planning");
+
+        std::fs::write(&log, "[DiT] Step 25/50 t=0.500\n").unwrap();
+        let p = super::job_progress(&models, 0);
+        let f = p.fraction.expect("a fraction once sampling has started");
+        assert!(f > 0.1 && f < 0.95, "{f} should be mid-render");
+        assert_eq!(p.step, Some((25, 50)));
+
+        std::fs::write(&log, "[VAE] Tiled decode: 4 tiles (chunk=256)\n").unwrap();
+        let p = super::job_progress(&models, 0);
+        assert_eq!(p.stage, "decoding");
+        // Never reaches 1.0: the file is not on disk until the job completes,
+        // and a bar that says 100% while nothing has been written is a lie.
+        assert!(p.fraction.unwrap() < 1.0, "{p:?}");
+    }
+
+    /// Marks isolate one run's progress from the previous run's lines.
+    #[test]
+    fn progress_ignores_lines_written_before_the_mark() {
+        let dir = ScratchDir::new("progress-mark");
+        let models = dir.0.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let log = models.join("ace-server.stderr.log");
+        std::fs::write(&log, "[DiT] Step 50/50 t=0.020\n").unwrap();
+        let mark = crate::server::stderr_mark(&models);
+
+        std::fs::write(&log, "[DiT] Step 50/50 t=0.020\n[DiT] Step 1/50 t=0.980\n").unwrap();
+        let p = super::job_progress(&models, mark);
+        assert_eq!(p.step, Some((1, 50)), "the previous run's last step leaked in");
+    }
+
+    /// A status poll must not be a point of failure.
+    ///
+    /// The engine holds connections open and the poll loop talks to it every
+    /// 400 ms, so its keep-alive timeout expires between two polls and the next
+    /// request lands on a socket the peer has already closed. That surfaced as
+    /// `poll failed: ... Connection reset by peer` and failed a render that was
+    /// progressing normally. Stand up a server that resets the first few
+    /// connections and then answers, and the job has to survive it.
+    #[test]
+    fn survives_a_status_poll_that_gets_reset() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let mut resets_left = 3;
+            // Keeps serving rather than closing the listener: `wait_for_job`
+            // polls until it reads a terminal status, and a listener that stops
+            // accepting turns "the peer dropped a connection" into "connection
+            // refused", which is a different failure entirely.
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                if resets_left > 0 {
+                    resets_left -= 1;
+                    // Drop the connection without answering. The client sees an
+                    // incomplete read and reports a transport error, which is
+                    // the same class of failure as the connection reset this
+                    // was written for. Forcing a literal RST needs a raw
+                    // setsockopt and a libc dependency, which is not worth a
+                    // dependency to reproduce a kernel detail: what is under
+                    // test is that a poll failure is survivable, not which errno
+                    // the kernel picked.
+                    drop(s);
+                    continue;
+                }
+                // Content-Length must match the body exactly, 17 bytes.
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n{\"status\":\"done\"}",
+                );
+                let _ = s.flush();
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf);
+            }
+        });
+
+        let state = super::wait_for_job(port, "job", 0, &mut |_| {})
+            .expect("a dropped connection must not fail the render");
+        assert_eq!(state, super::JobState::Done);
+    }
+
 }
 
 
