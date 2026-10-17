@@ -1015,6 +1015,9 @@ pub fn wait_for_job(
 pub struct FetchedResult {
     pub body: Vec<u8>,
     pub lrc: Option<String>,
+    /// What the engine called the body. Decides how it has to be read: the two
+    /// engines disagree, and only one of them wraps the audio.
+    pub mime: String,
 }
 
 pub fn fetch_result(port: u16, id: &str) -> Result<FetchedResult, String> {
@@ -1027,11 +1030,12 @@ pub fn fetch_result(port: u16, id: &str) -> Result<FetchedResult, String> {
         .header("X-LRC-Text")
         .map(decode_base64)
         .transpose()?;
+    let mime = response.header("Content-Type").unwrap_or("").to_string();
     let body = response
         .into_reader()
         .read_to_end_bytes()
         .map_err(|e| format!("result read failed: {e}"))?;
-    Ok(FetchedResult { body, lrc })
+    Ok(FetchedResult { body, lrc, mime })
 }
 
 /// Decode standard base64. Written out rather than pulled from a crate: the
@@ -1134,6 +1138,29 @@ pub fn parse_audio_parts(body: &[u8]) -> Vec<(String, Vec<u8>)> {
         cursor = start + next_rel;
     }
     out
+}
+
+/// The audio in a finished job, however the engine chose to wrap it.
+///
+/// acestep.cpp always answers `multipart/mixed`, even for one take, and rides
+/// the latent along in the same envelope as an octet-stream part. HOT-Step
+/// answers a single take as the bare audio bytes with a plain `audio/*` type,
+/// and only builds a multipart body when there is more than one track. Reading
+/// only the multipart case is what produced "synth returned no audio parts" on
+/// the most ordinary render there is: one track, no extras.
+///
+/// The content type decides. Guessing from the bytes does not work, because MP3
+/// and WAV frames look nothing like a multipart preamble and both start with
+/// something that could pass for either.
+pub fn audio_parts(result: &FetchedResult) -> Vec<(String, Vec<u8>)> {
+    let mime = result.mime.trim().to_ascii_lowercase();
+    if mime.starts_with("audio/") {
+        if result.body.is_empty() {
+            return Vec::new();
+        }
+        return vec![(mime, result.body.clone())];
+    }
+    parse_audio_parts(&result.body)
 }
 
 /// Pull fields off an LM-produced AceRequest so the UI can show what the
@@ -1319,10 +1346,13 @@ pub fn generate(
 
     on_stage("synth", "decoding audio");
     let fetched = fetch_result(port, &synth_id)?;
-    let result = fetched.body;
-    let parts = parse_audio_parts(&result);
+    let parts = audio_parts(&fetched);
     if parts.is_empty() {
-        return Err("synth returned no audio parts".to_string());
+        return Err(format!(
+            "synth returned no audio (content-type {:?}, {} bytes)",
+            fetched.mime,
+            fetched.body.len()
+        ));
     }
 
     let stamp = now_secs();
@@ -1920,6 +1950,49 @@ mod tests {
         let v = p.to_lm_json();
         assert_eq!(v["solver"], "md_confluence_v4", "acestep.cpp reads this");
         assert_eq!(v["infer_method"], "md_confluence_v4", "HOT-Step reads this");
+    }
+
+    /// HOT-Step's shape for a single take: the audio is the whole body and the
+    /// content type says so. This is the ordinary render, and reading it as
+    /// multipart found no parts and threw the finished track away.
+    #[test]
+    fn a_bare_audio_body_is_one_part() {
+        let bytes = vec![b'I', b'D', b'3', 0xff, 0xfb];
+        let result = FetchedResult {
+            body: bytes.clone(),
+            lrc: None,
+            mime: "audio/mpeg".to_string(),
+        };
+        let parts = audio_parts(&result);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0, "audio/mpeg");
+        assert_eq!(parts[0].1, bytes);
+    }
+
+    /// acestep.cpp's shape: multipart even for one take, with the latent
+    /// riding along as an octet-stream part that must be skipped.
+    #[test]
+    fn a_multipart_body_still_yields_only_the_audio() {
+        let body = b"--ace-batch-boundary\r\nContent-Type: audio/wav\r\n\r\nRIFFDATA\r\n--ace-batch-boundary\r\nContent-Type: application/octet-stream\r\n\r\n\x00\x01\x02\r\n--ace-batch-boundary--\r\n";
+        let result = FetchedResult {
+            body: body.to_vec(),
+            lrc: None,
+            mime: "multipart/mixed; boundary=ace-batch-boundary".to_string(),
+        };
+        let parts = audio_parts(&result);
+        assert_eq!(parts.len(), 1, "the latent part is not playable audio");
+        assert_eq!(parts[0].1, b"RIFFDATA".to_vec());
+    }
+
+    /// An empty body is not a track, whatever the content type claims.
+    #[test]
+    fn an_empty_audio_body_is_not_a_part() {
+        let result = FetchedResult {
+            body: Vec::new(),
+            lrc: None,
+            mime: "audio/wav".to_string(),
+        };
+        assert!(audio_parts(&result).is_empty());
     }
 
     /// The regression, and the reason this exists as a test at all. The
