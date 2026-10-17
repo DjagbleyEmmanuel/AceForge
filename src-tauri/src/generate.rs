@@ -557,6 +557,32 @@ fn choose_solver(names: &[String]) -> String {
     names.first().cloned().unwrap_or_default()
 }
 
+/// Write the two DiT-side names HOT-Step reads off the synth body.
+///
+/// `parse_server_fields` runs over the `/synth` request and nowhere else, and
+/// `/lm` does not echo either field into the requests it returns, so a request
+/// that does not carry them here runs on the engine's own defaults: solver
+/// "euler" and guidance "apg". Neither name has a plugin behind it, and the
+/// sampler dereferences the null it gets back rather than falling back, so the
+/// process dies mid-render.
+///
+/// Guidance is written even when empty, which is the safe value: the engine's
+/// registry answers an empty name with the first guidance plugin it loaded.
+/// Omitting the key is the one choice guaranteed to crash.
+///
+/// Split out because this is the line that was previously tucked inside a
+/// branch that a plain text-to-music render never entered.
+fn stamp_dit_names(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    solver: &str,
+    guidance: &str,
+) {
+    if !solver.is_empty() {
+        obj.insert("infer_method".into(), solver.into());
+    }
+    obj.insert("guidance_mode".into(), guidance.into());
+}
+
 fn submit(port: u16, path: &str, body: serde_json::Value) -> Result<String, String> {
     let url = format!("http://127.0.0.1:{port}{path}");
     // `send_json` turns any non-2xx into an opaque transport error, which threw
@@ -1213,39 +1239,19 @@ pub fn generate(
     let vae = params.vae.trim();
     let postprocess = params.postprocess_plugin.trim();
     let timesteps = params.custom_timesteps.trim();
-    let needs_dit_extras =
-        params.pp_vae_reencode || !vae.is_empty() || !postprocess.is_empty()
-            || !timesteps.is_empty() || params.mp3_bitrate != default_mp3_bitrate()
-            || params.dit_sliding_window != minus_one_i32();
-    let requests = if codes.is_empty()
-        && adapter.is_empty()
-        && track.is_empty()
-        && !needs_dit_extras
-    {
-        requests
-    } else {
+    // Every request is walked. This used to be conditional -- a plain
+    // text-to-music render skipped the loop entirely and the planner's
+    // requests were submitted untouched -- which meant the two fields below
+    // were only ever sent for repaints, adapters and stem builds. The simplest
+    // render, and the one everybody does first, was the one that crashed.
+    //
+    // The extras themselves are still applied conditionally below.
+    let guidance = resolve_guidance(port, &params.guidance_mode);
+    let requests = {
         let mut out = Vec::with_capacity(requests.len());
         for mut r in requests {
             if let Some(obj) = r.as_object_mut() {
-                // The solver has to be stated here as well as on `/lm`.
-                // HOT-Step runs `parse_server_fields` over the *synth* body and
-                // nowhere else -- `/lm` never reads it -- so a solver sent with
-                // the planner is simply discarded, and the render then runs on
-                // the engine's default `euler`, which has no plugin, and the
-                // sampler dereferences the null it gets back. Sending it on
-                // `/lm` alone looked correct and changed nothing.
-                //
-                // `guidance_mode` is the same trap one line later: the default is
-                // "apg", which no plugin provides either.
-                if !lm_params.solver.is_empty() {
-                    obj.insert("infer_method".into(), lm_params.solver.clone().into());
-                }
-                // Sent unconditionally, and sent even when empty: the engine's
-                // own default for this is a name that resolves to nothing, so
-                // leaving it out is the one choice guaranteed to crash. Empty
-                // means "first guidance plugin in the registry".
-                let guidance = resolve_guidance(port, &params.guidance_mode);
-                obj.insert("guidance_mode".into(), guidance.into());
+                stamp_dit_names(obj, &lm_params.solver, &guidance);
                 if !codes.is_empty() {
                     obj.insert("audio_codes".into(), codes.into());
                 }
@@ -1914,6 +1920,35 @@ mod tests {
         let v = p.to_lm_json();
         assert_eq!(v["solver"], "md_confluence_v4", "acestep.cpp reads this");
         assert_eq!(v["infer_method"], "md_confluence_v4", "HOT-Step reads this");
+    }
+
+    /// The regression, and the reason this exists as a test at all. The
+    /// stamping used to sit inside a branch guarded by "is there a DiT extra?",
+    /// so a plain text-to-music render -- codes, adapter, track, VAE, timesteps
+    /// all empty -- never reached it and was submitted with the planner's
+    /// defaults. That is the simplest render and the one everybody runs first.
+    /// Stamping is unconditional now, and the empty case is the one pinned.
+    #[test]
+    fn a_plain_render_still_gets_the_names_dit_needs() {
+        let mut obj = serde_json::Map::new();
+        // Exactly what a text-to-music render resolves to.
+        stamp_dit_names(&mut obj, "md_confluence_v4", "");
+        assert_eq!(obj["infer_method"], "md_confluence_v4");
+        assert_eq!(
+            obj["guidance_mode"], "",
+            "empty guidance is what lets the registry choose; omitting it is fatal"
+        );
+    }
+
+    /// An engine with no registry has no solver to offer, so the key is left
+    /// out rather than written empty -- the bundled engine only wants its own
+    /// default, and an empty solver is not a name it understands either.
+    #[test]
+    fn no_solver_means_the_key_is_left_out_entirely() {
+        let mut obj = serde_json::Map::new();
+        stamp_dit_names(&mut obj, "", "");
+        assert!(!obj.contains_key("infer_method"), "no invented name: {obj:?}");
+        assert!(obj.contains_key("guidance_mode"), "but guidance is always stated");
     }
 
     /// The engine reads these off the *synth* body and nowhere else -- `/lm`
