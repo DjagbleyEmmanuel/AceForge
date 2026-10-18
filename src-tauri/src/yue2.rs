@@ -495,7 +495,12 @@ fn staged_params(params: &Yue2Params, score: &str) -> (Yue2Params, Yue2Params) {
 
     let mut audio = params.clone();
     audio.plan_only = false;
-    audio.semantic_only = true;
+    // Deliberately not semantic_only. That flag is the engine's planner probe:
+    // it stops after the codec stream and hands back raw ids with no NAR, no VAE
+    // and no audio, which is a song nobody asked for. A supplied `abc` is what
+    // skips the plan stage -- the engine excludes a song that brings its own
+    // score from the plan batch.
+    audio.semantic_only = false;
     audio.abc = score.to_string();
     (plan, audio)
 }
@@ -870,9 +875,21 @@ mod tests {
         assert!(plan.plan_only && !plan.semantic_only);
         assert_eq!(plan.abc, "", "the composing stage was handed a score");
 
-        assert!(audio.semantic_only && !audio.plan_only);
         assert_eq!(audio.abc, "X:1\nM:4/4\nQ:1/4=120\n");
         assert_eq!(audio.style, params.style, "the render lost the style prompt");
+    }
+
+    /// A staged render must reach audio. Setting `semantic_only` on the second
+    /// job asks the engine for its planner probe instead: it stops after the
+    /// codec stream and returns raw ids, so the job completes cleanly having
+    /// produced no sound at all. This is the whole bug -- nothing else about
+    /// that request is wrong, so nothing else in a test would have caught it.
+    #[test]
+    fn the_rendering_stage_is_not_a_planner_probe() {
+        let (plan, audio) = staged_params(&Yue2Params::default(), "X:1\nM:4/4\nQ:1/4=120\n");
+        assert!(!audio.semantic_only, "the render would return codec ids, not audio");
+        assert!(!audio.plan_only);
+        assert!(plan.plan_only, "the composing stage has to actually compose");
     }
 
     /// A stale score left in the params must not leak into the composing stage.
