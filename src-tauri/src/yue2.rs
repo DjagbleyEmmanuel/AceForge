@@ -415,6 +415,37 @@ fn is_wav(bytes: &[u8]) -> bool {
 }
 
 /// Render, or produce a plan, through `/yue2/synth`.
+/// Lay lyric lines evenly across a finished track and format them as LRC.
+///
+/// This is a fabrication and is labelled as one everywhere it matters. The
+/// bundled engine returns a timed LRC for ACE-Step in the `X-LRC-Text` header
+/// and the app writes that out untouched; HOT-Step's YuE2 job never sets an LRC
+/// at all, and the words its composer invents are not returned anywhere -- the
+/// `abc` score the job does return is built from MIDI voices with no lyric
+/// field. So for lyrics the user supplied, the best available is a plausible
+/// placement rather than none, and the alternative was a track with lyrics in
+/// it that the player would never show.
+///
+/// Section markers are carried through as their own stamped line, which is what
+/// the ACE-Step sidecar looks like -- the engine writes `[00:00.00][Verse 1]`
+/// -- so a hand-written section reads the same way whichever engine made it.
+pub fn spread_lrc(lyrics: &str, duration_secs: f32) -> String {
+    let lines: Vec<&str> = lyrics.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() || duration_secs <= 0.0 {
+        return String::new();
+    }
+    let count = lines.len() as f32;
+    let mut out = String::with_capacity(lines.len() * 24);
+    for (i, line) in lines.iter().enumerate() {
+        // Spread across the whole track rather than stopping short of the end.
+        let at = (duration_secs * i as f32 / count).min(duration_secs);
+        let mins = (at / 60.0) as u32;
+        let secs = at - (mins as f32 * 60.0);
+        out.push_str(&format!("[{mins:02}:{secs:05.2}]{line}\n"));
+    }
+    out
+}
+
 pub fn render(
     port: u16,
     params: &Yue2Params,
@@ -487,6 +518,26 @@ pub fn render(
         std::fs::write(&path, data)
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         let seconds = wav_seconds(data);
+
+        // The sidecar ACE-Step renders get, so the library has something to
+        // show and the two engines produce the same shape of output. Written
+        // per take, unlike the ACE-Step path which times only the first: there
+        // is no alignment here to attach to a specific performance, so each
+        // take gets its own copy rather than one take inheriting another's
+        // timings.
+        //
+        // A failure here must not lose the render; the audio is already written.
+        if !params.lyrics.trim().is_empty() {
+            let lrc = spread_lrc(&params.lyrics, seconds);
+            if !lrc.is_empty() {
+                let lrc_path = path.with_extension("lrc");
+                if let Err(e) = std::fs::write(&lrc_path, &lrc) {
+                    eprintln!("[lrc] cannot write {}: {e}", lrc_path.display());
+                } else {
+                    eprintln!("[lrc] wrote {} ({} bytes)", lrc_path.display(), lrc.len());
+                }
+            }
+        }
         let id = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -562,6 +613,69 @@ fn wav_seconds(bytes: &[u8]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sidecar has to be readable by the same parser the library uses, or
+    /// the file exists and nothing shows. This is the round trip that decides
+    /// it, and it is the part that is easy to get wrong: the stamp has to be
+    /// `[mm:ss.xx]` with digits either side of the colon, or the parser treats
+    /// it as a metadata tag and drops the line.
+    #[test]
+    fn the_spread_lrc_round_trips_through_the_library_parser() {
+        let lyrics = "[Verse 1]\nHey baby\nI don't want much today\n[Chorus]\nNo no no";
+        let lrc = spread_lrc(lyrics, 30.0);
+        let parsed = crate::annotations::parse_lrc(&lrc);
+        assert_eq!(parsed.len(), 5, "every line, section markers included: {parsed:?}");
+        assert_eq!(parsed[0].text, "[Verse 1]");
+        assert_eq!(parsed[1].text, "Hey baby");
+        assert_eq!(parsed[4].text, "No no no");
+        // Strictly increasing, and inside the track.
+        for pair in parsed.windows(2) {
+            assert!(pair[0].at_secs <= pair[1].at_secs, "stamps went backwards");
+        }
+        assert!(parsed.last().unwrap().at_secs <= 30.0);
+    }
+
+    /// Empty lyrics must produce no file content at all. A render with nothing
+    /// sung should not leave an empty `.lrc` beside it that the library then
+    /// has to treat as "present but unreadable".
+    #[test]
+    fn no_lyrics_writes_nothing() {
+        assert_eq!(spread_lrc("", 30.0), "");
+        assert_eq!(spread_lrc("   \n \n", 30.0), "");
+    }
+
+    /// A zero-length track has nothing to spread across.
+    #[test]
+    fn a_zero_length_track_writes_nothing() {
+        assert_eq!(spread_lrc("Hey baby", 0.0), "");
+    }
+
+    /// The first line starts the track and the last lands inside it. A common
+    /// slip is spacing only up to `duration - duration/n`, which leaves the
+    /// closing line past the end of the audio.
+    #[test]
+    fn lines_span_the_whole_track() {
+        let lrc = spread_lrc("one\ntwo\nthree\nfour", 40.0);
+        let parsed = crate::annotations::parse_lrc(&lrc);
+        assert_eq!(parsed.first().unwrap().at_secs, 0.0);
+        let last = parsed.last().unwrap().at_secs;
+        assert!(last > 25.0 && last <= 40.0, "last line landed at {last}");
+    }
+
+    /// Over an hour the minutes field has to carry, not wrap.
+    #[test]
+    fn long_tracks_keep_counting_minutes() {
+        // Enough lines that the last one lands near the end: with two over
+        // 4000 s the last is at the halfway point, which is 33 minutes and
+        // proves nothing about carrying into the second hour.
+        let lyrics: Vec<String> = (0..400).map(|i| format!("line{i}")).collect();
+        let lrc = spread_lrc(&lyrics.join("\n"), 4000.0);
+        assert!(lrc.starts_with("[00:00.00]line0"), "{lrc}");
+        assert!(lrc.contains("[66:30."), "4000 s is past the hour mark: {lrc}");
+        let parsed = crate::annotations::parse_lrc(&lrc);
+        assert_eq!(parsed.len(), 400);
+        assert!((parsed.last().unwrap().at_secs - 3990.0).abs() < 0.01);
+    }
 
     #[test]
     fn unset_sampling_is_left_out_rather_than_sent_as_zero() {

@@ -245,7 +245,7 @@ fn bracket_is_stamp(inner: &str) -> bool {
 }
 
 /// Pull `[mm:ss.xx] line` pairs out of an LRC file, ignoring metadata tags.
-fn parse_lrc(text: &str) -> Vec<LyricLine> {
+pub(crate) fn parse_lrc(text: &str) -> Vec<LyricLine> {
     let mut out: Vec<LyricLine> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
