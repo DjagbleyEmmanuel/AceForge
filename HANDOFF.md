@@ -169,10 +169,11 @@ Two fixes worth remembering:
   `scragnog/YuE2-GGUF` has `yue2-lm-Q4_K_M.gguf` at 2.26 GiB, the lever if it's
   ever worth pursuing.
 - MiniMax weights download and classify, but there is **no generate UI**.
-- **`~/.local/share/app.aceforge.desktop/engines/audiocpp/` is 378 MB and
-  orphaned.** `EngineId` has only `AceStep` and `HotStep` and the string
-  "audiocpp" appears nowhere in the source. Safe to delete. The queue is now
-  empty and clean.
+- `ENGINE.md` still documents an `audiocpp` engine that no longer exists. It is
+  a plan, not a description: `EngineId` has only `AceStep` and `HotStep`, and
+  `scripts/fetch-resources.sh` can still fetch an audio.cpp build. Its orphaned
+  378 MB install has been deleted. Worth either implementing or deleting from
+  the docs, so the next reader does not go looking for it.
 
 ## Conventions
 
