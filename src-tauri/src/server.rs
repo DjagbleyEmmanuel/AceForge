@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::os::unix::process::CommandExt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -171,6 +172,36 @@ fn free_port() -> u16 {
 /// being launched is the only thing that distinguishes a run. Getting it wrong
 /// shows up as unknown request fields being ignored, which looks like the
 /// parameter having no effect rather than like the wrong engine.
+/// Ask the kernel to signal this process when its parent dies.
+///
+/// The sidecar is a long-lived child that loads gigabytes onto the GPU, so
+/// letting it outlive the window is expensive: `stop()` kills tracked children,
+/// but it only runs on a clean Stop, and closing the app or killing it outright
+/// leaves an orphan holding a CUDA context and a listening port. Three
+/// accumulated here over a day, each a wasted 46 MB on a 4 GB card -- and one of
+/// them part of why a render could not get the memory it asked for.
+///
+/// PR_SET_PDEATHSIG is the kernel's own answer, and it closes the window a
+/// shutdown hook leaves open: if the parent has already gone by the time the
+/// child runs this, it exits immediately rather than becoming an orphan again.
+///
+/// Runs in the forked child between fork and exec, so only async-signal-safe
+/// work belongs here. `prctl` is.
+fn die_with_parent() -> std::io::Result<()> {
+    use std::os::raw::{c_int, c_ulong};
+    const PR_SET_PDEATHSIG: c_int = 1;
+    const SIGTERM: c_int = 15;
+    // Declared rather than imported: the C integer types are in std, so this
+    // avoids a new dependency in order to avoid one.
+    extern "C" {
+        fn prctl(option: c_int, arg2: c_ulong, ...) -> c_int;
+    }
+    if unsafe { prctl(PR_SET_PDEATHSIG, SIGTERM as c_ulong, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub fn start(
     engine: crate::engines::EngineId,
     models_dir: &std::path::Path,
@@ -218,7 +249,13 @@ pub fn start(
     // Both of these default upstream to values that do not fit 4 GB.
     let max_seq = config.max_seq.clamp(1024, 32768);
 
-        let child = Command::new(&program)
+        let mut command = Command::new(&program);
+    // Unsafe at the call site rather than around the whole chain: `pre_exec` is
+    // an unsafe fn precisely because it runs in the forked child.
+    unsafe {
+        command.pre_exec(die_with_parent);
+    }
+    let child = command
         .arg("--models")
         .arg(models_dir)
         .arg("--host")
