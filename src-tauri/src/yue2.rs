@@ -466,32 +466,133 @@ pub fn spread_lrc(lyrics: &str, duration_secs: f32) -> String {
     out
 }
 
+/// One submitted YuE2 job, waited on, with whatever score it produced.
+struct StageRun {
+    id: String,
+    score: Option<String>,
+}
+
+/// Whether this render has to run as two jobs rather than one.
+///
+/// A full render with no score supplied is exactly the case where the composer
+/// and the audio would share a job -- and therefore share a KV cache lifetime,
+/// which is what does not fit.
+fn needs_staged_plan(params: &Yue2Params) -> bool {
+    !params.plan_only && !params.semantic_only && params.abc.trim().is_empty()
+}
+
+/// The two requests a staged render sends.
+///
+/// Pulled out so the staging can be tested without a server: the mistake this
+/// guards against is feeding the previous score back into the stage that is
+/// meant to replace it, which would silently render the wrong song.
+fn staged_params(params: &Yue2Params, score: &str) -> (Yue2Params, Yue2Params) {
+    let mut plan = params.clone();
+    plan.plan_only = true;
+    plan.semantic_only = false;
+    // Never feed a score in here: this stage exists to write one.
+    plan.abc = String::new();
+
+    let mut audio = params.clone();
+    audio.plan_only = false;
+    audio.semantic_only = true;
+    audio.abc = score.to_string();
+    (plan, audio)
+}
+
+/// Submit one job and wait for it. `Ok(None)` means the user cancelled.
+fn run_stage(
+    port: u16,
+    params: &Yue2Params,
+    models_dir: &std::path::Path,
+    on_stage: &mut dyn FnMut(&str, &str),
+    composing: &str,
+    running: &str,
+) -> Result<Option<StageRun>, String> {
+    on_stage("yue2", composing);
+    // Taken per stage: the mark is how staleness is judged, and a second job
+    // that inherited the first job's mark would look silent from the start.
+    let mark = crate::server::stderr_mark(models_dir);
+    let id = generate::submit_json(port, "/yue2/synth", params.to_json())?;
+    if generate::wait_for_job_quiet(port, &id, mark, &mut |_| on_stage("yue2", running))?
+        == generate::JobState::Cancelled
+    {
+        return Ok(None);
+    }
+    let score = generate::job_abc(port, &id);
+    Ok(Some(StageRun { id, score }))
+}
+
+/// Compose the score, then render from it, as two jobs.
+///
+/// YuE2's AR stage allocates a persistent KV cache that outlives the stage that
+/// filled it, so a plan and a semantic sharing one job hold two caches at once.
+/// On a 4 GB card the second allocation is the one that fails. Splitting lets
+/// the engine unload between the two.
+///
+/// It buys something back as well: the score is known before the NAR stage,
+/// which is the long one, so a score too short or too empty to be worth hearing
+/// fails in seconds instead of after the render has already cost its time.
+fn staged_plan_then_audio(
+    port: u16,
+    params: &Yue2Params,
+    models_dir: &std::path::Path,
+    on_stage: &mut dyn FnMut(&str, &str),
+) -> Result<Option<StageRun>, String> {
+    let (plan, _) = staged_params(params, "");
+    let Some(first) =
+        run_stage(port, &plan, models_dir, &mut *on_stage, "composing", "writing score")?
+    else {
+        return Ok(None);
+    };
+
+    let score = first.score.unwrap_or_default();
+    if score.trim().is_empty() {
+        return Err(
+            "The composer returned no score, so there is nothing to render. Try a shorter or more specific style prompt."
+                .into(),
+        );
+    }
+    let health = crate::abc::score_health(&score)
+        .map_err(|e| format!("The composed score cannot be rendered: {e}"))?;
+    on_stage(
+        "yue2",
+        &format!("score ready: {} vocal bars, {} sections", health.bars, health.sections),
+    );
+
+    let (_, audio) = staged_params(params, &score);
+    run_stage(port, &audio, models_dir, on_stage, "rendering score", "rendering")
+}
+
 pub fn render(
     port: u16,
     params: &Yue2Params,
     on_stage: &mut dyn FnMut(&str, &str),
 ) -> Result<Yue2Outcome, String> {
     let models_dir = crate::settings::resolve_hotstep_models_dir();
-    let mark = crate::server::stderr_mark(&models_dir);
 
-    on_stage("yue2", "composing");
-    let id = generate::submit_json(port, "/yue2/synth", params.to_json())?;
+    let cancelled = || Yue2Outcome {
+        tracks: Vec::new(),
+        score: None,
+        semantic_ids: None,
+        cancelled: true,
+    };
 
-    let state = generate::wait_for_job_quiet(port, &id, mark, &mut |_| on_stage("yue2", "rendering"))?;
-    if state == generate::JobState::Cancelled {
-        return Ok(Yue2Outcome {
-            tracks: Vec::new(),
-            score: None,
-            semantic_ids: None,
-            cancelled: true,
-        });
-    }
+    let (id, score) = if needs_staged_plan(params) {
+        match staged_plan_then_audio(port, params, &models_dir, &mut *on_stage)? {
+            Some(run) => (run.id, run.score),
+            None => return Ok(cancelled()),
+        }
+    } else {
+        match run_stage(port, params, &models_dir, on_stage, "composing", "rendering")? {
+            Some(run) => (run.id, run.score),
+            None => return Ok(cancelled()),
+        }
+    };
 
-    // The score comes back on the status, not the audio body, so it is fetched
-    // before the result. Read once: a second pass would double a render that
-    // already takes twenty minutes on this card.
-    let score = generate::job_abc(port, &id);
-
+    // The score comes back on the status, not the audio body, so it is read
+    // alongside the job rather than from the result. Read once: a second pass
+    // would double a render that already takes twenty minutes on this card.
     let fetched = generate::fetch_result(port, &id)?;
     let body = fetched.body;
 
@@ -735,6 +836,53 @@ mod tests {
         params.title = "Neon Rain".into();
         let json = params.to_json();
         assert!(json.get("title").is_none(), "title leaked into the request");
+    }
+
+    /// The staging is only for a full render with no score to start from. Every
+    /// other shape already loads one thing at a time and must keep doing so.
+    #[test]
+    fn only_a_plain_full_render_gets_staged() {
+        let base = Yue2Params::default();
+        assert!(needs_staged_plan(&base), "a plain render is exactly the case");
+
+        let mut plan_only = base.clone();
+        plan_only.plan_only = true;
+        assert!(!needs_staged_plan(&plan_only));
+
+        let mut semantic_only = base.clone();
+        semantic_only.semantic_only = true;
+        assert!(!needs_staged_plan(&semantic_only));
+
+        let mut supplied = base.clone();
+        supplied.abc = "X:1\nM:4/4\nQ:1/4=120\nK:C\nCDEF|".into();
+        assert!(!needs_staged_plan(&supplied), "a supplied score is already composed");
+    }
+
+    /// The stage that writes a score must not be handed one, and the stage that
+    /// renders must be. Getting this backwards either re-renders the previous
+    /// song or composes twice and throws the first score away.
+    #[test]
+    fn the_two_stages_pass_the_score_the_right_way_round() {
+        let mut params = Yue2Params::default();
+        params.style = "warm reggae".into();
+        let (plan, audio) = staged_params(&params, "X:1\nM:4/4\nQ:1/4=120\n");
+
+        assert!(plan.plan_only && !plan.semantic_only);
+        assert_eq!(plan.abc, "", "the composing stage was handed a score");
+
+        assert!(audio.semantic_only && !audio.plan_only);
+        assert_eq!(audio.abc, "X:1\nM:4/4\nQ:1/4=120\n");
+        assert_eq!(audio.style, params.style, "the render lost the style prompt");
+    }
+
+    /// A stale score left in the params must not leak into the composing stage.
+    #[test]
+    fn staging_ignores_a_score_left_over_in_the_params() {
+        let mut params = Yue2Params::default();
+        params.abc = "X:1\nM:4/4\nQ:1/4=120\nK:C\nold|".into();
+        // Not staged at all, but if it ever were, the old score must not ride along.
+        let (plan, _) = staged_params(&params, "");
+        assert_eq!(plan.abc, "");
     }
 
     #[test]

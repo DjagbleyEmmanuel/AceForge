@@ -501,6 +501,28 @@ fn has_word(haystack: &str, word: &str) -> bool {
 /// Each scored section is paired with the next lyric block of the same kind, in
 /// order, and stamped at the first vocal note inside that section's bars.
 /// Blocks with no timed section are dropped rather than guessed at.
+/// What a composed score turned out to be.
+///
+/// Exists so a score can be judged before the NAR stage is spent on it. That
+/// stage is the long one -- minutes rather than seconds -- and it does not care
+/// that it is about to turn a three-bar fragment into eight minutes of audio.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoreHealth {
+    /// Vocal bars. The composer's instrumental parts are not counted: a score
+    /// with no vocal bars cannot carry lyrics, which is the point of checking.
+    pub bars: usize,
+    /// Labelled sections the voice moves through.
+    pub sections: usize,
+}
+
+/// Inspect a composed score without committing to a render.
+pub fn score_health(abc: &str) -> Result<ScoreHealth, String> {
+    let vocal_ids = vocal_voice_ids(abc);
+    let bars = bar_clock(abc, &vocal_ids)?.len();
+    let sections = score_sections(abc, &vocal_ids).len();
+    Ok(ScoreHealth { bars, sections })
+}
+
 pub fn lyric_timings(abc: &str, lyrics: &str) -> Result<Vec<(f64, String)>, String> {
     if !abc.lines().any(|l| l.trim_start().starts_with("Q:")) {
         return Err("Score has no tempo (Q:); a free-tempo cover has no clock.".into());
@@ -564,6 +586,39 @@ pub fn lyric_timings(abc: &str, lyrics: &str) -> Result<Vec<(f64, String)>, Stri
     }
     Ok(out)
 }
+
+    /// The health gate runs before the NAR stage, which is the long one, so it
+    /// has to be right about what counts as a renderable score.
+    #[test]
+    fn score_health_counts_vocal_bars_and_sections() {
+        let abc = concat!(
+            "X:1\nT:\nM:4/4\nL:1/8\nQ:1/4=120\n",
+            "V: Vocal clef=treble name=\"Vocal Melody\" snm=\"Vocal\"\n",
+            "V: Bass snm=\"Bass\"\n",
+            "K:C\n",
+            "% Verse\n", "V: Vocal\n", "CDEF/2 | GABc | z4 |\n",
+            "% Chorus\n", "V: Vocal\n", "CDEF GABc | cdef gabc | z4 |\n",
+        );
+        let health = score_health(abc).expect("a healthy score");
+        assert_eq!(health.bars, 6, "instrumental bars must not be counted");
+        assert_eq!(health.sections, 2);
+    }
+
+    /// Every reason the gate exists: a score it waves through is a score the
+    /// user waits minutes to hear and then wishes they had not.
+    #[test]
+    fn score_health_rejects_a_score_nothing_can_be_heard_in() {
+        for abc in [
+            "",
+            "not abc at all",
+            // A well-formed score with no vocal voice at all.
+            "X:1\nM:4/4\nQ:1/4=120\nV: Piano\nK:C\nCDEF|GABc|\n",
+            // Vocal voice, but no notes under it.
+            "X:1\nM:4/4\nQ:1/4=120\nV: Vocal\nK:C\n",
+        ] {
+            assert!(score_health(abc).is_err(), "accepted an unusable score: {abc:?}");
+        }
+    }
 
 #[cfg(test)]
 mod tests {
