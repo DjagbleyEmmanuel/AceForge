@@ -8,8 +8,8 @@ src-tauri/resources/*
 !src-tauri/resources/covers/bin/
 
 # Vendored engine binaries. Over the 100 MB per-file hard limit on GitHub
-# (audiocpp_server alone is 144 MB), and both are build output rather than
-# source. `scripts/fetch-resources.sh` puts them back.
+# (libggml-cuda.so alone is 113 MB), and all of it is build output rather than
+# source. `scripts/fetch-resources.sh` puts it back.
 src-tauri/resources/*
 # ...except the bundled cover artwork: 128 KB of small SVG sources that are
 # content rather than build output, and without them a fresh clone ships with no

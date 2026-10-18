@@ -17,9 +17,9 @@ Written for a fresh agent picking this up cold. Read this first, then
 | RAM | 24 GB |
 | Disk | models on `/media/ghost/Pride` (99% full — 5.9 GB free) |
 
-- **Never run long audio.cpp / YuE2 renders.** The user asked for this at the
-  start and it still stands. Short engine probes are fine, and a 10 s probe is
-  how the crash below was finally pinned.
+- **Never run long renders.** The user asked for this at the start and it still
+  stands. Short engine probes are fine, and a 10 s probe is how the crash below
+  was finally pinned.
 - The build cache is at `/var/tmp/aceforge-target/target` via a symlink from
   `src-tauri/target`. Preserve it.
 - **Prune the bundle directory every release.** Each `tauri build` leaves a
@@ -169,11 +169,10 @@ Two fixes worth remembering:
   `scragnog/YuE2-GGUF` has `yue2-lm-Q4_K_M.gguf` at 2.26 GiB, the lever if it's
   ever worth pursuing.
 - MiniMax weights download and classify, but there is **no generate UI**.
-- `ENGINE.md` still documents an `audiocpp` engine that no longer exists. It is
-  a plan, not a description: `EngineId` has only `AceStep` and `HotStep`, and
-  `scripts/fetch-resources.sh` can still fetch an audio.cpp build. Its orphaned
-  378 MB install has been deleted. Worth either implementing or deleting from
-  the docs, so the next reader does not go looking for it.
+- **audio.cpp is gone.** The orphaned 378 MB install is deleted, `ENGINE.md` and
+  `fetch-resources.sh` no longer mention it, and nothing in the running app ever
+  addressed it. Do not re-add it. What remains from that work is the YuE2 and
+  MiniMax coverage, which HOT-Step provides instead.
 
 ## Conventions
 

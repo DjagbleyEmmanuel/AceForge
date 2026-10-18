@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Serde names are explicit, and deliberately match `as_str()` and the
-/// TypeScript union. Deriving camelCase produced "aceStep"/"audioCpp", which
-/// silently failed every frontend comparison against "acestep"/"hotstep".
+/// TypeScript union. Deriving camelCase produced "aceStep", which silently
+/// failed every frontend comparison against "acestep".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EngineId {
     #[serde(rename = "acestep")]
