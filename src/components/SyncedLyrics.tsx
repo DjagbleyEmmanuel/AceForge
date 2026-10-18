@@ -60,7 +60,10 @@ export function SyncedLyrics({
   /** Set briefly after a manual scroll, so our own smooth scroll is ignored. */
   const followLock = useRef(false);
   const [hidden, setHidden] = useState(() => readFlag("lyrics.hidden", false));
-  const [expanded, setExpanded] = useState(() => readFlag("lyrics.expanded", false));
+  // Open by default now that there is a focus line above it. Collapsed used to
+  // mean the panel was one hidden line of text, which is the one thing a
+  // lyrics panel should never be.
+  const [expanded, setExpanded] = useState(() => readFlag("lyrics.expanded", true));
 
   const plain = useMemo(() => lyricLines(lyrics), [lyrics]);
 
@@ -320,6 +323,22 @@ export function SyncedLyrics({
           </button>
         </span>
       </div>
+      {/* The line being sung, large and centred.
+          The list below is the reference: it is complete, scrollable, and
+          re-tappable. This is the part you read while it plays, so it gets the
+          space and the list does not. Only shown when there is something to
+          follow -- an untimed track falls back to plain lines. */}
+      {active >= 0 && timings && (
+        <div className="py-3 text-center">
+          <p
+            className="text-balance text-lg font-semibold leading-snug text-ink-100"
+            aria-live="polite"
+          >
+            {timings.lines[active]?.text ?? ""}
+          </p>
+        </div>
+      )}
+
       {expanded && (
       <ol
         ref={listRef}
