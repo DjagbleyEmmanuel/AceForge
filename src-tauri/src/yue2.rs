@@ -429,6 +429,19 @@ fn is_wav(bytes: &[u8]) -> bool {
 /// Section markers are carried through as their own stamped line, which is what
 /// the ACE-Step sidecar looks like -- the engine writes `[00:00.00][Verse 1]`
 /// -- so a hand-written section reads the same way whichever engine made it.
+/// Format score-derived timings as LRC. The counterpart to `spread_lrc`, which
+/// is the fallback for a score that could not be read.
+pub fn format_lrc(timed: &[(f64, String)]) -> String {
+    let mut out = String::new();
+    for (at, text) in timed {
+        let at = (*at).max(0.0);
+        let mins = (at / 60.0) as u32;
+        let secs = at - (mins as f64 * 60.0);
+        out.push_str(&format!("[{:02}:{:05.2}]{text}\n", mins, secs));
+    }
+    out
+}
+
 pub fn spread_lrc(lyrics: &str, duration_secs: f32) -> String {
     let lines: Vec<&str> = lyrics.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if lines.is_empty() || duration_secs <= 0.0 {
@@ -466,6 +479,11 @@ pub fn render(
             cancelled: true,
         });
     }
+
+    // The score comes back on the status, not the audio body, so it is fetched
+    // before the result. Read once: a second pass would double a render that
+    // already takes twenty minutes on this card.
+    let score = generate::job_abc(port, &id);
 
     let fetched = generate::fetch_result(port, &id)?;
     let body = fetched.body;
@@ -528,7 +546,17 @@ pub fn render(
         //
         // A failure here must not lose the render; the audio is already written.
         if !params.lyrics.trim().is_empty() {
-            let lrc = spread_lrc(&params.lyrics, seconds);
+            // Measured off the score the composer produced, when there is a
+            // score it can be measured from. The engine returns the lead sheet
+            // but never the clock over it, so the clock is derived here -- the
+            // same numbers the C6 wire format would carry.
+            let timed = score
+                .as_deref()
+                .and_then(|abc| crate::abc::lyric_timings(abc, &params.lyrics).ok());
+            let lrc = match &timed {
+                Some(lines) => format_lrc(lines),
+                None => spread_lrc(&params.lyrics, seconds),
+            };
             if !lrc.is_empty() {
                 let lrc_path = path.with_extension("lrc");
                 if let Err(e) = std::fs::write(&lrc_path, &lrc) {
@@ -638,6 +666,46 @@ mod tests {
     /// Empty lyrics must produce no file content at all. A render with nothing
     /// sung should not leave an empty `.lrc` beside it that the library then
     /// has to treat as "present but unreadable".
+    /// The whole point of the score path: the two must not agree, or the parser
+    /// is not doing anything. Even spread puts the fourth line at three
+    /// quarters of the track; the score puts the chorus where the score says.
+    #[test]
+    fn a_score_gives_different_times_than_even_spread() {
+        let abc = concat!(
+            "X:1\nT:\nM:4/4\nL:1/8\nQ:1/4=120\n",
+            "V: Vocal clef=treble name=\"Vocal Melody\" snm=\"Vocal\"\n",
+            "K:C\n",
+            "% Verse\n", "V: Vocal\n", "CDEF/2 | GABc | z4 |\n",
+            "% Chorus\n", "V: Vocal\n", "CDEF GABc | cdef gabc | z4 |\n",
+        );
+        let lyrics = "[Verse]\none\ntwo\n[Chorus]\nthree";
+        let measured = crate::abc::lyric_timings(abc, lyrics).expect("score timings");
+        let from_score = format_lrc(&measured);
+        let spread = spread_lrc(lyrics, 16.0);
+
+        assert_ne!(from_score, spread, "the score changed nothing");
+        // Both have to be readable, or the difference is just noise.
+        for text in [&from_score, &spread] {
+            assert!(
+                crate::annotations::parse_lrc(text).len() >= 4,
+                "unreadable: {text}"
+            );
+        }
+    }
+
+    /// A score the parser cannot read must not stop the sidecar being written.
+    /// The fallback is visibly approximate; losing the lyrics entirely would be
+    /// worse than approximate.
+    #[test]
+    fn an_unreadable_score_still_leaves_the_even_spread_fallback() {
+        let lyrics = "[Verse]\none\ntwo";
+        // No tempo, no sections, no vocal bars: every reason the parser refuses.
+        for abc in ["", "not abc", "X:1\nM:4/4\nK:C\n"] {
+            assert!(crate::abc::lyric_timings(abc, lyrics).is_err());
+        }
+        assert!(!spread_lrc(lyrics, 30.0).is_empty());
+    }
+
     #[test]
     fn no_lyrics_writes_nothing() {
         assert_eq!(spread_lrc("", 30.0), "");

@@ -915,6 +915,32 @@ pub fn wait_for_job(
 ///
 /// Nothing is lost by dropping it. A dead engine is still caught: the poll loop
 /// counts consecutive failures and gives up, and JOB_TIMEOUT stays as a backstop.
+/// The lead sheet a finished YuE2 job composed, if it produced one.
+///
+/// The engine splices `abc` into the ordinary `/job` status once the job is
+/// done, alongside `end_reason` and the per-track metadata. Nothing used it
+/// until now: the score came back and was dropped, which is why lyrics had to be
+/// laid out evenly when the timings were sitting in the response all along.
+///
+/// A second request rather than threading the value out of `wait_job`, which
+/// returns a bare `JobState` and is shared with the ACE-Step path that has no
+/// score to carry.
+pub fn job_abc(port: u16, id: &str) -> Option<String> {
+    let url = format!("http://127.0.0.1:{port}/job?id={id}");
+    let body = ureq::builder()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout_read(std::time::Duration::from_secs(30))
+        .build()
+        .get(&url)
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let abc = value.get("abc")?.as_str()?;
+    (!abc.trim().is_empty()).then(|| abc.to_string())
+}
+
 pub fn wait_for_job_quiet(
     port: u16,
     id: &str,

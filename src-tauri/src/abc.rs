@@ -35,9 +35,6 @@
 #[derive(Debug, Clone, Copy)]
 struct Bar {
     start_secs: f64,
-    end_secs: f64,
-    whole_start: f64,
-    whole_end: f64,
     bpm: f64,
     beat_whole_notes: f64,
 }
@@ -146,7 +143,6 @@ fn bar_clock(abc: &str, vocal_ids: &[String]) -> Result<Vec<Bar>, String> {
     let mut beat_whole = 0.0f64;
     let mut in_vocal = false;
     let mut secs = 0.0f64;
-    let mut whole = 0.0f64;
 
     for raw in abc.lines() {
         let line = raw.trim();
@@ -199,16 +195,8 @@ fn bar_clock(abc: &str, vocal_ids: &[String]) -> Result<Vec<Bar>, String> {
         for segment in bar_segments(line) {
             for _ in 0..bars_in(segment) {
                 let dur = meter_whole / beat_whole * 60.0 / bpm;
-                bars.push(Bar {
-                    start_secs: secs,
-                    end_secs: secs + dur,
-                    whole_start: whole,
-                    whole_end: whole + meter_whole,
-                    bpm,
-                    beat_whole_notes: beat_whole,
-                });
+                bars.push(Bar { start_secs: secs, bpm, beat_whole_notes: beat_whole });
                 secs += dur;
-                whole += meter_whole;
             }
         }
     }
@@ -605,10 +593,12 @@ mod tests {
     fn reads_the_fields_sheetsage_emits() {
         let ids = vocal_voice_ids(SHEETSAGE);
         let bars = bar_clock(SHEETSAGE, &ids).expect("clock");
-        // 4/4 at 120 bpm is two seconds a bar; four bars are written.
+        // 4/4 at 120 bpm is two seconds a bar; four bars are written, so the
+        // bar starts alone say both the count and the metre.
         assert_eq!(bars.len(), 4);
-        assert!((bars[0].end_secs - bars[0].start_secs - 2.0).abs() < 1e-9);
-        assert!((bars[1].start_secs - 2.0).abs() < 1e-9);
+        for (i, bar) in bars.iter().enumerate() {
+            assert!((bar.start_secs - i as f64 * 2.0).abs() < 1e-9, "bar {i} at {}", bar.start_secs);
+        }
     }
 
     /// Every note length SheetSage writes has to decode, because the whole
