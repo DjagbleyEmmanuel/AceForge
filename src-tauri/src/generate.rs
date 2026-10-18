@@ -18,7 +18,13 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400)
 /// Hard ceiling on one stage. Generous for 4 GB hardware: a repaint of a
 /// five-minute source has been measured at a few minutes, and the failure this
 /// replaces was an indefinite hang rather than a slow render.
-const JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+///
+/// It is a backstop, not the guard that matters. A real hang is caught within
+/// three minutes by the silence watchdog below, and a dead engine is caught the
+/// moment it exits. This only has to be longer than the slowest honest render,
+/// and a YuE2 render on this card has been measured at 1128 seconds end to end
+/// -- NAR alone took 934 -- so thirty minutes was cutting legitimate work short.
+const JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
 
 /// A stage that stops writing to stderr for this long has stopped making
 /// progress. Measured against the log's byte length, not against polls: the
@@ -29,10 +35,16 @@ const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Consecutive failed status polls tolerated before a render is abandoned.
 ///
-/// At a 400 ms interval this is a little over half a minute of continuous
-/// failure, which is far longer than a stale keep-alive socket lives and far
-/// shorter than a render the user would think had hung.
-const MAX_POLL_FAILURES: u32 = 80;
+/// A failure here is no longer evidence that the engine died -- the process is
+/// asked directly now -- so this is a backstop against spinning forever against
+/// something that is alive but will never answer.
+///
+/// The cost per attempt is a ten second read timeout plus the interval, so this
+/// is hours of continuous unresponsiveness rather than the ~14 minutes 80 was
+/// worth. That was under a long YuE2 render: 80 attempts ran out minutes before
+/// the engine reported "done (1 track(s))", and a finished render was thrown
+/// away.
+const MAX_POLL_FAILURES: u32 = 900;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -972,6 +984,20 @@ fn wait_job(
                 b
             }
             Err(e) => {
+                // Ask the process, not the network. A timeout and a refused
+                // connection look identical here, but they mean opposite things:
+                // a busy engine cannot answer a status poll for the length of a
+                // stage, while a refused connection is the engine gone.
+                //
+                // Counting both together is what threw away a finished render.
+                // One measured YuE2 job spent 934 seconds in NAR and 1128 in
+                // total; at ten seconds of read timeout per attempt that ran
+                // past the failure budget minutes before the engine wrote
+                // "done (1 track(s))", and the app reported a successful render
+                // as lost.
+                if !crate::server::engine_alive() {
+                    return Err(format!("the engine exited mid-render ({e})"));
+                }
                 consecutive_poll_failures += 1;
                 if consecutive_poll_failures > MAX_POLL_FAILURES {
                     return Err(format!(
@@ -1494,8 +1520,77 @@ const PLAN_SHARE: f32 = 0.10;
 const DIT_SHARE: f32 = 0.75;
 const DECODE_SHARE: f32 = 0.15;
 
+/// YuE2 stage shares, summing to 1.
+///
+/// From one measured render on this card: plan 50.9 s, semantic 122.0 s, NAR
+/// 934.5 s, VAE 20.6 s. NAR is four fifths of the pipeline and runs silently,
+/// so it gets the large share and the bar sits still through it -- the log has
+/// one line per chunk and no total to divide by, and inventing a rate here
+/// would make the bar move and mean nothing.
+const YUE2_PLAN: f32 = 0.05;
+const YUE2_SEMANTIC: f32 = 0.15;
+const YUE2_NAR: f32 = 0.85;
+const YUE2_VAE: f32 = 0.99;
+
+/// Which YuE2 stage the log has reached.
+///
+/// The order is the engine's own pipeline order, and each marker is written as
+/// its stage begins, so the last one seen is the stage in progress.
+fn yue2_stage(lines: &[String]) -> Option<(&'static str, u32)> {
+    let mut stage: Option<(&'static str, u32)> = None;
+    for line in lines {
+        if line.contains("[YuE2-AR-Tokens] semantic") {
+            stage = Some(("semantic", 0));
+        } else if line.contains("[YuE2-AR-Tokens] plan") {
+            stage = Some(("planning", 0));
+        } else if line.contains("[YuE2-NAR-Seal]") || line.contains("[YuE2] Loaded nar") {
+            stage = Some(("generating audio", 0));
+        } else if let Some(chunk) = parse_yue2_chunk(line) {
+            // Counted rather than totalled: the log gives an index and no
+            // length, so the count is reported in the stage label and the bar
+            // holds at the NAR share.
+            stage = Some(("generating audio", chunk));
+        } else if line.contains("[YuE2] Loaded vae") || line.contains("[YuE2-Vae]") {
+            // Deliberately not keyed on `[YuE2] Evicted`: that appears twice
+            // with opposite meanings -- the AR half is evicted to make room for
+            // NAR, and the NAR half to make room for the VAE -- so matching it
+            // would call the start of generation "decoding".
+            stage = Some(("decoding audio", 0));
+        } else if line.contains("[YuE2] Unloaded") {
+            stage = Some(("done", 0));
+        }
+    }
+    stage
+}
+
+/// `[YuE2-NAR-Chunk] song=0 index=2 frames=...`
+fn parse_yue2_chunk(line: &str) -> Option<u32> {
+    let rest = line.split("index=").nth(1)?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
 pub fn job_progress(models_dir: &std::path::Path, mark: u64) -> JobProgress {
     let lines = crate::server::stderr_since(models_dir, mark, 4000);
+
+    // YuE2 reports its own stages and shares none of the ACE-Step markers, so
+    // it is read on its own rather than being made to look like the sampler.
+    if lines.iter().any(|l| l.contains("[YuE2")) {
+        let (stage, chunks) = yue2_stage(&lines).unwrap_or(("planning", 0));
+        let fraction = match stage {
+            "planning" => Some(YUE2_PLAN),
+            "semantic" => Some(YUE2_SEMANTIC),
+            "generating audio" => Some(YUE2_NAR),
+            "decoding audio" => Some(YUE2_VAE),
+            _ => Some(1.0),
+        };
+        let stage = if chunks > 0 {
+            format!("{stage} · chunk {chunks}")
+        } else {
+            stage.to_string()
+        };
+        return JobProgress { fraction, stage, step: None, tiles_done: None };
+    }
+
     let mut stage = String::new();
     let mut step: Option<(u32, u32)> = None;
     let mut tiles: Option<(u32, u32)> = None;
@@ -1550,7 +1645,72 @@ pub fn job_progress(models_dir: &std::path::Path, mark: u64) -> JobProgress {
     }
 }
 
-/// `[DiT] Step 39/50 t=0.240`
+/// Real YuE2 log lines, from one measured render, driving the stage walk.
+    fn yue2_lines() -> Vec<String> {
+        [
+            "[YuE2] Loaded ar: AR 1.66 + NAR 0.00 + VAE(standard) 0.00 = 1.66 GB in 5804 ms",
+            "[YuE2-AR-Tokens] plan song=0 n=1441 hash=9fdad35d839bc877",
+            "[YuE2-AR-Tokens] semantic song=0 n=3623 hash=7e7ab0c93da60b46",
+            "[YuE2-NAR-Seal] song=0 chunk=[0,3623) shared_rows=5111 forwarded=1 ms=40.8",
+            "[YuE2] Evicted the AR half",
+            "[YuE2] Loaded nar: AR 0.00 + NAR 1.18 + VAE(standard) 0.00 = 1.18 GB in 72083 ms",
+            "[YuE2-NAR-Chunk] song=0 index=0 frames=3623 prefix_tokens=5112 solve_ms=862385.3 calls=64 variations=1",
+            "[YuE2] Loaded vae: AR 0.00 + NAR 0.00 + VAE(standard) 0.25 = 0.25 GB in 867 ms",
+            "[YuE2-Vae] Prepared (standard): 92 derived tensors, 121.3 MB",
+            "[YuE2] Unloaded",
+            "[YuE2-Job] 7be46db866eac26b: done (1 track(s), 3623 frames, end_reason=completed)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// The stage has to move forward as the log does, and the fraction has to
+    /// move with it -- a bar that reports "decoding" at 15% is worse than none.
+    #[test]
+    fn yue2_stages_advance_in_pipeline_order() {
+        let all = yue2_lines();
+        let at = |n: usize| yue2_stage(&all[..n]).unwrap_or(("planning", 0));
+        assert_eq!(at(1).0, "planning");
+        assert_eq!(at(3).0, "semantic");
+        assert_eq!(at(5).0, "generating audio");
+        assert_eq!(at(9).0, "decoding audio");
+        assert_eq!(at(11).0, "done");
+    }
+
+    /// Monotonic, and it ends at 1 rather than 0.99 -- a finished render must
+    /// not show a bar that never filled.
+    #[test]
+    fn the_yue2_fraction_never_goes_backwards() {
+        let mut last = 0.0;
+        let lines = yue2_lines();
+        for n in 1..=lines.len() {
+            let (stage, _) = yue2_stage(&lines[..n]).unwrap_or(("planning", 0));
+            let f = match stage {
+                "planning" => YUE2_PLAN,
+                "semantic" => YUE2_SEMANTIC,
+                "generating audio" => YUE2_NAR,
+                "decoding audio" => YUE2_VAE,
+                _ => 1.0,
+            };
+            assert!(f >= last, "fraction fell from {last} to {f} at line {n}");
+            last = f;
+        }
+        assert_eq!(last, 1.0);
+    }
+
+    /// NAR logs an index per chunk and no total, so the count is reported and
+    /// the bar holds rather than inventing a denominator.
+    #[test]
+    fn a_yue2_chunk_index_is_read_without_a_total() {
+        assert_eq!(
+            parse_yue2_chunk("[YuE2-NAR-Chunk] song=0 index=7 frames=120 solve_ms=1.0"),
+            Some(7)
+        );
+        assert_eq!(parse_yue2_chunk("[YuE2-NAR-Seal] song=0 chunk=[0,3623)"), None);
+    }
+
+    /// `[DiT] Step 39/50 t=0.240`
 fn parse_dit_step(line: &str) -> Option<(u32, u32)> {
     let rest = line.split("[DiT] Step ").nth(1)?;
     // `39/50` is a single whitespace-delimited token, so both halves come from

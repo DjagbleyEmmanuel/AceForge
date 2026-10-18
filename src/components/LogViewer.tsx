@@ -121,6 +121,16 @@ export function LogViewer({ running }: Props) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [lines, follow, collapsed]);
 
+  // Pausing is not the same as going back to the top: the box was left scrolled
+  // to the bottom, and a category chosen from there opens at the end of it,
+  // which is the same problem again by a different route. Read a chosen
+  // category from its first line.
+  useEffect(() => {
+    if (follow) return;
+    const el = boxRef.current;
+    if (el) el.scrollTop = 0;
+  }, [category, filter, follow, collapsed]);
+
   const needle = filter.trim().toLowerCase();
   /**
    * Filtered and classified in one pass. Recomputing per render is what this
@@ -149,6 +159,24 @@ export function LogViewer({ running }: Props) {
     return tally;
   }, [lines]);
 
+  /**
+   * Picking a category is a request to read that category, and following the
+   * tail is the opposite of it: the scroll effect below snaps to the bottom, so
+   * the first thing you saw was the last few lines and everything above them
+   * -- which is where a long warning starts -- was somewhere off screen. The
+   * same applies to typing in the filter.
+   *
+   * Following resumes from the paused button, which is where it already was in
+   * the code for scrolling up.
+   */
+  const pick = useCallback(
+    (next: LogCategory | "all") => {
+      setCategory(next);
+      if (next !== "all") setFollow(false);
+    },
+    [setFollow],
+  );
+
   const summary =
     category === "all" && !needle
       ? `${lines.length} lines`
@@ -171,7 +199,10 @@ export function LogViewer({ running }: Props) {
           <div className="flex flex-wrap items-center gap-1.5">
             <input
               value={filter}
-              onChange={(e) => setFilter(e.target.value)}
+              onChange={(e) => {
+                setFilter(e.target.value);
+                setFollow(false);
+              }}
               placeholder="filter"
               className="w-24 rounded border border-ink-700 bg-ink-900 px-2 py-1 font-mono text-[11px] text-ink-200 outline-none focus:border-glow-500/60"
             />
@@ -210,7 +241,7 @@ export function LogViewer({ running }: Props) {
               label="all"
               count={lines.length}
               active={category === "all"}
-              onClick={() => setCategory("all")}
+              onClick={() => pick("all")}
             />
             {CATEGORIES.map(({ id, label }) => {
               const n = counts[id] ?? 0;
@@ -221,7 +252,7 @@ export function LogViewer({ running }: Props) {
                   count={n}
                   active={category === id}
                   empty={n === 0}
-                  onClick={() => setCategory(id)}
+                  onClick={() => pick(id)}
                 />
               );
             })}

@@ -35,6 +35,19 @@ pub fn running_port() -> Option<u16> {
     *RUNNING_PORT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether a spawned engine is still running.
+///
+/// Deliberately does not touch the recorded port: this is asked from the render
+/// poll to tell "the engine exited" from "the engine is too busy to answer",
+/// and clearing the port out from under a render that is still going would be
+/// the wrong way to lose one.
+pub fn engine_alive() -> bool {
+    reap_finished();
+    let mut children = lock_children();
+    // Nothing tracked: this app did not start the engine, so it has no opinion.
+    children.is_empty() || children.iter_mut().any(|c| matches!(c.try_wait(), Ok(None)))
+}
+
 /// Reap anything that has exited and report the port only while the engine
 /// behind it is still alive.
 ///

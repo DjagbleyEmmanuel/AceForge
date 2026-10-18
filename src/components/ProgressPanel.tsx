@@ -129,12 +129,13 @@ export const ProgressPanel = memo(function ProgressPanel({
       : null;
 
   const step = progress?.step;
+  // The backend names the stage for both pipelines -- YuE2 has its own four and
+  // they arrive here verbatim -- so it is shown as given rather than collapsed
+  // back to ACE-Step's three.
   const detail =
     step && step[1] > 0
       ? `step ${step[0]}/${step[1]}`
-      : progress?.stage === "decoding"
-        ? "decoding audio"
-        : "planning";
+      : (progress?.stage ?? "planning");
 
   return (
     <div className="panel overflow-hidden p-3">
