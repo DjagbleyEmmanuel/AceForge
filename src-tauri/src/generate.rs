@@ -1645,70 +1645,6 @@ pub fn job_progress(models_dir: &std::path::Path, mark: u64) -> JobProgress {
     }
 }
 
-/// Real YuE2 log lines, from one measured render, driving the stage walk.
-    fn yue2_lines() -> Vec<String> {
-        [
-            "[YuE2] Loaded ar: AR 1.66 + NAR 0.00 + VAE(standard) 0.00 = 1.66 GB in 5804 ms",
-            "[YuE2-AR-Tokens] plan song=0 n=1441 hash=9fdad35d839bc877",
-            "[YuE2-AR-Tokens] semantic song=0 n=3623 hash=7e7ab0c93da60b46",
-            "[YuE2-NAR-Seal] song=0 chunk=[0,3623) shared_rows=5111 forwarded=1 ms=40.8",
-            "[YuE2] Evicted the AR half",
-            "[YuE2] Loaded nar: AR 0.00 + NAR 1.18 + VAE(standard) 0.00 = 1.18 GB in 72083 ms",
-            "[YuE2-NAR-Chunk] song=0 index=0 frames=3623 prefix_tokens=5112 solve_ms=862385.3 calls=64 variations=1",
-            "[YuE2] Loaded vae: AR 0.00 + NAR 0.00 + VAE(standard) 0.25 = 0.25 GB in 867 ms",
-            "[YuE2-Vae] Prepared (standard): 92 derived tensors, 121.3 MB",
-            "[YuE2] Unloaded",
-            "[YuE2-Job] 7be46db866eac26b: done (1 track(s), 3623 frames, end_reason=completed)",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-    }
-
-    /// The stage has to move forward as the log does, and the fraction has to
-    /// move with it -- a bar that reports "decoding" at 15% is worse than none.
-    #[test]
-    fn yue2_stages_advance_in_pipeline_order() {
-        let all = yue2_lines();
-        let at = |n: usize| yue2_stage(&all[..n]).unwrap_or(("planning", 0));
-        assert_eq!(at(1).0, "planning");
-        assert_eq!(at(3).0, "semantic");
-        assert_eq!(at(5).0, "generating audio");
-        assert_eq!(at(9).0, "decoding audio");
-        assert_eq!(at(11).0, "done");
-    }
-
-    /// Monotonic, and it ends at 1 rather than 0.99 -- a finished render must
-    /// not show a bar that never filled.
-    #[test]
-    fn the_yue2_fraction_never_goes_backwards() {
-        let mut last = 0.0;
-        let lines = yue2_lines();
-        for n in 1..=lines.len() {
-            let (stage, _) = yue2_stage(&lines[..n]).unwrap_or(("planning", 0));
-            let f = match stage {
-                "planning" => YUE2_PLAN,
-                "semantic" => YUE2_SEMANTIC,
-                "generating audio" => YUE2_NAR,
-                "decoding audio" => YUE2_VAE,
-                _ => 1.0,
-            };
-            assert!(f >= last, "fraction fell from {last} to {f} at line {n}");
-            last = f;
-        }
-        assert_eq!(last, 1.0);
-    }
-
-    /// NAR logs an index per chunk and no total, so the count is reported and
-    /// the bar holds rather than inventing a denominator.
-    #[test]
-    fn a_yue2_chunk_index_is_read_without_a_total() {
-        assert_eq!(
-            parse_yue2_chunk("[YuE2-NAR-Chunk] song=0 index=7 frames=120 solve_ms=1.0"),
-            Some(7)
-        );
-        assert_eq!(parse_yue2_chunk("[YuE2-NAR-Seal] song=0 chunk=[0,3623)"), None);
-    }
 
     /// `[DiT] Step 39/50 t=0.240`
 fn parse_dit_step(line: &str) -> Option<(u32, u32)> {
@@ -1844,6 +1780,71 @@ impl<R: std::io::Read + ?Sized> ReadToEnd for R {
 
 #[cfg(test)]
 mod tests {
+
+/// Real YuE2 log lines, from one measured render, driving the stage walk.
+    fn yue2_lines() -> Vec<String> {
+        [
+            "[YuE2] Loaded ar: AR 1.66 + NAR 0.00 + VAE(standard) 0.00 = 1.66 GB in 5804 ms",
+            "[YuE2-AR-Tokens] plan song=0 n=1441 hash=9fdad35d839bc877",
+            "[YuE2-AR-Tokens] semantic song=0 n=3623 hash=7e7ab0c93da60b46",
+            "[YuE2-NAR-Seal] song=0 chunk=[0,3623) shared_rows=5111 forwarded=1 ms=40.8",
+            "[YuE2] Evicted the AR half",
+            "[YuE2] Loaded nar: AR 0.00 + NAR 1.18 + VAE(standard) 0.00 = 1.18 GB in 72083 ms",
+            "[YuE2-NAR-Chunk] song=0 index=0 frames=3623 prefix_tokens=5112 solve_ms=862385.3 calls=64 variations=1",
+            "[YuE2] Loaded vae: AR 0.00 + NAR 0.00 + VAE(standard) 0.25 = 0.25 GB in 867 ms",
+            "[YuE2-Vae] Prepared (standard): 92 derived tensors, 121.3 MB",
+            "[YuE2] Unloaded",
+            "[YuE2-Job] 7be46db866eac26b: done (1 track(s), 3623 frames, end_reason=completed)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// The stage has to move forward as the log does, and the fraction has to
+    /// move with it -- a bar that reports "decoding" at 15% is worse than none.
+    #[test]
+    fn yue2_stages_advance_in_pipeline_order() {
+        let all = yue2_lines();
+        let at = |n: usize| yue2_stage(&all[..n]).unwrap_or(("planning", 0));
+        assert_eq!(at(1).0, "planning");
+        assert_eq!(at(3).0, "semantic");
+        assert_eq!(at(5).0, "generating audio");
+        assert_eq!(at(9).0, "decoding audio");
+        assert_eq!(at(11).0, "done");
+    }
+
+    /// Monotonic, and it ends at 1 rather than 0.99 -- a finished render must
+    /// not show a bar that never filled.
+    #[test]
+    fn the_yue2_fraction_never_goes_backwards() {
+        let mut last = 0.0;
+        let lines = yue2_lines();
+        for n in 1..=lines.len() {
+            let (stage, _) = yue2_stage(&lines[..n]).unwrap_or(("planning", 0));
+            let f = match stage {
+                "planning" => YUE2_PLAN,
+                "semantic" => YUE2_SEMANTIC,
+                "generating audio" => YUE2_NAR,
+                "decoding audio" => YUE2_VAE,
+                _ => 1.0,
+            };
+            assert!(f >= last, "fraction fell from {last} to {f} at line {n}");
+            last = f;
+        }
+        assert_eq!(last, 1.0);
+    }
+
+    /// NAR logs an index per chunk and no total, so the count is reported and
+    /// the bar holds rather than inventing a denominator.
+    #[test]
+    fn a_yue2_chunk_index_is_read_without_a_total() {
+        assert_eq!(
+            parse_yue2_chunk("[YuE2-NAR-Chunk] song=0 index=7 frames=120 solve_ms=1.0"),
+            Some(7)
+        );
+        assert_eq!(parse_yue2_chunk("[YuE2-NAR-Seal] song=0 chunk=[0,3623)"), None);
+    }
     use super::*;
 
     /// Self-cleaning temp directory. The progress tests write a real log file,
