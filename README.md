@@ -5,7 +5,7 @@
 **Local music generation with ACE-Step. Nothing leaves your machine.**
 
 [![release](https://img.shields.io/github/v/release/DjagbleyEmmanuel/AceForge.svg)](https://github.com/DjagbleyEmmanuel/AceForge/releases/latest)
-![licence](https://img.shields.io/badge/licence-unlicensed-lightgrey.svg)
+![licence](https://img.shields.io/badge/licence-MIT-blue.svg)
 
 </div>
 
@@ -135,8 +135,18 @@ use 12.6.
 
 ## Licence
 
-None. All rights reserved by default — see [the repository settings][lic] if you
-want to change that. The bundled engines and libraries keep their own licences.
+[MIT](LICENSE).
+
+Third-party components keep their own terms, which are compatible:
+
+| | |
+|---|---|
+| `minimp3` — vendored in `src-tauri/src/vendor/` | public domain (CC0) |
+| `acestep.cpp` — bundled engine binary | MIT |
+| HOT-Step CPP — bundled engine binary | MIT |
+
+The engine binaries are not in this repository; `scripts/fetch-resources.sh`
+fetches them from their own source trees.
 
 ## Development
 
@@ -149,5 +159,3 @@ npx tsc --noEmit
 ```
 
 There is no JavaScript test runner — frontend correctness is types plus reading.
-
-[lic]: https://github.com/DjagbleyEmmanuel/AceForge
