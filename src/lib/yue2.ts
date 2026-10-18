@@ -21,6 +21,11 @@ export interface StageSampling {
 }
 
 export interface Yue2Params {
+  /** User-supplied name for the file. Empty falls back to the style text,
+   *  then to the opening lyric line. Never sent to the engine: YuE2's route has
+   *  no title field, and the title names the file rather than steering the
+   *  render -- the same deal ACE-Step's title gets. */
+  title: string;
   /** A plain style sentence. Tempo and key go in this text: there are no
    *  separate fields for them on this pipeline. */
   style: string;
@@ -60,6 +65,7 @@ const unsetStage = (): StageSampling => ({
 });
 
 export const YUE2_DEFAULTS: Yue2Params = {
+  title: "",
   style: "",
   lyrics: "",
   cot: "full",

@@ -79,6 +79,12 @@ pub enum CotMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Yue2Params {
+    /// Names the output file. Empty falls back to the style text, then to the
+    /// opening lyric line. Deliberately absent from `to_json`: the engine's
+    /// YuE2 route has no title field, and this names a file rather than
+    /// steering the render.
+    #[serde(default)]
+    pub title: String,
     /// A plain style sentence. Tempo and key belong in this text; there are no
     /// separate fields for them on this pipeline.
     pub style: String,
@@ -152,6 +158,7 @@ fn one_point_five() -> f32 {
 impl Default for Yue2Params {
     fn default() -> Self {
         Yue2Params {
+            title: String::new(),
             style: String::new(),
             lyrics: String::new(),
             cot: CotMode::Full,
@@ -519,7 +526,7 @@ pub fn render(
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
     let stamp = generate::now_secs();
-    let stem_base = crate::paths::song_stem("", &params.style, &params.lyrics);
+    let stem_base = crate::paths::song_stem(&params.title, &params.style, &params.lyrics);
 
     let mut tracks = Vec::new();
     for (index, data) in parts.iter().enumerate() {
@@ -704,6 +711,30 @@ mod tests {
             assert!(crate::abc::lyric_timings(abc, lyrics).is_err());
         }
         assert!(!spread_lrc(lyrics, 30.0).is_empty());
+    }
+
+    /// The title names the file, so it has to win over the style text the way
+    /// it does for ACE-Step. A user who typed a name should not find their
+    /// track called after their own prompt.
+    #[test]
+    fn a_title_names_the_yue2_file() {
+        let mut params = Yue2Params::default();
+        params.style = "One warm reggae song in D minor".into();
+        params.lyrics = "[Verse]\nI walked the long road home".into();
+        assert_eq!(crate::paths::song_stem(&params.title, &params.style, &params.lyrics), "one-warm-reggae-song-in-d-minor");
+        params.title = "Neon Rain".into();
+        assert_eq!(crate::paths::song_stem(&params.title, &params.style, &params.lyrics), "neon-rain");
+    }
+
+    /// The engine's YuE2 route has no title field. Sending one would be a lie
+    /// the engine ignores, or worse a strict-mode 400 -- either way the title
+    /// has to stay out of the wire and name the file locally instead.
+    #[test]
+    fn the_title_never_reaches_the_engine() {
+        let mut params = Yue2Params::default();
+        params.title = "Neon Rain".into();
+        let json = params.to_json();
+        assert!(json.get("title").is_none(), "title leaked into the request");
     }
 
     #[test]

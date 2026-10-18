@@ -203,6 +203,23 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
         )}
 
         <div>
+          <label className="label" htmlFor="yue-title">
+            Title
+          </label>
+          <input
+            id="yue-title"
+            type="text"
+            value={params.title}
+            onChange={(e) => setParams((p) => ({ ...p, title: e.target.value }))}
+            placeholder="Neon Rain"
+            className="field"
+          />
+          <p className="mt-1 text-[10px] leading-relaxed text-ink-500">
+            Names the file. Leave it empty and the style text is used instead.
+          </p>
+        </div>
+
+        <div>
           <label className="label" htmlFor="yue-style">
             Style
           </label>
