@@ -85,6 +85,13 @@ pub struct Yue2Params {
     /// steering the render.
     #[serde(default)]
     pub title: String,
+    /// "mp3" or "wav". YuE2's engine has no format field at all -- it hardcodes
+    /// `result_mime = "audio/wav"` -- so this is applied here, after the render.
+    /// ACE-Step can ask its engine directly; YuE2 cannot.
+    #[serde(default)]
+    pub output_format: String,
+    #[serde(default = "default_mp3_bitrate")]
+    pub mp3_bitrate: i32,
     /// Which installed language model to run. Empty asks the engine to pick,
     /// which is left as its own decision rather than second-guessed here.
     #[serde(default)]
@@ -163,6 +170,11 @@ impl Default for Yue2Params {
     fn default() -> Self {
         Yue2Params {
             title: String::new(),
+            // MP3 by default, matching ACE-Step. A YuE2 render is minutes of
+            // work and lands as tens of megabytes of PCM, which is a poor
+            // default for something you are going to listen to more than once.
+            output_format: "mp3".into(),
+            mp3_bitrate: 128,
             lm_type: String::new(),
             style: String::new(),
             lyrics: String::new(),
@@ -633,6 +645,72 @@ fn staged_plan_then_audio(
     run_stage(port, &audio, models_dir, on_stage, "rendering score", "rendering")
 }
 
+/// The bitrate a YuE2 render is encoded at, clamped to something sane.
+fn mp3_bitrate_of(params: &Yue2Params) -> u32 {
+    params.mp3_bitrate.clamp(64, 320) as u32
+}
+
+fn default_mp3_bitrate() -> i32 {
+    128
+}
+
+/// Whether an MP3 encode can be attempted at all.
+///
+/// Checked once at startup rather than per track: the answer cannot change
+/// while the app runs, and spawning `ffmpeg -version` for every take would be
+/// silly.
+pub fn ffmpeg_available() -> bool {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Re-encode a finished WAV as MP3, returning the new path.
+///
+/// Every failure is an `Err`, and the caller keeps the WAV: the render is
+/// already on disk and correct, and discarding it because a re-encode did not
+/// work would be a bad trade. Duration is read from the WAV before this point
+/// and never re-derived, so sidecar timings do not depend on the encode having
+/// succeeded.
+fn to_mp3(wav: &std::path::Path, bitrate: u32) -> Result<std::path::PathBuf, String> {
+    let mp3 = wav.with_extension("mp3");
+    let out = std::process::Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(wav)
+        .arg("-codec:a")
+        .arg("libmp3lame")
+        .arg("-b:a")
+        .arg(format!("{bitrate}k"))
+        .arg(&mp3)
+        .output()
+        .map_err(|e| format!("ffmpeg could not be run: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("ffmpeg exited with {}", out.status)
+        } else {
+            err
+        });
+    }
+    // A zero-byte file means the encoder reported success and wrote nothing.
+    // Treating that as success would leave a library row pointing at nothing.
+    match std::fs::metadata(&mp3) {
+        Ok(m) if m.len() > 0 => Ok(mp3),
+        _ => {
+            let _ = std::fs::remove_file(&mp3);
+            Err("ffmpeg produced an empty file".into())
+        }
+    }
+}
+
 pub fn render(
     port: u16,
     params: &Yue2Params,
@@ -703,16 +781,41 @@ pub fn render(
         if !is_wav(data) {
             continue;
         }
+        // The engine only ever hands back WAV, so the extension written first
+        // is the engine's, not the requested one. `audio_path` below is what the
+        // library ends up pointing at.
         let stem = crate::paths::unique_path(&out_dir, &stem_base, "wav");
-        let path = PathBuf::from(stem);
-        let path = if index == 0 {
-            path
+        let wav_path = PathBuf::from(stem);
+        let wav_path = if index == 0 {
+            wav_path
         } else {
             crate::paths::unique_path(&out_dir, &format!("{stem_base}-{index}"), "wav")
         };
-        std::fs::write(&path, data)
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        std::fs::write(&wav_path, data)
+            .map_err(|e| format!("cannot write {}: {e}", wav_path.display()))?;
+        // Taken from the WAV bytes, before any re-encode, so the sidecar
+        // timings never depend on the encode having worked.
         let seconds = wav_seconds(data);
+
+        // YuE2's engine hardcodes WAV and offers no format of its own, so the
+        // choice is honoured here. A failed encode keeps the WAV: losing a
+        // render that took minutes to produce because a re-encode did not work
+        // would be a bad trade.
+        let mut path = wav_path.clone();
+        if params.output_format == "mp3" {
+            match to_mp3(&wav_path, mp3_bitrate_of(params)) {
+                Ok(mp3) => {
+                    // Only drop the WAV once the MP3 is confirmed on disk.
+                    let _ = std::fs::remove_file(&wav_path);
+                    path = mp3;
+                }
+                Err(why) => {
+                    eprintln!(
+                        "[yue2] keeping WAV, mp3 encode failed: {why} -- install ffmpeg for mp3 output"
+                    );
+                }
+            }
+        }
 
         // The sidecar ACE-Step renders get, so the library has something to
         // show and the two engines produce the same shape of output. Written
@@ -951,6 +1054,80 @@ mod tests {
     /// The engine builds `yue2-lm-<lm_type>.gguf` from what the picker sends,
     /// so the middle of that filename is the whole contract. An `-imat` suffix
     /// is part of the name and has to survive the round trip.
+    /// A real encode, because the size claim is the whole point and a mock
+    /// would prove nothing about it. ffmpeg is skipped rather than failed when
+    /// it is absent, so the suite still passes on a machine without it.
+    #[test]
+    fn an_encode_shrinks_the_file_by_roughly_the_bitrate_ratio() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg missing; skipping the encode test");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("aceforge-mp3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+
+        // Two seconds of silence, written by ffmpeg so the fixture does not
+        // have to encode PCM by hand.
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+            .arg("-i")
+            .arg("sine=frequency=440:duration=2")
+            .arg(&wav)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            std::fs::remove_dir_all(&dir).ok();
+            eprintln!("ffmpeg could not make the fixture; skipping");
+            return;
+        }
+        let wav_bytes = std::fs::metadata(&wav).unwrap().len();
+
+        let mp3 = to_mp3(&wav, 128).expect("encode should succeed");
+        let mp3_bytes = std::fs::metadata(&mp3).unwrap().len();
+        assert_eq!(mp3.extension().unwrap(), "mp3");
+        assert!(
+            mp3_bytes < wav_bytes / 4,
+            "128k mp3 ({mp3_bytes}) should be far smaller than wav ({wav_bytes})"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The WAV has to survive a failed encode. Throwing it away would lose a
+    /// render that took minutes to produce over a re-encode.
+    #[test]
+    fn a_failed_encode_leaves_the_wav_alone() {
+        let dir = std::env::temp_dir().join(format!("aceforge-mp3b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("not-audio.wav");
+        std::fs::write(&wav, b"RIFFnot really a wav").unwrap();
+
+        // Not skipped even without ffmpeg: a missing encoder and a failing one
+        // both have to come back as Err rather than a panic or a silent Ok.
+        assert!(to_mp3(&wav, 128).is_err());
+        assert!(wav.exists(), "the source must survive a failed encode");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_bitrate_is_clamped_to_something_sane() {
+        let mut p = Yue2Params::default();
+        p.mp3_bitrate = 9_999_999;
+        assert_eq!(mp3_bitrate_of(&p), 320);
+        p.mp3_bitrate = -5;
+        assert_eq!(mp3_bitrate_of(&p), 64);
+        p.mp3_bitrate = 192;
+        assert_eq!(mp3_bitrate_of(&p), 192);
+    }
+
+    /// mp3 is the default, matching ACE-Step. A YuE2 render is minutes of work
+    /// and lands as tens of megabytes of PCM otherwise.
+    #[test]
+    fn renders_default_to_mp3() {
+        assert_eq!(Yue2Params::default().output_format, "mp3");
+    }
+
     #[test]
     fn an_lm_type_is_the_middle_of_the_filename() {
         assert_eq!(lm_type_of("yue2-lm-Q6_K.gguf").as_deref(), Some("Q6_K"));

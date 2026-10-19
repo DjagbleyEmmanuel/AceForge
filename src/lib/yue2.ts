@@ -26,6 +26,10 @@ export interface Yue2Params {
    *  no title field, and the title names the file rather than steering the
    *  render -- the same deal ACE-Step's title gets. */
   title: string;
+  /** "mp3" or "wav". YuE2's engine has no format field -- it hardcodes WAV --
+   *  so this is applied by the app after the render. */
+  outputFormat: string;
+  mp3Bitrate: number;
   /** Which installed LM to run. Empty leaves the choice to the engine, which
    *  is not the same as picking the first one in this list. */
   lmType: string;
@@ -69,6 +73,8 @@ const unsetStage = (): StageSampling => ({
 
 export const YUE2_DEFAULTS: Yue2Params = {
   title: "",
+  outputFormat: "mp3",
+  mp3Bitrate: 128,
   lmType: "",
   style: "",
   lyrics: "",

@@ -270,6 +270,31 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
           </p>
         </div>
 
+        <div className="grid grid-cols-2 gap-2">
+          <Select
+            label="Format"
+            value={params.outputFormat}
+            onChange={(v) => setParams((p) => ({ ...p, outputFormat: v }))}
+            options={[
+              { value: "mp3", label: "mp3", note: "About an eighth of the size. Needs ffmpeg; without it the WAV is kept." },
+              { value: "wav", label: "wav", note: "Uncompressed, as the engine returns it." },
+            ]}
+          />
+          <Select
+            label="Bitrate"
+            value={String(params.mp3Bitrate)}
+            onChange={(v) =>
+              setParams((p) => ({ ...p, mp3Bitrate: Number(v) || 128 }))
+            }
+            options={[
+              { value: "128", label: "128 kbps", note: "Same as ACE-Step's default." },
+              { value: "192", label: "192 kbps", note: "Noticeably better on cymbals and reverb tails." },
+              { value: "320", label: "320 kbps", note: "Larger file, diminishing return." },
+            ]}
+            note={params.outputFormat === "mp3" ? undefined : "Only used for mp3."}
+          />
+        </div>
+
         <div>
           <Select
             label="Model"
