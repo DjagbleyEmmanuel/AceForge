@@ -1023,9 +1023,23 @@ fn queue_list() -> Vec<queue::QueuedJob> {
     queue::list()
 }
 
+/// Add a job to the queue.
+///
+/// `yue2_params` being present is what selects the engine, rather than a
+/// separate flag that could disagree with the parameters it was sent with.
 #[tauri::command]
-fn queue_add(params: generate::GenerateParams) -> queue::QueuedJob {
-    queue::enqueue(params)
+fn queue_add(
+    params: Option<generate::GenerateParams>,
+    yue2_params: Option<yue2::Yue2Params>,
+) -> queue::QueuedJob {
+    match yue2_params {
+        Some(yue2) => queue::enqueue_on(
+            queue::QueueBackend::Yue2,
+            params.unwrap_or_default(),
+            Some(yue2),
+        ),
+        None => queue::enqueue(params.unwrap_or_else(generate::GenerateParams::default)),
+    }
 }
 
 #[tauri::command]

@@ -10,6 +10,8 @@ import {
   type Yue2Params,
 } from "../lib/yue2";
 import { formatBytes } from "../lib/engines";
+import { queue } from "../lib/api";
+import { useQueueBusy } from "../lib/queueBusy";
 import { Select } from "./Select";
 
 interface Props {
@@ -125,19 +127,48 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
     return () => clearInterval(t);
   }, [loadLms]);
 
-  const { props, error: propsError } = useYue2Props(port, true, busy);
+  // A render owned by the runner, not by this panel. Switching tabs unmounts
+  // the panel, and a render awaited from here is orphaned with it: nothing left
+  // to show progress, and nothing to stop a second render being submitted over
+  // the top of it.
+  const queueBusy = useQueueBusy();
+  const { props, error: propsError } = useYue2Props(port, true, busy || queueBusy);
   const weights = useMemo(() => (props ? readWeights(props) : null), [props]);
 
   const ready = !!props?.available && !!weights?.lm && !!weights?.vae;
 
   const canSubmit =
-    ready && !busy && params.style.trim().length > 0 && params.style.trim().length < 2000;
+    ready &&
+    !busy &&
+    !queueBusy &&
+    params.style.trim().length > 0 &&
+    params.style.trim().length < 2000;
 
   async function run(planOnly: boolean, semanticOnly = false) {
     if (port === null) return;
-    setBusy(true);
     setError(null);
     setNotice(null);
+
+    // A full render goes to the runner, like every other engine. Plan-only and
+    // semantic-only stay here: their results are a score and a codec stream,
+    // which the queue row has nowhere to carry, and a plan-only job produces no
+    // audio at all -- queued, the row would report it as a failure.
+    if (!planOnly && !semanticOnly) {
+      try {
+        // No ACE-Step parameters: a YuE2 job runs off its own. The row still
+        // carries an empty placeholder, because the queue struct has held those
+        // fields since before YuE2 was queued and reshaping it now would mean
+        // migrating every saved queue.
+        await queue.add(null, { ...params, planOnly: false, semanticOnly: false });
+        setNotice("Added to the queue — progress is in the queue below.");
+        setTimeout(() => setNotice(null), 2600);
+      } catch (e) {
+        setError(String(e));
+      }
+      return;
+    }
+
+    setBusy(true);
     try {
       const outcome = await yue2Api.render(port, {
         ...params,

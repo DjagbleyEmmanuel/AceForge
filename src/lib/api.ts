@@ -15,6 +15,7 @@ import type {
   TrackNotes,
   WeightFile,
 } from "./types";
+import type { Yue2Params } from "./yue2";
 
 export type { WeightFile, SavedSeed, Layer, LayerStack, Section, SongProject };
 
@@ -318,7 +319,11 @@ export const generate = {
  *  backend runner decides when it starts. */
 export const queue = {
   list: () => invoke<QueuedJob[]>("queue_list"),
-  add: (params: GenerateParams) => invoke<QueuedJob>("queue_add", { params }),
+  /** Hand a job to the runner and return immediately. Passing `yue2` is what
+   *  selects the engine: there is no separate backend flag that could disagree
+   *  with the parameters it was sent alongside. */
+  add: (params: GenerateParams | null, yue2?: Yue2Params | null) =>
+    invoke<QueuedJob>("queue_add", { params, yue2Params: yue2 ?? null }),
   cancel: (jobId: string) => invoke<null>("queue_cancel", { jobId }),
   retry: (jobId: string) => invoke<QueuedJob>("queue_retry", { jobId }),
   discard: (jobId: string) => invoke<null>("queue_discard", { jobId }),

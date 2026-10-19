@@ -50,10 +50,32 @@ impl JobState {
     }
 }
 
+/// Which engine a queued job runs on.
+///
+/// YuE2 was rendered by awaiting a command directly, so a YuE2 render had no
+/// queue row at all: nothing to show, nothing to cancel, and no progress. It
+/// was the last engine still bypassing the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueBackend {
+    #[default]
+    Acestep,
+    Yue2,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedJob {
     pub id: String,
+    /// The ACE-Step parameters. Always present, and defaulted rather than
+    /// optional, because a row written before YuE2 existed has to still
+    /// deserialize -- an optional field here would make every saved queue a
+    /// parse failure.
     pub params: GenerateParams,
+    /// The YuE2 parameters, when this is a YuE2 job.
+    #[serde(default)]
+    pub yue2_params: Option<crate::yue2::Yue2Params>,
+    #[serde(default)]
+    pub backend: QueueBackend,
     pub state: JobState,
     pub error: Option<String>,
     pub track_ids: Vec<String>,
@@ -92,9 +114,31 @@ impl QueuedJob {
 
     /// One-line summary for the queue list.
     pub fn label(&self) -> String {
-        let caption = self.params.caption.trim();
-        let base = if caption.is_empty() {
-            "(no caption)"
+        // A YuE2 job has no caption to show. Its row is labelled by the title
+        // the user gave it, falling back to the style sentence -- without this
+        // every YuE2 job would read "(no caption)", which is both untrue and
+        // useless for telling two of them apart.
+        let caption = match self.backend {
+            QueueBackend::Yue2 => self
+                .yue2_params
+                .as_ref()
+                .map(|p| {
+                    let title = p.title.trim();
+                    if title.is_empty() {
+                        p.style.trim()
+                    } else {
+                        title
+                    }
+                    .to_string()
+                })
+                .unwrap_or_default(),
+            QueueBackend::Acestep => self.params.caption.trim().to_string(),
+        };
+        let base: String = if caption.is_empty() {
+            match self.backend {
+                QueueBackend::Yue2 => "YuE2 render".to_string(),
+                QueueBackend::Acestep => "(no caption)".to_string(),
+            }
         } else {
             caption
         };
@@ -102,7 +146,7 @@ impl QueuedJob {
             let head: String = base.chars().take(59).collect();
             format!("{head}…")
         } else {
-            base.to_string()
+            base
         }
     }
 }
@@ -219,6 +263,15 @@ fn now_secs() -> u64 {
 
 /// Enqueue a job and return it. Submission never blocks on the engine.
 pub fn enqueue(params: GenerateParams) -> QueuedJob {
+    enqueue_on(QueueBackend::Acestep, params, None)
+}
+
+/// Add a job for a specific engine.
+pub fn enqueue_on(
+    backend: QueueBackend,
+    params: GenerateParams,
+    yue2_params: Option<crate::yue2::Yue2Params>,
+) -> QueuedJob {
     // A negative seed is the UI's "random" sentinel, and the backend resolves it
     // internally with `random_device` without ever reporting the value back.
     // Pinning it now is what makes a job reproducible: the row shows the seed,
@@ -230,6 +283,8 @@ pub fn enqueue(params: GenerateParams) -> QueuedJob {
     let job = QueuedJob {
         id: next_id(),
         params,
+        yue2_params,
+        backend,
         state: JobState::Queued,
         error: None,
         track_ids: Vec::new(),
@@ -308,6 +363,11 @@ pub fn retry(job_id: String) -> Result<QueuedJob, String> {
         let fresh = QueuedJob {
             id: fresh_id,
             params: job.params.clone(),
+            // Retry has to carry the engine and its parameters too. A YuE2 job
+            // retried as ACE-Step would submit a caption it does not have, and
+            // a YuE2 row that dropped them would render nothing at all.
+            yue2_params: job.yue2_params.clone(),
+            backend: job.backend,
             state: JobState::Queued,
             error: None,
             track_ids: Vec::new(),
@@ -494,17 +554,22 @@ pub fn spawn_runner() {
                 continue;
             };
 
-            let params = {
+            // Read the whole job in one pass. Taking the fields separately would
+            // mean two locks, and a job retried between them could hand the
+            // runner a backend from one row and parameters from another.
+            let (params, backend, yue2_params) = {
                 let jobs = inner.jobs.lock().unwrap_or_else(|e| e.into_inner());
-                jobs.iter()
-                    .find(|j| j.id == job_id)
-                    .map(|j| j.params.clone())
+                match jobs.iter().find(|j| j.id == job_id) {
+                    Some(j) => (j.params.clone(), j.backend, j.yue2_params.clone()),
+                    None => continue,
+                }
             };
-            let Some(params) = params else { continue };
 
             set_running(&job_id);
 
             let params_for_run = params.clone();
+            let backend_for_run = backend;
+            let yue2_for_run = yue2_params.clone();
             let id_for_run = job_id.clone();
             let result = std::thread::spawn(move || {
                 use tauri::Emitter;
@@ -524,7 +589,28 @@ pub fn spawn_runner() {
                         let _ = app.emit("queue://stage", (job_id_for_cb.clone(), "running", id));
                     }
                 };
-                crate::generate::generate(port, &params_for_run, &mut stage, &mut job)
+                // A YuE2 job and an ACE-Step job share the thread, the
+                // callbacks and the queue row; only the call differs. YuE2
+                // takes no `job` callback because it does not expose the
+                // backend job id the way ACE-Step's /synth does, and nothing
+                // depends on it -- cancellation is per-queue-row.
+                match &backend_for_run {
+                    QueueBackend::Yue2 => {
+                        let yue2_params = yue2_for_run
+                            .ok_or_else(|| "this YuE2 job has no parameters".to_string())?;
+                        crate::yue2::render(port, &yue2_params, &mut stage)
+                            .map(|outcome| crate::generate::GenerateOutcome {
+                                tracks: outcome.tracks,
+                                cancelled: outcome.cancelled,
+                            })
+                    }
+                    QueueBackend::Acestep => crate::generate::generate(
+                        port,
+                        &params_for_run,
+                        &mut stage,
+                        &mut job,
+                    ),
+                }
             })
             .join();
 
@@ -569,6 +655,109 @@ fn wait_for_engine() -> Option<u16> {
 mod tests {
     use super::*;
 
+    /// A YuE2 row with no caption has to be identifiable. Every one of them
+    /// reading "(no caption)" would be a queue you cannot tell apart, which is
+    /// the same as no queue at all.
+    #[test]
+    fn a_yue2_row_is_labelled_by_its_title_or_style() {
+        let mut row = job(JobState::Queued, 0.0, 0.0);
+        row.backend = QueueBackend::Yue2;
+
+        row.yue2_params = Some(crate::yue2::Yue2Params {
+            title: "Neon Rain".into(),
+            style: "warm reggae".into(),
+            ..Default::default()
+        });
+        assert_eq!(row.label(), "Neon Rain");
+
+        row.yue2_params = Some(crate::yue2::Yue2Params {
+            title: "  ".into(),
+            style: "warm reggae in D minor".into(),
+            ..Default::default()
+        });
+        assert_eq!(row.label(), "warm reggae in D minor");
+
+        // And a YuE2 row whose parameters went missing says so, rather than
+        // borrowing ACE-Step's "(no caption)".
+        row.yue2_params = None;
+        assert_eq!(row.label(), "YuE2 render");
+
+        // ACE-Step is untouched.
+        let mut ace = job(JobState::Queued, 0.0, 0.0);
+        ace.params = params_with_caption("a song about rain");
+        assert_eq!(ace.label(), "a song about rain");
+    }
+
+    /// A queue written just before YuE2 existed has no backend and no YuE2
+    /// parameters. Losing the saved queue on upgrade would be a worse bug than
+    /// the one these fields were added for.
+    #[test]
+    fn a_queue_saved_before_yue2_still_loads() {
+        let legacy = serde_json::json!([{
+            "id": "q1",
+            "params": { "caption": "old song" },
+            "state": "done",
+            "error": null,
+            "track_ids": [],
+            "created_at": 1,
+            "started_at": 2,
+            "finished_at": 3,
+            "audio_secs": 12.0,
+            "elapsed_secs": 1.0,
+            "log_mark": 0
+        }]);
+        let jobs: Vec<QueuedJob> = serde_json::from_value(legacy).expect("a pre-YuE2 queue loads");
+        assert_eq!(jobs[0].backend, QueueBackend::Acestep);
+        assert!(jobs[0].yue2_params.is_none());
+        assert_eq!(jobs[0].params.caption, "old song");
+    }
+
+    /// A YuE2 row has to keep its engine and its parameters, or Retry turns it
+    /// into an ACE-Step job holding a caption it never had.
+    #[test]
+    fn a_yue2_job_keeps_its_engine_and_parameters() {
+        let yue2 = crate::yue2::Yue2Params {
+            style: "warm reggae".into(),
+            lyrics: "[Verse]\nline".into(),
+            lm_type: "Q4_K_M-imat".into(),
+            ..Default::default()
+        };
+        let job = QueuedJob {
+            id: "q2".into(),
+            params: params_with_caption(""),
+            yue2_params: Some(yue2.clone()),
+            backend: QueueBackend::Yue2,
+            state: JobState::Queued,
+            error: None,
+            track_ids: Vec::new(),
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            audio_secs: 0.0,
+            elapsed_secs: 0.0,
+            log_mark: 0,
+        };
+        let round: QueuedJob = serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
+        assert_eq!(round.backend, QueueBackend::Yue2);
+        let back = round.yue2_params.expect("the parameters survived the round trip");
+        assert_eq!(back.style, "warm reggae");
+        assert_eq!(back.lm_type, "Q4_K_M-imat");
+    }
+
+    /// The backend has to be told by the parameters, not by a flag that could
+    /// disagree with them.
+    #[test]
+    fn yue2_parameters_choose_the_engine() {
+        let yue2 = crate::yue2::Yue2Params::default();
+        let with = enqueue_on(QueueBackend::Yue2, params_with_caption(""), Some(yue2));
+        assert_eq!(with.backend, QueueBackend::Yue2);
+        assert!(with.yue2_params.is_some());
+
+        let without = enqueue(params_with_caption(""));
+        assert_eq!(without.backend, QueueBackend::Acestep);
+        assert!(without.yue2_params.is_none());
+    }
+
     /// Every other field has a serde default, so a bare caption is a valid
     /// `GenerateParams`. Building it this way keeps the test from having to name
     /// fields that the struct may later add.
@@ -581,6 +770,8 @@ mod tests {
         QueuedJob {
             id: "q1".into(),
             params: params_with_caption(""),
+            yue2_params: None,
+            backend: QueueBackend::Acestep,
             state,
             error: None,
             track_ids: Vec::new(),
@@ -670,6 +861,8 @@ mod tests {
         state().update(|jobs| {
             jobs.push(QueuedJob {
                 id: "q-isolation-probe".into(),
+                yue2_params: None,
+                backend: QueueBackend::Acestep,
                 params: params_with_caption("isolation probe"),
                 state: JobState::Failed,
                 error: Some("probe".into()),
@@ -703,6 +896,8 @@ mod tests {
         inner.update(|jobs| {
             jobs.push(QueuedJob {
                 id: "q-retry-src".into(),
+                yue2_params: None,
+                backend: QueueBackend::Acestep,
                 params: params_with_caption("retry me"),
                 state: JobState::Failed,
                 error: Some("boom".into()),
@@ -755,6 +950,8 @@ mod tests {
         inner.update(|jobs| {
             jobs.push(QueuedJob {
                 id: "q-clear-me".into(),
+                yue2_params: None,
+                backend: QueueBackend::Acestep,
                 params: params_with_caption("clear me"),
                 state: JobState::Failed,
                 error: Some("boom".into()),
@@ -762,11 +959,15 @@ mod tests {
             });
             jobs.push(QueuedJob {
                 id: keep_done.into(),
+                yue2_params: None,
+                backend: QueueBackend::Acestep,
                 params: params_with_caption("keep done"),
                 ..job(JobState::Done, 30.0, 40.0)
             });
             jobs.push(QueuedJob {
                 id: keep_queued.into(),
+                yue2_params: None,
+                backend: QueueBackend::Acestep,
                 params: params_with_caption("keep queued"),
                 ..job(JobState::Queued, 0.0, 0.0)
             });

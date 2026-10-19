@@ -3,6 +3,7 @@ import type { GenerateParams } from "../lib/api";
 import { server } from "../lib/api";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useYue2Props, YUE2_DEFAULTS, type Yue2Params } from "../lib/yue2";
+import { useQueueBusy } from "../lib/queueBusy";
 import { Select } from "./Select";
 import { Yue2Panel } from "./Yue2Panel";
 
@@ -46,7 +47,15 @@ export function HotStepPanel({
   const [yue2, setYue2] = useState<Yue2Params>(YUE2_DEFAULTS);
   // Asked once here so the switch can say "no weights" before the form is
   // opened, rather than after someone has filled the style box in.
-  const { props: yue2Props } = useYue2Props(port, true);
+  //
+  // Paused while the runner holds a job. This poll is unpaused by default, and
+  // an unpaused one fires every eight seconds for the whole of a YuE2 render --
+  // each request blocking behind the render until it times out. That is what
+  // produced "could not ask the engine about YuE2" on a perfectly healthy
+  // engine, and it is why the panel had to be recovered by restarting the
+  // server: the requests kept coming.
+  const queueBusy = useQueueBusy();
+  const { props: yue2Props } = useYue2Props(port, true, queueBusy);
   const yue2Ready = !!yue2Props?.available;
 
   /** Solvers this engine will actually run, asked of the engine rather than

@@ -29,7 +29,14 @@ const STATE_LABEL: Record<JobState, string> = {
 /** Truncated caption for the row. Mirrors `QueuedJob::label` on the Rust side;
  *  `label` is a method, so it is not present in the serialised job. */
 function jobLabel(job: QueuedJob): string {
-  const base = job.params.caption.trim() || "(no caption)";
+  // Mirrors QueuedJob::label: a YuE2 row is named by its title or style, since
+  // it has no caption. See the Rust side for why.
+  const yue2 = job.yue2_params;
+  const source =
+    job.backend === "yue2"
+      ? yue2?.title.trim() || yue2?.style.trim() || "YuE2 render"
+      : job.params.caption.trim();
+  const base = source || "(no caption)";
   return [...base].length > 60 ? `${[...base].slice(0, 59).join("")}…` : base;
 }
 
@@ -168,7 +175,14 @@ export function QueuePanel({ onGenerated }: Props) {
                   </span>
 
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-xs text-ink-200" title={job.params.caption}>
+                    <p
+                      className="truncate text-xs text-ink-200"
+                      title={
+                        job.backend === "yue2"
+                          ? job.yue2_params?.title || job.yue2_params?.style
+                          : job.params.caption
+                      }
+                    >
                       {jobLabel(job)}
                     </p>
                     <p className="mt-0.5 text-[11px] text-ink-500">

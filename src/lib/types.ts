@@ -129,9 +129,21 @@ export type JobState =
   | "cancelled"
   | "interrupted";
 
+/** Which engine a queued job runs on. Rows written before YuE2 was queued
+ *  read back as "acestep", which is what they are. */
+export type { Yue2Params } from "./yue2";
+import type { Yue2Params } from "./yue2";
+
+export type QueueBackend = "acestep" | "yue2";
+
 export interface QueuedJob {
   id: string;
+  /** The ACE-Step parameters. Present on every row, including YuE2 ones, where
+   *  it is an empty placeholder the struct needs rather than anything used. */
   params: GenerateParams;
+  /** The YuE2 parameters, when this is a YuE2 job. */
+  yue2_params: Yue2Params | null;
+  backend: QueueBackend;
   state: JobState;
   error: string | null;
   track_ids: string[];
