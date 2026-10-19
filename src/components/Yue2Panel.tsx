@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   readWeights,
   yue2Api,
@@ -6,6 +6,7 @@ import {
   YUE2_DEFAULTS,
   type CotMode,
   type StageSampling,
+  type Yue2Lm,
   type Yue2Params,
 } from "../lib/yue2";
 import { formatBytes } from "../lib/engines";
@@ -104,6 +105,25 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [score, setScore] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+
+  // The installed models, read from disk rather than from the engine: the pick
+  // has to be made before a job is submitted, so it cannot wait on a sidecar.
+  // Polled slowly for the same reason props are -- a download can finish while
+  // the window is open, and the list should catch up without a reopen.
+  const [lms, setLms] = useState<Yue2Lm[]>([]);
+  const loadLms = useCallback(async () => {
+    try {
+      setLms(await yue2Api.lms());
+    } catch {
+      // An unreadable models directory leaves the picker on "engine picks",
+      // which is the behaviour before any of this existed.
+    }
+  }, []);
+  useEffect(() => {
+    void loadLms();
+    const t = setInterval(() => void loadLms(), 15000);
+    return () => clearInterval(t);
+  }, [loadLms]);
 
   const { props, error: propsError } = useYue2Props(port, true, busy);
   const weights = useMemo(() => (props ? readWeights(props) : null), [props]);
@@ -217,6 +237,27 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
           <p className="mt-1 text-[10px] leading-relaxed text-ink-500">
             Names the file. Leave it empty and the style text is used instead.
           </p>
+        </div>
+
+        <div>
+          <Select
+            label="Model"
+            value={params.lmType}
+            onChange={(v) => setParams((p) => ({ ...p, lmType: v }))}
+            options={[
+              { value: "", label: "engine picks", note: "Largest model the engine finds first. This is what a render used before this picker existed." },
+              ...lms.map((m) => ({
+                value: m.lmType,
+                label: m.lmType,
+                meta: formatBytes(m.sizeBytes),
+              })),
+            ]}
+            note={
+              lms.length === 0
+                ? "No yue2-lm-*.gguf found in the models directory, so there is nothing to choose between."
+                : "Sized smallest first. On a 4 GB card the smallest is the one most likely to finish; the split render already avoids the two-caches-at-once collision."
+            }
+          />
         </div>
 
         <div>

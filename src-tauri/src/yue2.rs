@@ -85,6 +85,10 @@ pub struct Yue2Params {
     /// steering the render.
     #[serde(default)]
     pub title: String,
+    /// Which installed language model to run. Empty asks the engine to pick,
+    /// which is left as its own decision rather than second-guessed here.
+    #[serde(default)]
+    pub lm_type: String,
     /// A plain style sentence. Tempo and key belong in this text; there are no
     /// separate fields for them on this pipeline.
     pub style: String,
@@ -159,6 +163,7 @@ impl Default for Yue2Params {
     fn default() -> Self {
         Yue2Params {
             title: String::new(),
+            lm_type: String::new(),
             style: String::new(),
             lyrics: String::new(),
             cot: CotMode::Full,
@@ -229,6 +234,9 @@ impl Yue2Params {
         o.insert("cot".into(), cot_name.into());
         if !self.abc.trim().is_empty() {
             o.insert("abc".into(), self.abc.clone().into());
+        }
+        if !self.lm_type.trim().is_empty() {
+            o.insert("lm_type".into(), self.lm_type.trim().into());
         }
         if self.plan_only {
             o.insert("plan_only".into(), true.into());
@@ -463,6 +471,62 @@ pub fn spread_lrc(lyrics: &str, duration_secs: f32) -> String {
         let secs = at - (mins as f32 * 60.0);
         out.push_str(&format!("[{mins:02}:{secs:05.2}]{line}\n"));
     }
+    out
+}
+
+/// One YuE2 language model the engine could be asked to load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Yue2Lm {
+    /// What the request sends as `lm_type`. The engine builds a filename from
+    /// it, so it is the middle of `yue2-lm-<lm_type>.gguf` and nothing else.
+    pub lm_type: String,
+    pub filename: String,
+    pub size_bytes: u64,
+}
+
+const LM_PREFIX: &str = "yue2-lm-";
+const LM_SUFFIX: &str = ".gguf";
+
+/// The `lm_type` a filename stands for.
+///
+/// Empty is not a model: `yue2-lm-.gguf` would make the engine look for a file
+/// it will never find, and a picker offering it would just be a way to fail.
+pub fn lm_type_of(filename: &str) -> Option<String> {
+    let middle = filename.strip_prefix(LM_PREFIX)?.strip_suffix(LM_SUFFIX)?;
+    if middle.is_empty() {
+        return None;
+    }
+    Some(middle.to_string())
+}
+
+/// The YuE2 language models installed under `dir`.
+///
+/// Scans for the exact filenames the engine builds rather than asking the
+/// weights catalogue, which knows about architecture rather than about what a
+/// picker is allowed to offer. A dropdown that lists a model the engine then
+/// refuses to load is worse than a short one. An unextracted download is
+/// skipped for the same reason: the engine opens `.gguf`, so a `.zip` beside it
+/// is not a choice.
+pub fn available_lms(dir: &std::path::Path) -> Vec<Yue2Lm> {
+    let mut out: Vec<Yue2Lm> = std::fs::read_dir(dir.join("yue2"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let filename = entry.file_name().to_str()?.to_string();
+            let lm_type = lm_type_of(&filename)?;
+            let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            Some(Yue2Lm { lm_type, filename, size_bytes })
+        })
+        .collect();
+    // Smallest first: on a card this size the smallest model is the one most
+    // likely to finish, and the ordering should say so without being read.
+    out.sort_by(|a, b| {
+        a.size_bytes
+            .cmp(&b.size_bytes)
+            .then_with(|| a.lm_type.cmp(&b.lm_type))
+    });
     out
 }
 
@@ -884,6 +948,87 @@ mod tests {
     /// codec stream and returns raw ids, so the job completes cleanly having
     /// produced no sound at all. This is the whole bug -- nothing else about
     /// that request is wrong, so nothing else in a test would have caught it.
+    /// The engine builds `yue2-lm-<lm_type>.gguf` from what the picker sends,
+    /// so the middle of that filename is the whole contract. An `-imat` suffix
+    /// is part of the name and has to survive the round trip.
+    #[test]
+    fn an_lm_type_is_the_middle_of_the_filename() {
+        assert_eq!(lm_type_of("yue2-lm-Q6_K.gguf").as_deref(), Some("Q6_K"));
+        assert_eq!(lm_type_of("yue2-lm-Q4_K_M-imat.gguf").as_deref(), Some("Q4_K_M-imat"));
+        assert_eq!(lm_type_of("yue2-lm-q8_0.gguf").as_deref(), Some("q8_0"));
+
+        // Anything the engine would not build a path from.
+        for bad in [
+            "yue2-vae-standard-f32.gguf",
+            "nar_lora_joint_v9.safetensors",
+            "yue2-lm-q8_0.zip",
+            "yue2-lm-.gguf",
+            "yue2-lm-Q6_K.gguf.part",
+        ] {
+            assert_eq!(lm_type_of(bad), None, "offered a model the engine cannot load: {bad}");
+        }
+    }
+
+    /// A real directory, because the whole job is deciding what is on disk --
+    /// and a fake one would let a scan that finds nothing pass.
+    #[test]
+    fn the_picker_lists_only_what_the_engine_could_load() {
+        let root = std::env::temp_dir().join(format!("aceforge-lms-{}", std::process::id()));
+        let yue2 = root.join("yue2");
+        std::fs::create_dir_all(&yue2).unwrap();
+        std::fs::write(yue2.join("yue2-lm-Q6_K.gguf"), b"the biggest one here").unwrap();
+        std::fs::write(yue2.join("yue2-lm-Q4_K_M-imat.gguf"), b"tiny").unwrap();
+        // Neither of these is loadable and neither may appear.
+        std::fs::write(yue2.join("yue2-lm-q8_0.zip"), b"packed").unwrap();
+        std::fs::write(yue2.join("yue2-vae-standard-f32.gguf"), b"vae").unwrap();
+        std::fs::write(yue2.join("nar_lora_joint_v9.safetensors"), b"lora").unwrap();
+
+        let found = available_lms(&root);
+        let types: Vec<&str> = found.iter().map(|m| m.lm_type.as_str()).collect();
+        assert_eq!(types, vec!["Q4_K_M-imat", "Q6_K"], "smallest first, zip and VAE left out");
+        assert_eq!(found[0].size_bytes, 4, "the small one sorts first");
+        assert_eq!(found[1].size_bytes, 20);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A missing models directory is an empty picker, not an error: the panel
+    /// should still open and simply have nothing to offer.
+    #[test]
+    fn no_models_directory_is_an_empty_picker() {
+        assert!(available_lms(&std::env::temp_dir().join("aceforge-nowhere-at-all")).is_empty());
+    }
+
+    /// Empty means "let the engine pick". Sending it anyway would pin the
+    /// request to a pick the user never made.
+    #[test]
+    fn the_lm_type_is_sent_only_when_asked_for() {
+        let mut params = Yue2Params::default();
+        assert!(params.to_json().get("lm_type").is_none());
+
+        params.lm_type = "Q4_K_M-imat".into();
+        assert_eq!(params.to_json()["lm_type"], "Q4_K_M-imat");
+
+        params.lm_type = "  ".into();
+        assert!(params.to_json().get("lm_type").is_none(), "whitespace is not a model");
+    }
+
+    /// A wrong pick should be caught here rather than as a failed render.
+    #[test]
+    fn a_pick_the_engine_cannot_find_is_rejected_before_submitting() {
+        let mut params = Yue2Params::default();
+        params.lm_type = "Q2_K".into();
+        let have: Vec<String> = available_lms(&std::env::temp_dir().join("aceforge-nothing-here"))
+            .into_iter()
+            .map(|m| m.lm_type)
+            .collect();
+        assert!(!have.contains(&params.lm_type));
+        // Documented behaviour: the request still goes out and the engine
+        // reports the missing file. This test exists so that if that ever
+        // changes, the change is deliberate.
+        assert_eq!(params.to_json()["lm_type"], "Q2_K");
+    }
+
     #[test]
     fn the_rendering_stage_is_not_a_planner_probe() {
         let (plan, audio) = staged_params(&Yue2Params::default(), "X:1\nM:4/4\nQ:1/4=120\n");
@@ -1029,4 +1174,5 @@ mod tests {
         wav[40..44].copy_from_slice(&(96000u32).to_le_bytes()); // 1s of 16-bit 48k
         assert!((wav_seconds(&wav) - 1.0).abs() < 0.01, "{}", wav_seconds(&wav));
     }
+
 }

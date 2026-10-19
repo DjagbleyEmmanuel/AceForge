@@ -26,6 +26,9 @@ export interface Yue2Params {
    *  no title field, and the title names the file rather than steering the
    *  render -- the same deal ACE-Step's title gets. */
   title: string;
+  /** Which installed LM to run. Empty leaves the choice to the engine, which
+   *  is not the same as picking the first one in this list. */
+  lmType: string;
   /** A plain style sentence. Tempo and key go in this text: there are no
    *  separate fields for them on this pipeline. */
   style: string;
@@ -66,6 +69,7 @@ const unsetStage = (): StageSampling => ({
 
 export const YUE2_DEFAULTS: Yue2Params = {
   title: "",
+  lmType: "",
   style: "",
   lyrics: "",
   cot: "full",
@@ -112,11 +116,25 @@ export interface Yue2Outcome {
   cancelled: boolean;
 }
 
+/** One YuE2 language model on disk. `lmType` is what the engine builds
+ *  `yue2-lm-<lmType>.gguf` from, so it is the middle of the filename and
+ *  nothing else. */
+export interface Yue2Lm {
+  lmType: string;
+  filename: string;
+  sizeBytes: number;
+}
+
 export const yue2Api = {
   props: (port?: number) =>
     invoke<Yue2Props>("yue2_props", { port: port ?? null }),
   render: (port: number | null, params: Yue2Params) =>
     invoke<Yue2Outcome>("yue2_render", { port, params }),
+  /** Needs no engine: these are filenames on disk, read straight from the
+   *  models directory. Asking the running sidecar would mean the picker could
+   *  not be filled until one was up, which is the wrong order -- the pick has
+   *  to be made before the job is submitted. */
+  lms: () => invoke<Yue2Lm[]>("yue2_lms"),
 };
 
 /** Read a value out of the forwarded document without asserting a shape.

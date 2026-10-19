@@ -316,6 +316,17 @@ async fn yue2_props(_port: Option<u16>) -> Result<yue2::Yue2Props, String> {
         .map_err(|e| format!("YuE2 props worker stopped: {e}"))?
 }
 
+/// The YuE2 language models on disk.
+///
+/// Needs no engine: these are filenames the engine would look for, read from
+/// the models directory directly. Asking the engine instead would mean the
+/// picker could not be filled until a sidecar was up, which is the wrong order
+/// -- the choice has to be made before the job is submitted.
+#[tauri::command]
+fn yue2_lms() -> Vec<yue2::Yue2Lm> {
+    yue2::available_lms(&crate::settings::resolve_hotstep_models_dir())
+}
+
 /// Compose or render through YuE2.
 ///
 /// Async because it blocks on the job: a synchronous command holds the main
@@ -1293,6 +1304,7 @@ pub fn run() {
             job_progress,
             current_log_mark,
             yue2_props,
+            yue2_lms,
             yue2_render,
             reinstall_bundled_engine,
             inspect_engine,
