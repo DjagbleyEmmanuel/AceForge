@@ -1,23 +1,30 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+/** camelCase throughout, because that is what the backend serialises. Written
+ *  in snake_case it type-checks perfectly and renders `undefined` at runtime,
+ *  which is exactly what happened. `sysinfo` asserts the payload keys. */
 export interface GpuProcess {
   pid: number;
-  used_mib: number;
+  usedMib: number;
   name: string | null;
 }
 
 export interface SystemStats {
   gpu: {
     name: string;
-    used_mib: number;
-    total_mib: number;
+    /** Share of the card's memory in use. */
+    usedMib: number;
+    totalMib: number;
     percent: number;
+    /** How busy the card is right now. High memory with low utilisation means
+     *  something other than the GPU is the bottleneck. */
+    utilization: number;
     processes: GpuProcess[];
   } | null;
-  ram_used_mib: number;
-  ram_total_mib: number;
-  ram_percent: number;
+  ramUsedMib: number;
+  ramTotalMib: number;
+  ramPercent: number;
 }
 
 /** How often to ask. Two seconds: slow enough that nvidia-smi is not a
@@ -122,14 +129,25 @@ export function ResourcePanel() {
       {stats?.gpu ? (
         <>
           <Meter
+            label="GPU"
+            detail={
+              stats.gpu.utilization > 0
+                ? "card busy"
+                : "card idle"
+            }
+            percent={stats.gpu.utilization}
+            tone="bg-sky-400"
+            warnAt={99}
+          />
+          <Meter
             label="VRAM"
-            detail={`${mib(stats.gpu.used_mib)} / ${mib(stats.gpu.total_mib)} · ${stats.gpu.name}`}
+            detail={`${mib(stats.gpu.usedMib)} / ${mib(stats.gpu.totalMib)} · ${stats.gpu.name}`}
             percent={stats.gpu.percent}
             tone="bg-glow-500"
             warnAt={80}
           />
           {stats.gpu.processes
-            .filter((p) => p.used_mib >= 16)
+            .filter((p) => p.usedMib >= 16)
             .slice(0, 3)
             .map((p) => (
               <p
@@ -138,7 +156,7 @@ export function ResourcePanel() {
                 title={p.name ? `${p.name} (pid ${p.pid})` : `pid ${p.pid}`}
               >
                 <span className="text-ink-400">{p.name ?? `pid ${p.pid}`}</span>{" "}
-                {mib(p.used_mib)}
+                {mib(p.usedMib)}
               </p>
             ))}
         </>
@@ -148,11 +166,11 @@ export function ResourcePanel() {
         </p>
       )}
 
-      {stats && stats.ram_total_mib > 0 && (
+      {stats && stats.ramTotalMib > 0 && (
         <Meter
           label="RAM"
-          detail={`${mib(stats.ram_used_mib)} / ${mib(stats.ram_total_mib)}`}
-          percent={stats.ram_percent}
+          detail={`${mib(stats.ramUsedMib)} / ${mib(stats.ramTotalMib)}`}
+          percent={stats.ramPercent}
           tone="bg-mint-400"
           warnAt={90}
         />

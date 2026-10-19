@@ -15,7 +15,13 @@ pub struct GpuStats {
     pub total_mib: u64,
     /// 0-100, rounded down. Truncated rather than rounded so a bar never
     /// claims more than the card can back.
+    /// Share of the card's memory in use, 0-100.
     pub percent: u8,
+    /// How busy the card is right now, 0-100. Not the same figure as the
+    /// memory one: a render can hold two gigabytes and be stalled waiting on
+    /// the CPU, which shows as high memory and low utilisation, and the two
+    /// together are what say whether the GPU is the bottleneck.
+    pub utilization: u8,
     /// Which processes hold it, largest first.
     pub processes: Vec<GpuProcess>,
 }
@@ -80,7 +86,7 @@ fn nvidia(args: &[&str]) -> Option<String> {
 
 fn gpu() -> Option<GpuStats> {
     let totals = nvidia(&[
-        "--query-gpu=name,memory.used,memory.total",
+        "--query-gpu=name,memory.used,memory.total,utilization.gpu",
         "--format=csv,noheader,nounits",
     ])?;
     // One line per card. The first is the one the engine uses.
@@ -89,6 +95,10 @@ fn gpu() -> Option<GpuStats> {
     let name = parts.next()?.to_string();
     let used_mib: u64 = parts.next()?.parse().ok()?;
     let total_mib: u64 = parts.next()?.parse().ok()?;
+    // Reported as "N/A" by some drivers rather than a number. Losing the whole
+    // card over it would be silly, so an unparseable reading is simply absent
+    // and the meter is skipped.
+    let utilization: u8 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
 
     let mut processes: Vec<GpuProcess> = nvidia(&[
         "--query-compute-apps=pid,used_memory",
@@ -114,6 +124,7 @@ fn gpu() -> Option<GpuStats> {
         used_mib,
         total_mib,
         percent: percent(used_mib, total_mib),
+        utilization,
         processes,
     })
 }
@@ -148,7 +159,15 @@ fn ram() -> (u64, u64) {
     // "Available" is what the kernel would hand out without swapping, which is
     // the figure that matches what a new model load is competing with. `free`'s
     // "used" subtracts buffers and cache, which is not what anyone means here.
-    (total.saturating_sub(available), total)
+    //
+    // /proc/meminfo is in kibibytes. Left alone the meter reads "5198 GB of
+    // 23895 GB", which is wrong by a factor of 1024 and only visible once
+    // something else happens to render.
+    const KIB_TO_MIB: u64 = 1024;
+    (
+        total.saturating_sub(available) / KIB_TO_MIB,
+        total / KIB_TO_MIB,
+    )
 }
 
 fn kib_field(line: &str, key: &str) -> Option<u64> {
@@ -187,6 +206,13 @@ mod tests {
         let (used, total) = ram();
         assert!(total > 0, "MemTotal should be readable on Linux");
         assert!(used <= total, "used cannot exceed total");
+        // In mebibytes. A 24 GB machine reporting 24468 GB is the bug this
+        // asserts against.
+        assert!(total < 1024 * 1024, "RAM should be in MiB, got {total}");
+        assert!(
+            total > 0 && total < 256 * 1024,
+            "RAM should be a plausible machine size in MiB, got {total}"
+        );
     }
 
     /// A machine with no NVIDIA card must report None, not a zeroed card that
@@ -206,4 +232,42 @@ mod tests {
         assert_eq!(kib_field("MemTotal:       24468616 kB", "MemTotal"), Some(24468616));
         assert_eq!(kib_field("MemFree: 1 kB", "MemTotal"), None);
     }
+
+    /// The field names have to be camelCase, because that is what the frontend
+    /// declares. Rust's `rename_all` makes this easy to get wrong in a way that
+    /// compiles and type-checks perfectly: the serialised keys come out as
+    /// `usedMib` while a hand-written interface reads `used_mib`, and every
+    /// consumer gets `undefined` instead of an error.
+    #[test]
+    fn the_serialised_field_names_match_the_frontend() {
+        let stats = SystemStats {
+            gpu: Some(GpuStats {
+                name: "NVIDIA GeForce GTX 1050".into(),
+                used_mib: 1900,
+                total_mib: 4096,
+                percent: 46,
+                utilization: 88,
+                processes: vec![GpuProcess {
+                    pid: 42,
+                    used_mib: 1800,
+                    name: Some("ace-server".into()),
+                }],
+            }),
+            ram_used_mib: 4000,
+            ram_total_mib: 24000,
+            ram_percent: 16,
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        let gpu = &json["gpu"];
+        assert!(gpu.get("usedMib").is_some(), "VRAM used is missing: {gpu}");
+        assert!(gpu.get("totalMib").is_some(), "VRAM total is missing: {gpu}");
+        assert!(gpu.get("utilization").is_some(), "GPU busy is missing: {gpu}");
+        assert!(gpu["processes"][0].get("usedMib").is_some(), "process VRAM is missing");
+        assert!(json.get("ramUsedMib").is_some(), "RAM used is missing: {json}");
+        assert!(json.get("ramTotalMib").is_some(), "RAM total is missing: {json}");
+        // And nothing carrying the snake_case spelling.
+        assert!(gpu.get("used_mib").is_none(), "snake_case leaked into the payload");
+        assert!(json.get("ram_used_mib").is_none(), "snake_case leaked into the payload");
+    }
+
 }
