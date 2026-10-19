@@ -159,3 +159,20 @@ npx tsc --noEmit
 ```
 
 There is no JavaScript test runner — frontend correctness is types plus reading.
+
+## Bundled third-party components
+
+| Component | Licence | Why it is here |
+|---|---|---|
+| `ace-server` and its runtime (HOT-Step) | as shipped upstream | the engine |
+| `lame` 3.100 (`resources/encoder/lame`) | **LGPL-2.0** | MP3 encoding |
+
+`lame` is shipped as a separate, statically linked executable rather than
+linked into this app. Every pure-Rust MP3 encoder is LGPL, and Rust links
+statically, so using one would place LGPL code inside this MIT binary and oblige
+the app to be relinkable. As a separate executable it is mere aggregation: it can
+be replaced or deleted, and this project stays MIT. Its licence travels with it
+as `COPYING.LAME.txt`.
+
+Rebuild it with `scripts/build-lame.sh`, which produces a fully static binary
+(no `libtinfo`, no `libc` dependency) and fails the build if the result is not.

@@ -10,7 +10,7 @@ import {
   type Yue2Params,
 } from "../lib/yue2";
 import { formatBytes } from "../lib/engines";
-import { queue } from "../lib/api";
+import { queue, server } from "../lib/api";
 import { useQueueBusy } from "../lib/queueBusy";
 import { Select } from "./Select";
 
@@ -112,6 +112,15 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
   // has to be made before a job is submitted, so it cannot wait on a sidecar.
   // Polled slowly for the same reason props are -- a download can finish while
   // the window is open, and the list should catch up without a reopen.
+  // Resolved at startup, so it is asked once rather than per render.
+  const [mp3Ok, setMp3Ok] = useState(true);
+  useEffect(() => {
+    void server
+      .mp3Available()
+      .then(setMp3Ok)
+      .catch(() => setMp3Ok(false));
+  }, []);
+
   const [lms, setLms] = useState<Yue2Lm[]>([]);
   const loadLms = useCallback(async () => {
     try {
@@ -276,7 +285,13 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
             value={params.outputFormat}
             onChange={(v) => setParams((p) => ({ ...p, outputFormat: v }))}
             options={[
-              { value: "mp3", label: "mp3", note: "About an eighth of the size. Needs ffmpeg; without it the WAV is kept." },
+              {
+                value: "mp3",
+                label: "mp3",
+                note: mp3Ok
+                  ? "About an eighth of the size. The encoder ships with the app."
+                  : "No encoder found on this machine, so renders will stay WAV.",
+              },
               { value: "wav", label: "wav", note: "Uncompressed, as the engine returns it." },
             ]}
           />

@@ -632,6 +632,16 @@ fn engine_solvers(port: Option<u16>) -> Vec<String> {
     port.and_then(generate::engine_solvers).unwrap_or_default()
 }
 
+/// Whether this install can write MP3 at all.
+///
+/// The bundled encoder is resolved at startup, so this answers before a render
+/// rather than after one. The UI uses it to say why a render might still land
+/// as WAV instead of leaving the user to work it out from file sizes.
+#[tauri::command]
+fn mp3_available() -> bool {
+    yue2::mp3_supported()
+}
+
 /// Live VRAM and RAM, for the sidebar meters.
 ///
 /// A command rather than something the webview polls on its own: the numbers
@@ -1333,6 +1343,7 @@ pub fn run() {
             yue2_props,
             yue2_lms,
             system_stats,
+            mp3_available,
             yue2_render,
             reinstall_bundled_engine,
             inspect_engine,
@@ -1431,6 +1442,10 @@ pub fn run() {
             if let Ok(resource) = app.path().resource_dir() {
                 covers::set_resource_dir(resource.clone());
                 grant_covers(app.handle(), &resource.join("covers"));
+                // The bundled MP3 encoder lives beside the covers. Resolved
+                // once here so a missing one is known before a render starts
+                // rather than after it finishes.
+                yue2::set_encoder_dir(resource.join("encoder"));
             }
             // A custom cover folder set in an earlier session needs the same
             // grant, or it stops rendering after a restart.

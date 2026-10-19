@@ -654,19 +654,107 @@ fn default_mp3_bitrate() -> i32 {
     128
 }
 
-/// Whether an MP3 encode can be attempted at all.
-///
-/// Checked once at startup rather than per track: the answer cannot change
-/// while the app runs, and spawning `ffmpeg -version` for every take would be
-/// silly.
-pub fn ffmpeg_available() -> bool {
-    std::process::Command::new("ffmpeg")
+/// Set once at startup from the resource directory, next to the engine's.
+static ENCODER_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn bundled_encoder_dir() -> String {
+    ENCODER_DIR.get().cloned().unwrap_or_default()
+}
+
+pub fn set_encoder_dir(dir: std::path::PathBuf) {
+    let _ = ENCODER_DIR.set(dir.to_string_lossy().into_owned());
+}
+
+/// The encoder to use, or None when nothing on this machine can do it.
+pub fn mp3_encoder() -> Option<std::path::PathBuf> {
+    mp3_encoder_at(std::path::Path::new(&bundled_encoder_dir()))
+}
+
+/// Resolution split out from the static lookup so it can be tested against a
+/// directory that is not the real one.
+pub fn mp3_encoder_at(bundled_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let bundled = bundled_dir.join("lame");
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+    // The fallback for a broken or half-extracted install. A system ffmpeg
+    // still beats nothing, and it is what this depended on outright before.
+    let have_ffmpeg = std::process::Command::new("ffmpeg")
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    have_ffmpeg.then(|| std::path::PathBuf::from("ffmpeg"))
+}
+
+/// Whether MP3 output is possible at all, so the UI can say so before a render
+/// rather than after one.
+pub fn mp3_supported() -> bool {
+    mp3_encoder().is_some()
+}
+
+/// The full argument list for one encoder.
+///
+/// Built in one place and returned whole, because the order matters and the two
+/// tools disagree about it. `ffmpeg` wants `-i` immediately before the input and
+/// its codec options *after* it; lame wants no `-i` at all and takes input then
+/// output bare. Getting this wrong produces a file that decodes and is the wrong
+/// length, which is a miserable thing to notice by ear.
+///
+/// An earlier version assembled this by appending codec flags to a list that
+/// already held `-i`, which put the input flag in front of them and handed
+/// ffmpeg a codec option where it expected a filename. The test below is what
+/// caught it.
+fn encoder_args(
+    encoder: &std::path::Path,
+    wav: &std::path::Path,
+    mp3: &std::path::Path,
+    bitrate: u32,
+) -> Vec<String> {
+    let wav = wav.to_string_lossy().into_owned();
+    let mp3 = mp3.to_string_lossy().into_owned();
+    if encoder.file_name().is_some_and(|n| n == "ffmpeg") {
+        vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-y".into(),
+            "-i".into(),
+            wav,
+            "-codec:a".into(),
+            "libmp3lame".into(),
+            "-b:a".into(),
+            format!("{bitrate}k"),
+            mp3,
+        ]
+    } else {
+        vec!["--quiet".into(), "-b".into(), bitrate.to_string(), wav, mp3]
+    }
+}
+
+/// Run the encoder over a WAV.
+fn encode(
+    encoder: &std::path::Path,
+    wav: &std::path::Path,
+    mp3: &std::path::Path,
+    bitrate: u32,
+) -> Result<(), String> {
+    let args = encoder_args(encoder, wav, mp3, bitrate);
+    let out = std::process::Command::new(encoder)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("{} could not be run: {e}", encoder.display()))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("{} exited with {}", encoder.display(), out.status)
+        } else {
+            err.lines().next().unwrap_or("encoder failed").to_string()
+        });
+    }
+    Ok(())
 }
 
 /// Re-encode a finished WAV as MP3, returning the new path.
@@ -677,36 +765,16 @@ pub fn ffmpeg_available() -> bool {
 /// and never re-derived, so sidecar timings do not depend on the encode having
 /// succeeded.
 fn to_mp3(wav: &std::path::Path, bitrate: u32) -> Result<std::path::PathBuf, String> {
+    let encoder = mp3_encoder().ok_or("no MP3 encoder is available")?;
     let mp3 = wav.with_extension("mp3");
-    let out = std::process::Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-y")
-        .arg("-i")
-        .arg(wav)
-        .arg("-codec:a")
-        .arg("libmp3lame")
-        .arg("-b:a")
-        .arg(format!("{bitrate}k"))
-        .arg(&mp3)
-        .output()
-        .map_err(|e| format!("ffmpeg could not be run: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if err.is_empty() {
-            format!("ffmpeg exited with {}", out.status)
-        } else {
-            err
-        });
-    }
+    encode(&encoder, wav, &mp3, bitrate)?;
     // A zero-byte file means the encoder reported success and wrote nothing.
     // Treating that as success would leave a library row pointing at nothing.
     match std::fs::metadata(&mp3) {
         Ok(m) if m.len() > 0 => Ok(mp3),
         _ => {
             let _ = std::fs::remove_file(&mp3);
-            Err("ffmpeg produced an empty file".into())
+            Err(format!("{} produced an empty file", encoder.display()))
         }
     }
 }
@@ -1054,13 +1122,69 @@ mod tests {
     /// The engine builds `yue2-lm-<lm_type>.gguf` from what the picker sends,
     /// so the middle of that filename is the whole contract. An `-imat` suffix
     /// is part of the name and has to survive the round trip.
+    /// The bundled encoder has to win over a system one, or a machine with
+    /// ffmpeg behaves differently from a machine without it -- which is the
+    /// thing this whole change exists to stop.
+    #[test]
+    fn the_bundled_encoder_is_preferred() {
+        let dir = std::env::temp_dir().join(format!("aceforge-enc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lame"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            dir.join("lame"),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+
+        let found = mp3_encoder_at(&dir);
+        assert_eq!(found, Some(dir.join("lame")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An encoder that is not there must not resolve to one. Silently falling
+    /// through to a different tool is how this shipped as a system dependency
+    /// in the first place.
+    #[test]
+    fn a_missing_bundled_encoder_resolves_to_nothing_when_ffmpeg_is_absent() {
+        let dir = std::env::temp_dir().join(format!("aceforge-enc2-{}", std::process::id()));
+        let found = mp3_encoder_at(&dir);
+        if found.is_some() {
+            // Only legitimate when a system ffmpeg exists, which is the
+            // documented fallback rather than a test failure.
+            assert!(found.unwrap().ends_with("ffmpeg"));
+        }
+    }
+
+    /// lame and ffmpeg take opposite arguments, and ffmpeg's `-i` has to sit
+    /// immediately before the input with its codec options after. Getting this
+    /// wrong yields a file that decodes and is the wrong length.
+    #[test]
+    fn each_encoder_gets_a_correctly_ordered_command_line() {
+        let wav = std::path::Path::new("/tmp/in.wav");
+        let mp3 = std::path::Path::new("/tmp/out.mp3");
+
+        let ff = encoder_args(std::path::Path::new("ffmpeg"), wav, mp3, 192);
+        let i_of = ff.iter().position(|a| a == "-i").expect("ffmpeg needs -i");
+        assert_eq!(ff[i_of + 1], "/tmp/in.wav", "-i must be followed by the input");
+        let bpos = ff.iter().position(|a| a == "-b:a").expect("ffmpeg needs -b:a");
+        assert!(bpos > i_of + 1, "codec options belong after the input");
+        assert_eq!(ff.last().unwrap(), "/tmp/out.mp3");
+        assert!(!ff.contains(&"-b".to_string()), "lame's flag does not belong in an ffmpeg call");
+
+        let lm = encoder_args(std::path::Path::new("lame"), wav, mp3, 192);
+        assert!(!lm.contains(&"-i".to_string()), "lame takes no -i");
+        assert_eq!(&lm[0..3], ["--quiet", "-b", "192"]);
+        assert_eq!(lm[3], "/tmp/in.wav");
+        assert_eq!(lm[4], "/tmp/out.mp3");
+    }
+
     /// A real encode, because the size claim is the whole point and a mock
     /// would prove nothing about it. ffmpeg is skipped rather than failed when
     /// it is absent, so the suite still passes on a machine without it.
     #[test]
     fn an_encode_shrinks_the_file_by_roughly_the_bitrate_ratio() {
-        if !ffmpeg_available() {
-            eprintln!("ffmpeg missing; skipping the encode test");
+        if mp3_encoder().is_none() {
+            eprintln!("no encoder on this machine; skipping the encode test");
             return;
         }
         let dir = std::env::temp_dir().join(format!("aceforge-mp3-{}", std::process::id()));
