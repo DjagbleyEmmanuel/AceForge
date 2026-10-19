@@ -416,6 +416,50 @@ pub fn stderr_len(models_dir: &Path) -> u64 {
     stderr_mark(models_dir)
 }
 
+/// The offset just past the last complete line.
+///
+/// The log viewer resumes from this rather than from the raw length. The engine
+/// writes in whatever chunks it likes, so a poll routinely lands mid-line: the
+/// raw length would then be treated as a line boundary, and the remainder of
+/// that line would arrive at the next poll as a second, headless line. Long
+/// paths and progress bars -- which are exactly what you go looking at -- split
+/// across two entries.
+///
+/// Deliberately not folded into `stderr_len`, which feeds the stall watchdog.
+/// That one wants to notice a log growing at all, and rounding to a line
+/// boundary would make it slightly deaf to a partial write.
+pub fn stderr_len_complete(models_dir: &Path) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = stderr_log_path(models_dir);
+    let Ok(len) = std::fs::metadata(&path).map(|m| m.len()) else {
+        return 0;
+    };
+    if len == 0 {
+        return 0;
+    }
+    // A long tail is enough to find the last newline in, and not reading the
+    // whole file every two seconds is the point of having a cursor at all.
+    const TAIL: u64 = 64 * 1024;
+    let from = len.saturating_sub(TAIL);
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return len;
+    };
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return len;
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return len;
+    }
+    match buf.iter().rposition(|b| *b == b'\n') {
+        // +1 for the newline itself.
+        Some(i) => from + i as u64 + 1,
+        // No newline in the tail at all: one enormous line, or a write that
+        // has not landed yet. Fall back to the length rather than stalling.
+        None => len,
+    }
+}
+
 /// Empty the log.
 ///
 /// Truncated in place rather than unlinked. The sidecar was handed this path as
@@ -600,5 +644,51 @@ mod tests {
     fn clearing_a_missing_log_is_not_an_error() {
         let dir = Scratch::new("clear-absent");
         stderr_clear(&dir.0).expect("nothing to clear is still success");
+    }
+
+    /// A cursor that lands mid-line splits that line in two across polls. The
+    /// engine writes in arbitrary chunks, so this is the normal case rather
+    /// than an edge one.
+    #[test]
+    fn the_cursor_lands_on_a_line_boundary() {
+        let dir = std::env::temp_dir().join(format!("aceforge-log-{}", std::process::id()));
+        let yue2 = dir.join("yue2");
+        std::fs::create_dir_all(&yue2).unwrap();
+        std::fs::write(stderr_log_path(&dir), b"first\nsecond\npart").unwrap();
+        let cursor = stderr_len_complete(&dir);
+        assert_eq!(cursor, b"first\nsecond\n".len() as u64);
+
+        // The half-written line has not been shown, and when it completes it
+        // arrives whole. With the raw length as the cursor the viewer would
+        // have shown "part" already and "ial" next, as two headless lines.
+        std::fs::write(stderr_log_path(&dir), b"first\nsecond\npartial\n").unwrap();
+        assert_eq!(stderr_since(&dir, cursor, 1000), vec!["partial".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A log with no trailing newline has no boundary to offer, and stalling
+    /// the viewer forever would be worse than overshooting slightly.
+    #[test]
+    fn a_log_with_no_newline_does_not_stall_the_cursor() {
+        let dir = std::env::temp_dir().join(format!("aceforge-log2-{}", std::process::id()));
+        let yue2 = dir.join("yue2");
+        std::fs::create_dir_all(&yue2).unwrap();
+        std::fs::write(stderr_log_path(&dir), b"no newline anywhere").unwrap();
+        assert_eq!(stderr_len_complete(&dir), b"no newline anywhere".len() as u64);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The watchdog still gets the raw length. Rounding to a line boundary
+    /// would make it slightly deaf to a partial write, and that is the one
+    /// signal it has.
+    #[test]
+    fn the_watchdog_still_gets_the_raw_length() {
+        let dir = std::env::temp_dir().join(format!("aceforge-log3-{}", std::process::id()));
+        let yue2 = dir.join("yue2");
+        std::fs::create_dir_all(&yue2).unwrap();
+        std::fs::write(stderr_log_path(&dir), b"line\npartial").unwrap();
+        assert_eq!(stderr_len(&dir), b"line\npartial".len() as u64);
+        assert!(stderr_len(&dir) > stderr_len_complete(&dir));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -62,9 +62,13 @@ export function LogViewer({ running }: Props) {
 
   // Full reload when the log is opened or the server restarts: a restart
   // truncates nothing, but the cursor is meaningless across one.
+  // A full reload when the log is opened, when the server restarts, and when
+  // the panel is expanded. Expanding matters because polling is suspended while
+  // collapsed, so an expanded log would otherwise open onto whatever it had
+  // when it was last shut -- which reads as a log that has stopped.
   useEffect(() => {
     void refresh();
-  }, [refresh, running]);
+  }, [refresh, running, collapsed]);
 
   useEffect(() => {
     if (!running || !follow || collapsed) return;
@@ -184,7 +188,7 @@ export function LogViewer({ running }: Props) {
 
   return (
     <section className="panel overflow-hidden">
-      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
         <button
           onClick={() => setCollapsedFlag(!collapsed)}
           className="flex items-center gap-2 text-left"
@@ -196,7 +200,7 @@ export function LogViewer({ running }: Props) {
         </button>
 
         {!collapsed && (
-          <div className="flex flex-wrap items-center gap-1.5">
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             <input
               value={filter}
               onChange={(e) => {
@@ -204,11 +208,11 @@ export function LogViewer({ running }: Props) {
                 setFollow(false);
               }}
               placeholder="filter"
-              className="w-24 rounded border border-ink-700 bg-ink-900 px-2 py-1 font-mono text-[11px] text-ink-200 outline-none focus:border-glow-500/60"
+              className="w-20 shrink-0 rounded border border-ink-700 bg-ink-900 px-2 py-0.5 font-mono text-[11px] text-ink-200 outline-none focus:border-glow-500/60"
             />
             <button
               onClick={() => setFollow(!follow)}
-              className={`chip px-2 py-1 text-[10px] ${
+              className={`chip px-2 py-0.5 text-[10px] ${
                 follow
                   ? "bg-glow-500/15 text-glow-300 ring-1 ring-glow-500/40"
                   : "bg-ink-800 text-ink-400 ring-1 ring-ink-700"
@@ -216,13 +220,13 @@ export function LogViewer({ running }: Props) {
             >
               {follow ? "following" : "paused"}
             </button>
-            <button onClick={() => void refresh()} className="chip px-2 py-1 text-[10px]">
+            <button onClick={() => void refresh()} className="chip px-2 py-0.5 text-[10px]">
               reload
             </button>
             <button
               onClick={() => void clearAll()}
               disabled={busy || lines.length === 0}
-              className="chip px-2 py-1 text-[10px] disabled:opacity-40"
+              className="chip px-2 py-0.5 text-[10px] disabled:opacity-40"
               title="Empty the backend log. The file is truncated in place, so the server keeps writing to it."
             >
               clear
@@ -236,7 +240,7 @@ export function LogViewer({ running }: Props) {
           {/* Category picker. "all" is the default and the counts are what make
               it worth having: the error bucket on a real log is five lines in
               two thousand, and it is all five that matter. */}
-          <div className="flex flex-wrap items-center gap-1 border-t border-ink-800 px-4 py-2">
+          <div className="flex flex-wrap items-center gap-1 border-t border-ink-800 px-3 py-1.5">
             <CategoryChip
               label="all"
               count={lines.length}
@@ -260,13 +264,21 @@ export function LogViewer({ running }: Props) {
 
           <div
             ref={boxRef}
-            className="term-scroll max-h-96 overflow-y-auto overscroll-contain border-t border-ink-800 bg-ink-950 px-3 py-2 font-mono text-[11px] leading-[1.55]"
+            className="term-scroll h-[clamp(11rem,38vh,30rem)] overflow-y-auto overflow-x-hidden overscroll-contain border-t border-ink-800 bg-ink-950 px-3 py-2 font-mono text-[11px] leading-[1.55]"
             onScroll={(e) => {
               // Scrolling up is an implicit pause: yanking the view back to the
               // bottom while someone is reading a stack trace is infuriating.
+              //
+              // Scrolling back down resumes it, which is the half that was
+              // missing. Without it, following was a one-way door: one stray
+              // scroll during a live render stopped the log for good, and the
+              // only way back was the reload button. That is what "the log
+              // does not update until I click reload" actually was -- not a
+              // broken poll but a paused one with no way to unpause it by hand.
               const el = e.currentTarget;
               const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-              if (!atBottom && follow) setFollow(false);
+              if (atBottom && !follow) setFollow(true);
+              else if (!atBottom && follow) setFollow(false);
             }}
           >
             {shown.length === 0 ? (
@@ -289,7 +301,7 @@ export function LogViewer({ running }: Props) {
             )}
           </div>
 
-          <p className="flex items-center gap-2 px-4 py-2 text-[10px] text-ink-500">
+          <p className="flex items-center gap-2 border-t border-ink-800 px-3 py-1 text-[10px] text-ink-500">
             <span>
               {summary}
               {needle && " (filtered)"}

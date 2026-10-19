@@ -7,6 +7,7 @@ import { LibraryPanel } from "./components/LibraryPanel";
 import { QueuePanel } from "./components/QueuePanel";
 import { SetupCheck } from "./components/SetupCheck";
 import { LogViewer } from "./components/LogViewer";
+import { ResourcePanel } from "./components/ResourcePanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ThemeChooser, useTheme } from "./components/ThemeChooser";
 import { StorePanel } from "./components/StorePanel";
@@ -75,6 +76,7 @@ export default function App() {
             startedAt={app.activeJob?.started_at ?? null}
           />
           <ThemeChooser theme={theme} onChange={setTheme} />
+          <ResourcePanel />
           <div className="panel p-3">
             <div className="flex items-center justify-between">
               <span className="text-[11px] text-ink-400">Runtime</span>

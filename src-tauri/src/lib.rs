@@ -17,6 +17,7 @@ pub mod wav;
 pub mod yue2;
 pub mod wildcards;
 pub mod store;
+pub mod sysinfo;
 
 use serde::Serialize;
 use std::path::PathBuf;
@@ -593,7 +594,9 @@ fn server_logs(limit: Option<usize>) -> Vec<String> {
 #[tauri::command]
 fn server_log_cursor() -> u64 {
     let dir = settings::resolve_models_dir(None);
-    server::stderr_len(&dir)
+    // The complete-line length, not the raw one: the viewer resumes from this,
+    // and a cursor that lands mid-line splits that line across two entries.
+    server::stderr_len_complete(&dir)
 }
 
 /// Everything written since `cursor`. Empty when nothing changed, which is the
@@ -627,6 +630,16 @@ fn engine_liveness() -> Option<u16> {
 #[tauri::command]
 fn engine_solvers(port: Option<u16>) -> Vec<String> {
     port.and_then(generate::engine_solvers).unwrap_or_default()
+}
+
+/// Live VRAM and RAM, for the sidebar meters.
+///
+/// A command rather than something the webview polls on its own: the numbers
+/// have to keep updating while the window sits idle, and `/proc` is not
+/// something the frontend can read.
+#[tauri::command]
+fn system_stats() -> sysinfo::SystemStats {
+    sysinfo::stats()
 }
 
 /// The port the sidecar came up on. The UI needs it for every /job call, and
@@ -1319,6 +1332,7 @@ pub fn run() {
             current_log_mark,
             yue2_props,
             yue2_lms,
+            system_stats,
             yue2_render,
             reinstall_bundled_engine,
             inspect_engine,
