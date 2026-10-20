@@ -206,15 +206,25 @@ fn die_with_parent() -> std::io::Result<()> {
 ///
 /// Set when a server starts. The two engines share an HTTP surface but not a
 /// request format, and nothing else distinguishes them at runtime.
-static RUNNING_ENGINE: std::sync::OnceLock<crate::engines::EngineId> = std::sync::OnceLock::new();
+///
+/// A lock rather than a `OnceLock`, and that distinction matters. The engine
+/// can be switched in the sidebar and started again in the same session, and a
+/// `OnceLock` accepts a value exactly once: the second start would have been
+/// ignored and the app would have carried on shaping requests for the engine
+/// that was no longer running. That is the same 400 this whole change is
+/// about, coming back after a restart.
+static RUNNING_ENGINE: std::sync::RwLock<Option<crate::engines::EngineId>> =
+    std::sync::RwLock::new(None);
 
 fn set_running_engine(engine: crate::engines::EngineId) {
-    let _ = RUNNING_ENGINE.set(engine);
+    if let Ok(mut slot) = RUNNING_ENGINE.write() {
+        *slot = Some(engine);
+    }
 }
 
 /// The engine currently running, if any.
 pub fn running_engine() -> Option<crate::engines::EngineId> {
-    RUNNING_ENGINE.get().copied()
+    RUNNING_ENGINE.read().ok().and_then(|slot| *slot)
 }
 
 pub fn start(
@@ -549,6 +559,24 @@ pub fn props(port: u16) -> Result<serde_json::Value, String> {
     let body = http_get(port, "/props").ok_or_else(|| "server not reachable".to_string())?;
     serde_json::from_str(&body).map_err(|e| format!("bad /props payload: {e}"))
 }
+    /// The engine can be switched in the sidebar and started again in the same
+    /// session. A `OnceLock` takes a value exactly once, so the second start
+    /// would have been ignored and the app would have kept shaping requests
+    /// for the engine that was no longer running -- which is the 400 this
+    /// whole change is about, returning after a restart.
+    #[test]
+    fn the_running_engine_follows_a_switch() {
+        set_running_engine(crate::engines::EngineId::AceStep);
+        assert_eq!(running_engine(), Some(crate::engines::EngineId::AceStep));
+        set_running_engine(crate::engines::EngineId::HotStep);
+        assert_eq!(
+            running_engine(),
+            Some(crate::engines::EngineId::HotStep),
+            "switching engines has to take effect, or requests keep their old shape"
+        );
+        // Put it back, so a later test does not inherit a HOT-Step engine.
+        set_running_engine(crate::engines::EngineId::AceStep);
+    }
 #[cfg(test)]
 mod tests {
     use super::*;
