@@ -709,14 +709,40 @@ fn job_id_from(value: serde_json::Value, path: &str) -> Result<String, String> {
 /// Sending either one switches the request from plain JSON to multipart, which
 /// is why this is not just "always multipart": the JSON path is cheaper and is
 /// what a plain text-to-music render should keep using.
+/// The shape a multipart synth request takes, per engine.
+///
+/// This is the whole bug: the two engines parse the same multipart part with
+/// different parsers, and one of them refuses an array. The app sent an array
+/// to both, which the bundled engine accepts and HOT-Step answers with a 400
+/// and no explanation.
+///
+/// One request goes as an object, which both engines take. A genuine batch
+/// keeps the array, and only the engine that can parse one gets to have it:
+/// HOT-Step's multipart path takes a single request, so there the extra takes
+/// are dropped and said to be dropped rather than the whole render failing.
+fn multipart_payload(
+    requests: &serde_json::Value,
+    hotstep: bool,
+) -> (serde_json::Value, usize) {
+    match requests {
+        serde_json::Value::Array(items) if items.len() == 1 => (items[0].clone(), 0),
+        serde_json::Value::Array(items) if items.len() > 1 => {
+            if hotstep {
+                (items[0].clone(), items.len() - 1)
+            } else {
+                (requests.clone(), 0)
+            }
+        }
+        other => (other.clone(), 0),
+    }
+}
+
 pub fn submit_synth_with_audio(
     port: u16,
     requests: &serde_json::Value,
     source: Option<&Path>,
     reference: Option<&Path>,
 ) -> Result<String, String> {
-    let json = serde_json::to_string(requests).map_err(|e| e.to_string())?;
-
     let read = |p: &Path| -> Result<Vec<u8>, String> {
         std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()))
     };
@@ -726,6 +752,33 @@ pub fn submit_synth_with_audio(
     if source_bytes.is_none() && ref_bytes.is_none() {
         return submit(port, "/synth", requests.clone());
     }
+
+    // The two engines disagree about the request shape, and the disagreement is
+    // fatal rather than cosmetic.
+    //
+    //   acestep.cpp       request_parse_json_array -> an object OR an array
+    //   hot-step-server   request_parse_json      -> an object ONLY
+    //
+    // The multipart branch is the one that exposes it, because the plain JSON
+    // branch of both engines takes the array parser. Send an array to
+    // HOT-Step with a source audio or a timbre reference and it answers 400
+    // "Multipart: invalid JSON in 'request' part" -- with an object it
+    // works, and the object form is accepted by both engines.
+    //
+    // So: one request goes as an object, and only a genuine batch keeps the
+    // array, which only the engine that can take one gets to have.
+    let (payload, dropped) = multipart_payload(
+        requests,
+        crate::server::running_engine() == Some(crate::engines::EngineId::HotStep),
+    );
+    if dropped > 0 {
+        eprintln!(
+            "[synth] HOT-Step accepts one request per multipart synth, so \
+             {dropped} of {} takes were dropped",
+            dropped + 1
+        );
+    }
+    let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
 
     // Boundary only has to be unique in this body; the parts are WAV or MP3,
     // never multipart text themselves.
@@ -753,7 +806,7 @@ pub fn submit_synth_with_audio(
     }
     form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-    let response = ureq::post(&format!("http://127.0.0.1:{port}/synth"))
+    let response = match ureq::post(&format!("http://127.0.0.1:{port}/synth"))
         .timeout(std::time::Duration::from_secs(300))
         // `Request::set` is the setter in ureq 2; `header` is a getter.
         .set(
@@ -761,7 +814,28 @@ pub fn submit_synth_with_audio(
             &format!("multipart/form-data; boundary={boundary}"),
         )
         .send(&form[..])
-        .map_err(|e| format!("submit /synth failed: {e}"))?;
+    {
+        Ok(r) => r,
+        // The body is the only place the engine explains itself. `ureq`'s
+        // Display for a status error is just "status code 400", which is how
+        // a request-shape mismatch between the two engines arrived here as a
+        // number and nothing else. The JSON path already reads the body; this
+        // one did not.
+        Err(ureq::Error::Status(code, r)) => {
+            let detail = r
+                .into_string()
+                .ok()
+                .and_then(|b| {
+                    serde_json::from_str::<serde_json::Value>(&b)
+                        .ok()
+                        .and_then(|v| v.get("error")?.as_str().map(str::to_string))
+                })
+                .unwrap_or_default();
+            let hint = if detail.is_empty() { String::new() } else { format!(": {detail}") };
+            return Err(format!("/synth refused the request ({code}){hint}"));
+        }
+        Err(e) => return Err(format!("submit /synth failed: {e}")),
+    };
 
     job_id_from(
         response.into_json().map_err(|e| format!("bad submit response: {e}"))?,
@@ -1806,6 +1880,42 @@ impl<R: std::io::Read + ?Sized> ReadToEnd for R {
 
 #[cfg(test)]
 mod tests {
+    /// The shape a multipart synth request takes, per engine.
+    #[test]
+    fn one_request_goes_as_an_object_which_both_engines_take() {
+        let requests = serde_json::json!([{ "caption": "a song" }]);
+        for hotstep in [false, true] {
+            let (payload, dropped) = multipart_payload(&requests, hotstep);
+            assert!(payload.is_object(), "an object is the only shape both take");
+            assert_eq!(dropped, 0);
+        }
+    }
+
+    /// A genuine batch keeps the array, which only the engine that can parse
+    /// one gets to have. HOT-Step's multipart path takes a single request, so
+    /// there the extra takes are dropped rather than the render failing.
+    #[test]
+    fn a_batch_keeps_the_array_except_on_hotstep() {
+        let requests = serde_json::json!([{ "caption": "one" }, { "caption": "two" }]);
+        let (payload, dropped) = multipart_payload(&requests, false);
+        assert!(payload.is_array(), "the bundled engine batches a multipart request");
+        assert_eq!(dropped, 0);
+
+        let (payload, dropped) = multipart_payload(&requests, true);
+        assert!(payload.is_object());
+        assert_eq!(dropped, 1, "the extra take is dropped, and it says so");
+    }
+
+    /// The engine's own explanation has to survive, or a request-shape
+    /// mismatch arrives as a bare number and the cause has to be guessed at.
+    #[test]
+    fn a_status_error_keeps_the_engine_explanation() {
+        let body = r#"{"error":"Multipart: invalid JSON in 'request' part"}"#;
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        let detail = parsed.get("error").and_then(|v| v.as_str()).unwrap_or_default();
+        assert_eq!(detail, "Multipart: invalid JSON in 'request' part");
+    }
+
 
 /// Real YuE2 log lines, from one measured render, driving the stage walk.
     fn yue2_lines() -> Vec<String> {

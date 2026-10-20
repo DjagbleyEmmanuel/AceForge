@@ -202,6 +202,21 @@ fn die_with_parent() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Which engine the running sidecar is.
+///
+/// Set when a server starts. The two engines share an HTTP surface but not a
+/// request format, and nothing else distinguishes them at runtime.
+static RUNNING_ENGINE: std::sync::OnceLock<crate::engines::EngineId> = std::sync::OnceLock::new();
+
+fn set_running_engine(engine: crate::engines::EngineId) {
+    let _ = RUNNING_ENGINE.set(engine);
+}
+
+/// The engine currently running, if any.
+pub fn running_engine() -> Option<crate::engines::EngineId> {
+    RUNNING_ENGINE.get().copied()
+}
+
 pub fn start(
     engine: crate::engines::EngineId,
     models_dir: &std::path::Path,
@@ -209,6 +224,10 @@ pub fn start(
 ) -> Result<ServerStatus, String> {
     reap_finished();
     let hot = engine == crate::engines::EngineId::HotStep;
+    // Remembered so a request can be shaped for the engine that is actually
+    // running. The two engines disagree about the request format and the app
+    // cannot tell them apart by port.
+    set_running_engine(engine);
 
     // Resolution order: explicit override (the ACE-Step engine only, since it
     // is the one a developer is likely to have built by hand), then the engine
