@@ -112,6 +112,17 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
   // has to be made before a job is submitted, so it cannot wait on a sidecar.
   // Polled slowly for the same reason props are -- a download can finish while
   // the window is open, and the list should catch up without a reopen.
+  // Whether the forced aligner model is installed. With it the lyric timings
+  // are measured by listening to the finished track; without it they are
+  // estimated from the score's note positions. The user should know which.
+  const [alignerOk, setAlignerOk] = useState(false);
+  useEffect(() => {
+    void server
+      .yue2AlignerPresent()
+      .then(setAlignerOk)
+      .catch(() => setAlignerOk(false));
+  }, []);
+
   // Resolved at startup, so it is asked once rather than per render.
   const [mp3Ok, setMp3Ok] = useState(true);
   useEffect(() => {
@@ -362,6 +373,24 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
             placeholder="[Verse]&#10;I walked the long road home tonight"
             className="field resize-y font-mono text-[11px]"
           />
+          <p className="mt-1 text-[10px] leading-relaxed text-ink-500">
+            {alignerOk ? (
+              <>
+                Timings are measured by a forced aligner listening to the
+                finished track, so write the words the way they are sung --
+                <code className="mx-1 font-mono">plaay</code> rather than
+                <code className="mx-1 font-mono">play</code>. The aligner
+                matches the audio against this exact text.
+              </>
+            ) : (
+              <>
+                No aligner model installed, so timings are estimated from the
+                score&apos;s note positions. Install
+                <code className="mx-1 font-mono">mms-fa-f32.gguf</code> in the
+                models folder to have them measured from the audio instead.
+              </>
+            )}
+          </p>
         </div>
 
         <div className="grid gap-3 sm:grid-cols-3">

@@ -894,16 +894,44 @@ pub fn render(
         //
         // A failure here must not lose the render; the audio is already written.
         if !params.lyrics.trim().is_empty() {
-            // Measured off the score the composer produced, when there is a
-            // score it can be measured from. The engine returns the lead sheet
-            // but never the clock over it, so the clock is derived here -- the
-            // same numbers the C6 wire format would carry.
-            let timed = score
-                .as_deref()
-                .and_then(|abc| crate::abc::lyric_timings(abc, &params.lyrics).ok());
-            let lrc = match &timed {
-                Some(lines) => format_lrc(lines),
-                None => spread_lrc(&params.lyrics, seconds),
+            // The forced aligner first, when the model is installed: it hears
+            // the finished track and reports when each word was sung. The
+            // score-derived timings below are an estimate read off the lead
+            // sheet, and the evenly-spread one is a guess -- both are worse
+            // than a recording, and both are what a machine without the 1.26 GB
+            // aligner model is left with.
+            //
+            // The lyrics sent to the aligner must be the exact string the
+            // render was given: the answer indexes into it, and nothing
+            // re-derives the offsets.
+            let aligned = match crate::align::align(port, &path, &params.lyrics) {
+                Ok(words) => {
+                    let lrc = crate::align::aligned_lrc(&params.lyrics, &words);
+                    if lrc.is_empty() {
+                        eprintln!("[yue2] the aligner returned no timed lines; using the score");
+                    }
+                    lrc
+                }
+                Err(e) => {
+                    eprintln!("[yue2] forced alignment unavailable ({e}); using the score");
+                    String::new()
+                }
+            };
+
+            let lrc = if !aligned.is_empty() {
+                aligned
+            } else {
+                // Measured off the score the composer produced, when there is a
+                // score it can be measured from. The engine returns the lead
+                // sheet but never the clock over it, so the clock is derived
+                // here -- the same numbers the C6 wire format would carry.
+                let timed = score
+                    .as_deref()
+                    .and_then(|abc| crate::abc::lyric_timings(abc, &params.lyrics).ok());
+                match &timed {
+                    Some(lines) => format_lrc(lines),
+                    None => spread_lrc(&params.lyrics, seconds),
+                }
             };
             if !lrc.is_empty() {
                 let lrc_path = path.with_extension("lrc");
