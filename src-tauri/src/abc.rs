@@ -555,14 +555,24 @@ pub fn lyric_timings(abc: &str, lyrics: &str) -> Result<Vec<(f64, String)>, Stri
         } else {
             bars.len()
         };
-        let onset = onsets
+        // Every bar of the section that carries a vocal onset, not just the
+        // first one.
+        //
+        // Stamping every line of a section with the section's opening time put
+        // a whole verse on one timestamp, and the player's current line then
+        // jumped a verse at a time instead of moving through it. The bars are
+        // there, and each one is where the voice says something.
+        let section_onsets: Vec<f64> = onsets
             .iter()
             .skip(section.start_bar.saturating_sub(1))
             .take(end_bar.saturating_sub(section.start_bar).max(1))
             .copied()
             .flatten()
-            .next();
-        let Some(onset) = onset else { continue };
+            .collect();
+        if section_onsets.is_empty() {
+            continue;
+        }
+        let onset = section_onsets[0];
 
         let block = &blocks[match_at.0];
         // Trim trailing whitespace so the emitted line is not mostly blanks.
@@ -577,8 +587,20 @@ pub fn lyric_timings(abc: &str, lyrics: &str) -> Result<Vec<(f64, String)>, Stri
             end -= 1;
         }
         let text: String = lyrics.chars().skip(block.start).take(end - block.start).collect();
-        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            out.push(((onset * 1000.0).round() / 1000.0, line.to_string()));
+        let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        // Spread the lines across the section's bars, in proportion. A line
+        // takes the bar at the same fraction of the section as it is of the
+        // lines, so a verse of six lines over eight bars puts the third line
+        // at the third bar's start and not at the verse's.
+        let span = section_onsets.len();
+        for (i, line) in lines.iter().enumerate() {
+            let at = if lines.len() <= 1 {
+                onset
+            } else {
+                let bar = (i * span) / lines.len();
+                section_onsets[bar.min(span - 1)]
+            };
+            out.push(((at * 1000.0).round() / 1000.0, line.to_string()));
         }
     }
     if out.is_empty() {
@@ -780,5 +802,13 @@ mod tests {
     fn nonsense_in_is_refused() {
         assert!(lyric_timings("not a score at all", "[Verse]\nhi").is_err());
         assert!(lyric_timings(SHEETSAGE, "").is_err());
+    }
+
+    #[test]
+    fn zz_print_real() {
+        let lyrics = "[Verse 1]\nline one\nline two\nline three\nline four\n[Chorus]\nc1\nc2";
+        for (at, text) in lyric_timings(REAL_SCORE, lyrics).expect("t") {
+            println!("REAL {:>7.2}s  {}", at, text);
+        }
     }
 }

@@ -383,10 +383,11 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
                 matches the audio against this exact text.
                 <br />
                 <span className="text-ink-600">
-                  The aligner needs about 1.2 GB of card of its own, so it
-                  only fits tracks of roughly two minutes. A longer one is
-                  timed from the score instead, which is an estimate rather
-                  than a measurement.
+                  The aligner needs about 1.2 GB of card of its own, so it only
+                  fits tracks of roughly two minutes. A longer one is timed on
+                  the CPU instead, which is measured too but takes a few
+                  minutes. If even that fails, the score is used, which is
+                  exact to the bar but not a measurement.
                 </span>
               </>
             ) : (

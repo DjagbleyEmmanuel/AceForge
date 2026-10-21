@@ -22,6 +22,89 @@
 use serde::Deserialize;
 use std::path::Path;
 
+/// Align on the CPU, using a second engine instance.
+///
+/// The aligner's backend is chosen when the process starts -- `GGML_BACKEND` is
+/// read from the environment at that point and there is no per-request knob --
+/// so the only way to get a CPU aligner is a second engine. The running
+/// engine keeps its GPU, which is what it needs for the render; this one does
+/// nothing but align.
+///
+/// The CPU path is slow: measured at 399 seconds for three minutes of audio on
+/// four threads, against a second and a half on the GPU. It is here because
+/// the GPU path runs out of room on a card this size -- the compute buffer
+/// grows about 22 MB per second of audio, and the model wants another 1203,
+/// so four gigabytes is gone by the two-minute mark -- and a track with no
+/// timings at all is worse than one that took ten minutes.
+pub fn align_on_cpu(
+    binary: &Path,
+    models_dir: &Path,
+    audio: &Path,
+    lyrics: &str,
+    threads: u32,
+) -> Result<Vec<AlignedWord>, String> {
+    let port = free_port()?;
+    let mut child = std::process::Command::new(binary)
+        .arg("--models")
+        .arg(models_dir)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .env("GGML_BACKEND", "CPU")
+        .env("GGML_N_THREADS", threads.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot start a CPU engine: {e}"))?;
+
+    let result = (|| {
+        wait_for_port(port, std::time::Duration::from_secs(120))?;
+        align(port, audio, lyrics)
+    })();
+
+    // The child is a whole engine, loaded with a gigabyte of weights. It goes
+    // away with the align, either way.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+/// A port nothing is listening on.
+///
+/// Bound and released rather than guessed: a random high port can be anything,
+/// including something another process is already on.
+fn free_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("cannot find a free port: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("cannot read the port: {e}"))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+/// Wait until the engine answers, or give up.
+///
+/// The engine loads its registry before it listens, and on a cold page cache
+/// that takes a few seconds.
+fn wait_for_port(port: u16, timeout: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}").parse().map_err(|e| format!("bad port: {e}"))?,
+            std::time::Duration::from_millis(500),
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    Err("the CPU engine did not start listening in time".into())
+}
+
 /// One word the aligner timed.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AlignedWord {
@@ -376,6 +459,17 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+    /// The CPU aligner needs a port of its own, and the port must not be one
+    /// something else is already on. Binding and releasing gives a port the
+    /// kernel says is free, rather than a random number that might not be.
+    #[test]
+    fn a_free_port_is_bound_rather_than_guessed() {
+        let port = free_port().expect("a port");
+        assert!(port > 1024, "got a privileged port: {port}");
+        // It must be free now, which is the whole point of asking the kernel.
+        let taken = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+        assert!(taken, "the port handed out was already in use");
+    }
     #[test]
     fn the_engines_own_offsets_map_to_the_right_lines() {
         let lyrics = "[Verse 1]\nhello there my friend\n[Chorus]\nsing it loud now";
@@ -423,5 +517,6 @@ mod tests {
         assert_eq!(aligned_lrc("", &[]), "");
         assert_eq!(aligned_lrc("   \n  \n", &[]), "");
     }
+
 
 }
