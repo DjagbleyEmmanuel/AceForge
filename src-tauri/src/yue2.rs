@@ -642,7 +642,20 @@ fn staged_plan_then_audio(
     );
 
     let (_, audio) = staged_params(params, &score);
-    run_stage(port, &audio, models_dir, on_stage, "rendering score", "rendering")
+    let Some(mut last) = run_stage(port, &audio, models_dir, on_stage, "rendering score", "rendering")?
+    else {
+        return Ok(None);
+    };
+    // The score is the one this function composed, not whatever the audio job
+    // happens to report about itself.
+    //
+    // Re-reading it from the job's status was how the sidecar fell all the
+    // way through to the evenly-spread fallback: the score-derived timings
+    // are the second-best answer and they were only ever offered when the
+    // engine volunteered the score a second time. It composed one; there is
+    // no reason to ask it for it again and take the chance that it says no.
+    last.score = Some(score);
+    Ok(Some(last))
 }
 
 /// The bitrate a YuE2 render is encoded at, clamped to something sane.
@@ -985,29 +998,51 @@ fn wav_seconds(bytes: &[u8]) -> f32 {
     let rd = |at: usize| -> u32 {
         u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
     };
-    let mut pos = 12usize;
+    // The fmt chunk holds a mix of widths: the format tag, the channel count,
+    // the block alignment and the bit depth are u16, and only the sample rate
+    // and byte rate are u32. Reading a u16 as a u32 picks up the low half of
+    // the next field, so a channel count of 2 and a rate of 48000 come back
+    // as one number.
+    let rd16 = |at: usize| -> u32 {
+        u16::from_le_bytes([bytes[at], bytes[at + 1]]) as u32
+    };
+    // The fmt chunk, read properly this time.
+    //
+    //   0  format tag      2  channels      4  sample rate
+    //   8  byte rate      12  block align   14  bits per sample
+    //
+    // The old version took the rate and divided the data size by two, on the
+    // grounds that "16-bit mono and stereo both divide by 2". That is true of
+    // the bytes per SAMPLE, and false of the bytes per FRAME: stereo has two
+    // of them. So every stereo track came out exactly twice as long as it is,
+    // and a 253 second render reported 506. The evenly-spread sidecar then
+    // timed its lines against 506 seconds of a 253 second song, and the last
+    // line landed two minutes past the end of the track.
     let mut rate = 0u32;
+    let mut channels = 0u32;
+    let mut bits = 16u32;
+    let mut pos = 12usize;
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
         let size = rd(pos + 4) as usize;
         if id == b"fmt " && pos + 8 + 16 <= bytes.len() {
+            channels = rd16(pos + 10);
             rate = rd(pos + 12);
+            bits = rd16(pos + 22);
             break;
         }
         pos += 8 + size + (size & 1);
     }
+    if rate == 0 || channels == 0 || bits == 0 {
+        return 0.0;
+    }
+    let frame_bytes = (channels * bits / 8).max(1);
     let mut pos = 12usize;
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
         let size = rd(pos + 4) as usize;
         if id == b"data" {
-            // 16-bit mono and stereo both divide by 2; the channel count is not
-            // read here because the caller only wants a length for the list.
-            return if rate > 0 {
-                (size / 2) as f32 / rate as f32
-            } else {
-                0.0
-            };
+            return (size / frame_bytes as usize) as f32 / rate as f32;
         }
         pos += 8 + size + (size & 1);
     }
@@ -1491,6 +1526,60 @@ mod tests {
         assert_eq!(parts[1], b"BBB");
     }
 
+    /// A stereo track is twice the bytes of a mono one for the same length.
+    /// Reading the duration without the channel count reports stereo as twice
+    /// as long, and the evenly-spread sidecar then times its lines against
+    /// twice the length of the song.
+    #[test]
+    fn a_stereo_wav_is_not_reported_as_twice_its_length() {
+        let seconds = 2.0f32;
+        let rate = 48000u32;
+        let samples = (rate as f32 * seconds) as u32;
+
+        let mono = synth_wav(1, 16, rate, samples);
+        let stereo = synth_wav(2, 16, rate, samples);
+        assert!((wav_seconds(&mono) - seconds).abs() < 0.001, "{}", wav_seconds(&mono));
+        assert!((wav_seconds(&stereo) - seconds).abs() < 0.001, "{}", wav_seconds(&stereo));
+    }
+
+    /// Twenty-four bit is three bytes per sample, so the frame size has to
+    /// come from the fmt chunk rather than being assumed.
+    #[test]
+    fn the_frame_size_comes_from_the_fmt_chunk() {
+        let rate = 48000u32;
+        let samples = rate; // one second
+        for (channels, bits) in [(1u32, 16u32), (2, 16), (1, 24), (2, 24)] {
+            let wav = synth_wav(channels, bits, rate, samples);
+            let got = wav_seconds(&wav);
+            assert!(
+                (got - 1.0).abs() < 0.001,
+                "{channels}ch {bits}bit reported {got}s"
+            );
+        }
+    }
+
+    /// Build a real WAV: RIFF header, fmt chunk, data chunk.
+    fn synth_wav(channels: u32, bits: u32, rate: u32, samples: u32) -> Vec<u8> {
+        let block_align = channels * bits / 8;
+        let data_len = samples * block_align;
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36u32 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&(channels as u16).to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * block_align).to_le_bytes());
+        out.extend_from_slice(&(block_align as u16).to_le_bytes());
+        out.extend_from_slice(&(bits as u16).to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(out.len() + data_len as usize, 0);
+        out
+    }
+
     #[test]
     fn wav_length_comes_from_the_data_chunk() {
         let mut wav = vec![0u8; 44];
@@ -1498,10 +1587,14 @@ mod tests {
         wav[8..12].copy_from_slice(b"WAVE");
         wav[12..16].copy_from_slice(b"fmt ");
         wav[16..20].copy_from_slice(&16u32.to_le_bytes());
+        wav[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
+        wav[22..24].copy_from_slice(&1u16.to_le_bytes()); // channels: mono
         wav[24..28].copy_from_slice(&48000u32.to_le_bytes()); // sample rate at 0x18
+        wav[34..36].copy_from_slice(&16u16.to_le_bytes()); // bits per sample
         wav[36..40].copy_from_slice(b"data");
         wav[40..44].copy_from_slice(&(96000u32).to_le_bytes()); // 1s of 16-bit 48k
         assert!((wav_seconds(&wav) - 1.0).abs() < 0.01, "{}", wav_seconds(&wav));
     }
+
 
 }

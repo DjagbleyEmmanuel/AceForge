@@ -381,6 +381,13 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
                 <code className="mx-1 font-mono">plaay</code> rather than
                 <code className="mx-1 font-mono">play</code>. The aligner
                 matches the audio against this exact text.
+                <br />
+                <span className="text-ink-600">
+                  The aligner needs about 1.2 GB of card of its own, so it
+                  only fits tracks of roughly two minutes. A longer one is
+                  timed from the score instead, which is an estimate rather
+                  than a measurement.
+                </span>
               </>
             ) : (
               <>
