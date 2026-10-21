@@ -112,17 +112,6 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
   // has to be made before a job is submitted, so it cannot wait on a sidecar.
   // Polled slowly for the same reason props are -- a download can finish while
   // the window is open, and the list should catch up without a reopen.
-  // Whether the forced aligner model is installed. With it the lyric timings
-  // are measured by listening to the finished track; without it they are
-  // estimated from the score's note positions. The user should know which.
-  const [alignerOk, setAlignerOk] = useState(false);
-  useEffect(() => {
-    void server
-      .yue2AlignerPresent()
-      .then(setAlignerOk)
-      .catch(() => setAlignerOk(false));
-  }, []);
-
   // Resolved at startup, so it is asked once rather than per render.
   const [mp3Ok, setMp3Ok] = useState(true);
   useEffect(() => {
@@ -374,30 +363,12 @@ export function Yue2Panel({ port, params, setParams, onGenerated }: Props) {
             className="field resize-y font-mono text-[11px]"
           />
           <p className="mt-1 text-[10px] leading-relaxed text-ink-500">
-            {alignerOk ? (
-              <>
-                Timings are measured by a forced aligner listening to the
-                finished track, so write the words the way they are sung --
-                <code className="mx-1 font-mono">plaay</code> rather than
-                <code className="mx-1 font-mono">play</code>. The aligner
-                matches the audio against this exact text.
-                <br />
-                <span className="text-ink-600">
-                  The aligner needs about 1.2 GB of card of its own, so it only
-                  fits tracks of roughly two minutes. A longer one is timed on
-                  the CPU instead, which is measured too but takes a few
-                  minutes. If even that fails, the score is used, which is
-                  exact to the bar but not a measurement.
-                </span>
-              </>
-            ) : (
-              <>
-                No aligner model installed, so timings are estimated from the
-                score&apos;s note positions. Install
-                <code className="mx-1 font-mono">mms-fa-f32.gguf</code> in the
-                models folder to have them measured from the audio instead.
-              </>
-            )}
+            Lyric timings come from the score the composer wrote, so each
+            line is placed at the bar it is sung over. Put a section marker
+            above each block --{" "}
+            <code className="mx-1 font-mono">[Verse]</code>{" "}
+            <code className="mx-1 font-mono">[Chorus]</code>{" "}
+            -- so the score can be matched to it.
           </p>
         </div>
 

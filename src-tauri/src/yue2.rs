@@ -658,25 +658,6 @@ fn staged_plan_then_audio(
     Ok(Some(last))
 }
 
-/// Align a track on the CPU, with a second engine instance.
-///
-/// The engine's aligner backend is fixed when the process starts, so this
-/// starts its own. It finds the same binary the running engine came from --
-/// the bundled one or the installed one -- and gives it the models directory.
-fn cpu_align(audio: &std::path::Path, lyrics: &str) -> Result<Vec<crate::align::AlignedWord>, String> {
-    let models_dir = crate::settings::resolve_hotstep_models_dir();
-    let binary = crate::engines::binary_path(crate::engines::EngineId::HotStep).ok_or_else(|| {
-        "no installed HOT-Step engine to run the aligner with".to_string()
-    })?;
-    // The engine halves the core count by default, which measured at 627
-    // seconds for three minutes of audio against 399 with all four.
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(2)
-        .max(1);
-    crate::align::align_on_cpu(&binary, &models_dir, audio, lyrics, threads)
-}
-
 /// The bitrate a YuE2 render is encoded at, clamped to something sane.
 fn mp3_bitrate_of(params: &Yue2Params) -> u32 {
     params.mp3_bitrate.clamp(64, 320) as u32
@@ -936,57 +917,25 @@ pub fn render(
             // The lyrics sent to the aligner must be the exact string the
             // render was given: the answer indexes into it, and nothing
             // re-derives the offsets.
-            let aligned = match crate::align::align(port, &path, &params.lyrics) {
-                Ok(words) => {
-                    let lrc = crate::align::aligned_lrc(&params.lyrics, &words);
-                    if lrc.is_empty() {
-                        eprintln!("[yue2] the aligner returned no timed lines; using the score");
-                    }
-                    lrc
-                }
-                Err(gpu_error) => {
-                    // The GPU ran out of room, which for anything past a couple
-                    // of minutes it always does: the aligner's compute buffer
-                    // grows about 22 MB per second of audio and the model wants
-                    // another 1203 on top. The CPU can do the same job, slowly.
-                    eprintln!(
-                        "[yue2] the GPU aligner could not take this track ({gpu_error}); \
-                         trying the CPU, which takes several minutes"
-                    );
-                    on_stage(
-                        "yue2",
-                        "timing the lyrics on the CPU — slow, but measured",
-                    );
-                    match cpu_align(&path, &params.lyrics) {
-                        Ok(words) => {
-                            let lrc = crate::align::aligned_lrc(&params.lyrics, &words);
-                            if lrc.is_empty() {
-                                eprintln!("[yue2] the CPU aligner returned no timed lines");
-                            }
-                            lrc
-                        }
-                        Err(e) => {
-                            eprintln!("[yue2] the CPU aligner also failed ({e}); using the score");
-                            String::new()
-                        }
-                    }
-                }
-            };
-
-            let lrc = if !aligned.is_empty() {
-                aligned
-            } else {
-                // Measured off the score the composer produced, when there is a
-                // score it can be measured from. The engine returns the lead
-                // sheet but never the clock over it, so the clock is derived
-                // here -- the same numbers the C6 wire format would carry.
-                let timed = score
-                    .as_deref()
-                    .and_then(|abc| crate::abc::lyric_timings(abc, &params.lyrics).ok());
-                match &timed {
-                    Some(lines) => format_lrc(lines),
-                    None => spread_lrc(&params.lyrics, seconds),
-                }
+            // Timed from the composed score.
+            //
+            // The forced aligner that used to do this is gone, and its absence
+            // is not a loss of function so much as the removal of a liability:
+            // it wanted 1.2 GB of weights and a compute buffer that grew with
+            // the track, which on a card this size meant it could not run, and
+            // a failed align inside the engine that renders is very likely
+            // what took the memory a later render needed. The score is always
+            // there, costs nothing, and is exact to the bar.
+            let timed = score
+                .as_deref()
+                .and_then(|abc| crate::abc::lyric_timings(abc, &params.lyrics).ok());
+            // The score's own note positions, falling back to an even spread
+            // when the score could not be read at all. The engine returns the
+            // lead sheet but never the clock over it, so the clock is derived
+            // here -- the same numbers the C6 wire format would carry.
+            let lrc = match &timed {
+                Some(lines) => format_lrc(lines),
+                None => spread_lrc(&params.lyrics, seconds),
             };
             if !lrc.is_empty() {
                 let lrc_path = path.with_extension("lrc");

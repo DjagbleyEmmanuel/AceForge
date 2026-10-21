@@ -94,10 +94,6 @@ export const server = {
   /** The port, but only while an engine is still listening on it. Null once it
    *  has died, which is how the UI stops claiming a dead runtime is live. */
   liveness: () => invoke<number | null>("engine_liveness"),
-  /** Whether the YuE2 forced aligner model is installed. With it, lyric
-   *  timings are measured from the finished audio; without it they are
-   *  estimated from the score. */
-  yue2AlignerPresent: () => invoke<boolean>("yue2_aligner_present"),
   /** Whether an MP3 encoder was found at startup. Bundled first, then a
    *  system ffmpeg; false means renders will land as WAV. */
   mp3Available: () => invoke<boolean>("mp3_available"),

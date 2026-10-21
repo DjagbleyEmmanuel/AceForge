@@ -609,40 +609,6 @@ pub fn lyric_timings(abc: &str, lyrics: &str) -> Result<Vec<(f64, String)>, Stri
     Ok(out)
 }
 
-    /// A real SheetSage score, as the engine's composer actually writes one.
-    ///
-    /// It is not a tidy fixture: 2/4 time, a 32nd-note unit, chord symbols
-    /// hanging off the notes, a rest-only "Z" voice alternating with a
-    /// sounding one, and lowercase section names. Every one of those is a
-    /// shape the hand-written fixtures did not have.
-    const REAL_SCORE: &str = include_str!("testdata/sheetsage-real.abc");
-
-    #[test]
-    fn a_real_score_parses_and_times_lyrics() {
-        let lyrics = "[Verse 1]\nHey baby\nI don't want much today\n[Chorus]\nNo no no no no baby";
-        let timed = lyric_timings(REAL_SCORE, lyrics)
-            .expect("a real composed score should time lyrics against it");
-        assert!(!timed.is_empty(), "{timed:?}");
-        // Monotonic, and inside the track.
-        let mut last = -1.0;
-        for (at, text) in &timed {
-            assert!(*at >= last, "stamps went backwards: {timed:?}");
-            assert!(*at >= 0.0);
-            last = *at;
-        }
-        // The real score is 2/4 at 64bpm, so a bar is 1.875s, and the verse
-        // starts after nine bars of intro: 9 * 1.875 = 16.875s.
-        //
-        // Pinned exactly, because this is the path a track too long for the
-        // aligner falls back to, and a bar clock that is off by a factor of
-        // two would put every lyric in the wrong place.
-        assert!(
-            (timed[0].0 - 16.875).abs() < 0.01,
-            "the verse should start at 16.875s, got {}",
-            timed[0].0
-        );
-        assert!(last < 600.0, "timings ran away: {timed:?}");
-    }
     /// The health gate runs before the NAR stage, which is the long one, so it
     /// has to be right about what counts as a renderable score.
     #[test]
@@ -678,6 +644,41 @@ pub fn lyric_timings(abc: &str, lyrics: &str) -> Result<Vec<(f64, String)>, Stri
 
 #[cfg(test)]
 mod tests {
+    /// A real SheetSage score, as the engine's composer actually writes one.
+    ///
+    /// It is not a tidy fixture: 2/4 time, a 32nd-note unit, chord symbols
+    /// hanging off the notes, a rest-only "Z" voice alternating with a
+    /// sounding one, and lowercase section names. Every one of those is a
+    /// shape the hand-written fixtures did not have.
+    const REAL_SCORE: &str = include_str!("testdata/sheetsage-real.abc");
+
+    #[test]
+    fn a_real_score_parses_and_times_lyrics() {
+        let lyrics = "[Verse 1]\nHey baby\nI don't want much today\n[Chorus]\nNo no no no no baby";
+        let timed = lyric_timings(REAL_SCORE, lyrics)
+            .expect("a real composed score should time lyrics against it");
+        assert!(!timed.is_empty(), "{timed:?}");
+        // Monotonic, and inside the track.
+        let mut last = -1.0;
+        for (at, text) in &timed {
+            assert!(*at >= last, "stamps went backwards: {timed:?}");
+            assert!(*at >= 0.0);
+            last = *at;
+        }
+        // The real score is 2/4 at 64bpm, so a bar is 1.875s, and the verse
+        // starts after nine bars of intro: 9 * 1.875 = 16.875s.
+        //
+        // Pinned exactly, because this is the path a track too long for the
+        // aligner falls back to, and a bar clock that is off by a factor of
+        // two would put every lyric in the wrong place.
+        assert!(
+            (timed[0].0 - 16.875).abs() < 0.01,
+            "the verse should start at 16.875s, got {}",
+            timed[0].0
+        );
+        assert!(last < 600.0, "timings ran away: {timed:?}");
+    }
+
     use super::*;
 
     /// The exact shape SheetSage writes. A regression here means the parser

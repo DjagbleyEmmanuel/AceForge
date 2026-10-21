@@ -1,5 +1,4 @@
 pub mod abc;
-pub mod align;
 pub mod annotations;
 pub mod covers;
 pub mod downloads;
@@ -641,16 +640,6 @@ fn engine_solvers(port: Option<u16>) -> Vec<String> {
 #[tauri::command]
 fn mp3_available() -> bool {
     yue2::mp3_supported()
-}
-
-/// Whether the forced aligner model is installed.
-///
-/// The YuE2 lyric timings are measured by listening to the finished track when
-/// this is there, and estimated from the score's note positions when it is not.
-/// The UI says which, because the two are not equally trustworthy.
-#[tauri::command]
-fn yue2_aligner_present() -> bool {
-    align::model_present(&settings::resolve_hotstep_models_dir())
 }
 
 /// Live VRAM and RAM, for the sidebar meters.
@@ -1354,7 +1343,6 @@ pub fn run() {
             yue2_props,
             yue2_lms,
             system_stats,
-            yue2_aligner_present,
             mp3_available,
             yue2_render,
             reinstall_bundled_engine,
